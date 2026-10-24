@@ -6,11 +6,14 @@
 
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/pitch_landmarks.hpp"
+#include "touchfc/possession.hpp"
 
 #include "touchfc/frame_check.hpp"
 #include "touchfc/time.hpp"
 
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 
 namespace touchfc {
 
@@ -202,11 +205,72 @@ void Pipeline::run_t2() {
   to_track_.wake();
 }
 
+void Pipeline::update_possession(FrameSlot& slot) {
+  const Config cfg = config_.load();
+  const float limit = cfg.poss_dist_m > 0.f ? cfg.poss_dist_m : 1.5f;
+  int ball = -1;
+  float best_score = -1.f;
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    if (slot.dets[i].class_id != 3 || slot.dets[i].score <= best_score) continue;
+    best_score = slot.dets[i].score;
+    ball = static_cast<int>(i);
+  }
+  const bool have = ball >= 0 && slot.pitch_valid;
+  float bx = 0, by = 0;
+  if (have) {
+    bx = slot.pitch_x[static_cast<std::uint32_t>(ball)];
+    by = slot.pitch_y[static_cast<std::uint32_t>(ball)];
+  }
+  float best_d = 1e9f;
+  std::uint16_t track = 0;
+  std::uint8_t team = 0;
+  if (have) {
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      if (slot.dets[i].class_id == 3 || slot.det_team[i] == 0) continue;
+      const float dx = slot.pitch_x[i] - bx;
+      const float dy = slot.pitch_y[i] - by;
+      const float d = dx * dx + dy * dy;
+      if (d < best_d) {
+        best_d = d;
+        track = slot.dets[i].track_id;
+        team = slot.det_team[i];
+      }
+    }
+  }
+  if (poss_t0_ == 0) poss_t0_ = last_track_t_ns_;
+  const float dist = track != 0 ? std::sqrt(best_d) : 99.f;
+  const PossOut out = step_possession(poss_, have, bx, by, track, team, dist, limit, last_track_t_ns_, poss_t0_);
+  if (out.emitted && poss_n_ < 64) {
+    poss_events_[poss_n_] = out.event;
+    poss_events_[poss_n_].id = static_cast<EventId>(poss_n_ + 1);
+    ++poss_n_;
+  }
+  slot.ball_ok = have ? 1 : 0;
+  slot.ball_x = bx;
+  slot.ball_y = by;
+  slot.poss_team = poss_.held ? poss_.team : 0;
+  slot.poss_track = poss_.held ? poss_.track : 0;
+}
+
+void Pipeline::write_spadl(const char* path) const {
+  if (path == nullptr || path[0] == '\0') return;
+  std::FILE* f = std::fopen(path, "wb");
+  if (f == nullptr) return;
+  std::fputs(kSpadlHeader, f);
+  const int dir = attack_dir.load(std::memory_order_relaxed) >= 0 ? 1 : -1;
+  for (int i = 0; i < poss_n_; ++i) {
+    char row[256];
+    format_spadl_row(row, static_cast<int>(sizeof(row)), poss_events_[i], dir);
+    std::fputs(row, f);
+  }
+  std::fclose(f);
+}
+
 void Pipeline::assign_teams(FrameSlot& slot) {
   for (std::uint32_t i = 0; i < slot.det_count; ++i) slot.det_team[i] = 0;
   for (std::uint32_t i = 0; i < slot.det_count; ++i) {
     const Detection& d = slot.dets[i];
-    if (d.track_id == 0) continue;
+    if (d.track_id == 0 || d.class_id == 3) continue;
     Lab sample;
     if (!torso_lab(slot.bgra.get(), slot.stride, slot.meta.width, slot.meta.height, d.x, d.y, d.w, d.h,
                    sample))
@@ -236,7 +300,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
   }
   if (seed_ok_[0] || seed_ok_[1]) {
     for (auto& t : tracker_.tracks) {
-      if (t.id == 0 || t.team_lock) continue;
+      if (t.id == 0 || t.team_lock || t.class_id == 3) continue;
       t.team = static_cast<std::uint8_t>(nearest_team(t.lab, seed_[0], seed_ok_[0], seed_[1], seed_ok_[1]));
     }
   }
@@ -302,6 +366,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
 
   int n0 = 0, n1 = 0;
   for (const auto& t : tracker_.tracks) {
+    if (t.id == 0 || t.class_id == 3) continue;
     if (t.team == 1) ++n0;
     else if (t.team == 2) ++n1;
   }
@@ -310,7 +375,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
     int n = 0;
     for (std::uint32_t i = 0; i < slot.det_count && n < kPcMaxPlayers; ++i) {
       const auto id = slot.dets[i].track_id;
-      if (id == 0) continue;
+      if (id == 0 || slot.dets[i].class_id == 3) continue;
       std::uint8_t team = 0;
       for (const auto& t : tracker_.tracks)
         if (t.id == id) team = t.team;
@@ -339,8 +404,9 @@ void Pipeline::assign_teams(FrameSlot& slot) {
     const auto id = slot.dets[i].track_id;
     if (id == 0) continue;
     for (const auto& t : tracker_.tracks)
-      if (t.id == id) slot.det_team[i] = t.team;
+      if (t.id == id) slot.det_team[i] = t.class_id == 3 ? 0 : t.team;
   }
+  update_possession(slot);
 }
 
 void Pipeline::run_t3() {

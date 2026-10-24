@@ -37,6 +37,11 @@ struct FrameSlot {
   std::uint8_t pc_valid = 0;
   float territory = 0.5f;
   std::array<std::uint8_t, 160> pc_ds{};
+  std::uint8_t ball_ok = 0;
+  std::uint8_t poss_team = 0;
+  std::uint16_t poss_track = 0;
+  float ball_x = 0.f;
+  float ball_y = 0.f;
 };
 
 // Slots are allocated once. The index from SlotPool is the vector index.

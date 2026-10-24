@@ -74,8 +74,8 @@ inline void tti_row8(float px, float py, float vx, float vy, const float* tx, co
   const __m256 dx = _mm256_sub_ps(_mm256_loadu_ps(tx), _mm256_set1_ps(px));
   const __m256 dy = _mm256_sub_ps(_mm256_loadu_ps(ty), _mm256_set1_ps(py));
   const __m256 d2 = _mm256_add_ps(_mm256_mul_ps(dx, dx), _mm256_mul_ps(dy, dy));
-  const __m256 small = _mm256_cmp_ps(d2, _mm256_set1_ps(1e-6f), _CMP_LT_OQ);
-  const __m256 d = _mm256_sqrt_ps(_mm256_blendv_ps(d2, _mm256_set1_ps(1.f), small));
+  const __m256 tiny = _mm256_cmp_ps(d2, _mm256_set1_ps(1e-6f), _CMP_LT_OQ);
+  const __m256 d = _mm256_sqrt_ps(_mm256_blendv_ps(d2, _mm256_set1_ps(1.f), tiny));
   __m256 s = _mm256_div_ps(
       _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(vx), dx), _mm256_mul_ps(_mm256_set1_ps(vy), dy)), d);
   s = _mm256_min_ps(_mm256_max_ps(s, _mm256_setzero_ps()), _mm256_set1_ps(kVmax));
@@ -95,7 +95,7 @@ inline void tti_row8(float px, float py, float vx, float vy, const float* tx, co
   __m256 t = _mm256_blendv_ps(t_cruise, t_acc, accel_reaches);
   t = _mm256_blendv_ps(t, t_at_max, already);
   t = _mm256_add_ps(t, _mm256_set1_ps(kReact));
-  t = _mm256_blendv_ps(t, _mm256_set1_ps(kReact), small);
+  t = _mm256_blendv_ps(t, _mm256_set1_ps(kReact), tiny);
   _mm256_storeu_ps(out, t);
 #else
   for (int i = 0; i < 8; ++i) out[i] = tti_seconds(px, py, vx, vy, tx[i], ty[i]);

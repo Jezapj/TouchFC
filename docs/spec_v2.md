@@ -133,7 +133,7 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M4 | Homography, scene gate, minimap | **Done.** `--keypoints` runs a 32-point YOLOv8 pose model every 8th frame, fits with RANSAC, and holds that homography between fits by the centroid pan. Without the file, the minimap still uses the wide-shot template. |
 | M5 | SIMD pitch control on a 2 m grid, also runnable on StatsBomb 360 alone | **Done.** 53×34 Spearman time-to-intercept, AVX2 over each row. A 360 frame is just positions and a team bit; no video. The minimap waits for team labels (M6) before painting it. |
 | M6 | Team histogram, label UI, lineup import, session save/load | **Done** without lineup import or session save/load. A control-window click sets team A or B from the torso colour; other tracks follow the nearer colour. A new id within 8 m and the same colour keeps the team for 2 s. |
-| M7 | Ball, possession, then pass/shot only if recall allows, SPADL export | Precision/recall table. Export columns match SPADL. |
+| M7 | Ball, possession, then pass/shot only if recall allows, SPADL export | **Done** for the ball and possession. COCO class 32 is kept as the ball. A player within 1.5 m holds it; a change closes a spell. Pass and shot are not emitted. `spadl.csv` uses the SPADL columns, with type_id 21 for a possession spell. |
 | M8 | PGO, `--pin` on versus off, final report | Before/after for every optimisation that was actually applied, including the ones that did not matter. |
 
 Cut in this order if time runs out: xG timeline (already cut), label inheritance, M7 pass/shot (keep possession), M1b polish, team clustering. Do not cut M0, M1, M2, M3, M5 or M8.

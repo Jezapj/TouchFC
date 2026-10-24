@@ -11,6 +11,7 @@
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
 #include "touchfc/pitch_control.hpp"
+#include "touchfc/possession.hpp"
 #include "touchfc/pitch_landmarks.hpp"
 #include "touchfc/pitch_pose.hpp"
 #include "touchfc/preprocess.hpp"
@@ -31,6 +32,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 #include <atomic>
 #include <cstdint>
@@ -740,4 +742,28 @@ TEST_CASE("team colour follows the seed and survives a gap") {
   REQUIRE(inherit_team(lost, 1, 12.f, 3.f, red, 1500) == 1);
   REQUIRE(inherit_team(lost, 1, 40.f, 3.f, red, 1500) == 0);
   REQUIRE(inherit_team(lost, 1, 12.f, 3.f, blue, 1500) == 0);
+}
+
+TEST_CASE("possession closes a spell and spadl uses the spec columns") {
+  Possession s;
+  const PossOut start = step_possession(s, true, 0.f, 0.f, 4, 1, 1.f, 1.5f, 1000000000LL, 0);
+  REQUIRE_FALSE(start.emitted);
+  REQUIRE(s.held);
+  const PossOut next = step_possession(s, true, 10.f, 0.f, 9, 2, 0.4f, 1.5f, 2000000000LL, 0);
+  REQUIRE(next.emitted);
+  REQUIRE(next.event.team == 1);
+  REQUIRE(next.event.track == 4);
+  REQUIRE(s.track == 9);
+  Possession far;
+  const PossOut none = step_possession(far, true, 0.f, 0.f, 4, 1, 5.f, 1.5f, 0, 0);
+  REQUIRE_FALSE(none.emitted);
+  REQUIRE_FALSE(far.held);
+  char row[256];
+  Event e = next.event;
+  e.id = 1;
+  e.match_ms_end = 2000;
+  format_spadl_row(row, 256, e, 1);
+  REQUIRE(std::strstr(kSpadlHeader, "type_id") != nullptr);
+  REQUIRE(std::strstr(row, ",21,1,0") != nullptr);
+  REQUIRE(std::strstr(row, "52.50,34.00") != nullptr);
 }

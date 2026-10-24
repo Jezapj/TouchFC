@@ -7,6 +7,8 @@
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/gmc.hpp"
 #include "touchfc/homography.hpp"
+#include "touchfc/pitch_control.hpp"
+#include "touchfc/possession.hpp"
 #include "touchfc/scene.hpp"
 #include "touchfc/tracker.hpp"
 #include "touchfc/hdr_sink.hpp"
@@ -52,6 +54,7 @@ class Pipeline {
   void note_present(FrameId frame, TimeNs capture, TimeNs present) noexcept {
     note(3, frame, Stage::Present, capture, present);
   }
+  void write_spadl(const char* path) const;
 
   bool pop_present(std::uint32_t& slot) noexcept { return to_present_.try_pop(slot); }
   std::uint32_t take_live_present() noexcept { return live_present_.take(); }
@@ -74,6 +77,7 @@ class Pipeline {
   void note(int producer, FrameId frame, Stage stage, TimeNs begin, TimeNs end) noexcept;
   void drain_ring(BlockingSpsc<std::uint32_t, kDepth>& ring);
   void assign_teams(FrameSlot& slot);
+  void update_possession(FrameSlot& slot);
 
   FramePool& pool_;
   FrameSource* source_ = nullptr;
@@ -139,6 +143,10 @@ class Pipeline {
   std::uint8_t pc_valid_ = 0;
   float territory_ = 0.5f;
   std::uint8_t pc_ds_[160]{};
+  Possession poss_{};
+  Event poss_events_[64]{};
+  int poss_n_ = 0;
+  std::int64_t poss_t0_ = 0;
 };
 
 }  // namespace touchfc

@@ -114,7 +114,10 @@ class OrtDetector final : public Detector {
       if (num_classes_ >= 80) {
         std::uint32_t kept = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
-          if (slot.dets[i].class_id == 0) slot.dets[kept++] = slot.dets[i];
+          if (slot.dets[i].class_id == 0 || slot.dets[i].class_id == 32) {
+          if (slot.dets[i].class_id == 32) slot.dets[i].class_id = 3;
+          slot.dets[kept++] = slot.dets[i];
+        }
         }
         count = kept;
       }

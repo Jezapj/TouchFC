@@ -114,6 +114,11 @@ class App {
   std::uint8_t last_pc_valid_ = 0;
   float last_territory_ = 0.5f;
   std::array<std::uint8_t, 160> last_pc_ds_{};
+  std::uint8_t last_ball_ok_ = 0;
+  std::uint8_t last_poss_team_ = 0;
+  std::uint16_t last_poss_track_ = 0;
+  float last_ball_x_ = 0.f;
+  float last_ball_y_ = 0.f;
   TimeNs anchor_wall_ = 0;
   TimeNs anchor_pts_ = 0;
   int held_ = -1;
@@ -283,6 +288,11 @@ void App::remember(const FrameSlot& slot) {
   last_pc_valid_ = slot.pc_valid;
   last_territory_ = slot.territory;
   last_pc_ds_ = slot.pc_ds;
+  last_ball_ok_ = slot.ball_ok;
+  last_ball_x_ = slot.ball_x;
+  last_ball_y_ = slot.ball_y;
+  last_poss_team_ = slot.poss_team;
+  last_poss_track_ = slot.poss_track;
   have_frame_ = true;
   const TimeNs now = now_ns();
   if (pipe_) pipe_->note_present(slot.meta.id, slot.meta.t_capture, now);
@@ -460,6 +470,7 @@ void App::draw_view() {
                                                  : kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
         dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
       }
+      if (last_ball_ok_) dl->AddCircleFilled(map(last_ball_x_, last_ball_y_), 4.f, IM_COL32(255, 255, 255, 255));
     }
   }
   ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
@@ -473,6 +484,8 @@ void App::draw_view() {
     const char* scene = last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other";
     ImGui::Text("pitch %s   fit error %.2f m", scene, last_reproj_m_);
     if (last_pc_valid_) ImGui::Text("territory A %.0f%%", last_territory_ * 100.f);
+    if (last_poss_team_ != 0) ImGui::Text("possession %s #%u", last_poss_team_ == 1 ? "A" : "B", last_poss_track_);
+    else if (last_ball_ok_) ImGui::TextUnformatted("ball seen, no holder");
   }
   if (pipe_) {
     const auto drops = pipe_->drops.load() + (source_ ? source_->capture_drops() : 0);
@@ -792,6 +805,7 @@ int App::run() {
     }
     if (pipe_) pipe_->join();
   if (sink_) sink_->write_csv(args_.telemetry_path);
+  if (pipe_) pipe_->write_spadl("spadl.csv");
   if (source_) source_->close();
   pipe_.reset();
   detector_.reset();
