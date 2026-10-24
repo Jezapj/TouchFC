@@ -4,11 +4,13 @@
 #include "frame_source.hpp"
 
 #include "touchfc/blocking_spsc.hpp"
+#include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
 #include "touchfc/time.hpp"
 #include "touchfc/mailbox.hpp"
 #include "touchfc/seqlock.hpp"
 #include "touchfc/telemetry.hpp"
+#include "touchfc/tracker.hpp"
 #include "touchfc/triple_buffer.hpp"
 #include "touchfc/wake.hpp"
 
@@ -99,6 +101,17 @@ class Pipeline {
   std::uint64_t last_hash_ = 0;
   bool have_hash_ = false;
   FrameId next_id_ = 1;
+
+  // T3-owned state. Only run_t3 touches these.
+  Tracker tracker_{};
+  TrackerParams tracker_params_{};
+  TimeNs last_track_t_ns_ = 0;
+  GmcTranslation last_gmc_{};
+  // Previous-frame matched centroids, for the next frame's GMC estimation.
+  float gmc_prev_cx_[kMaxDetections]{};
+  float gmc_prev_cy_[kMaxDetections]{};
+  float gmc_prev_tid_[kMaxDetections]{};
+  std::uint32_t gmc_prev_n_ = 0;
 };
 
 }  // namespace touchfc

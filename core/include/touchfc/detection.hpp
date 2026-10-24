@@ -17,7 +17,7 @@ struct Detection {
   float h = 0;
   float score = 0;
   std::uint16_t class_id = 0;
-  std::uint16_t flags = 0;
+  std::uint16_t track_id = 0;  // 0 before Tracker assigns one
 };
 
 static_assert(std::is_trivially_copyable_v<Detection>);

@@ -69,7 +69,7 @@ inline void decode_yolov8(const float* output, std::uint32_t num_classes,
     d.h = h;
     d.score = best;
     d.class_id = static_cast<std::uint16_t>(best_c);
-    d.flags = 0;
+    d.track_id = 0;
   }
 
   // Sort by score descending so NMS can sweep in one pass.

@@ -3,7 +3,9 @@
 #include "touchfc/cpu.hpp"
 #include "touchfc/detection.hpp"
 #include "touchfc/frame_check.hpp"
+#include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
+#include "touchfc/kalman.hpp"
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
@@ -13,6 +15,7 @@
 #include "touchfc/spsc_ring.hpp"
 #include "touchfc/telemetry.hpp"
 #include "touchfc/time.hpp"
+#include "touchfc/tracker.hpp"
 #include "touchfc/triple_buffer.hpp"
 #include "touchfc/types.hpp"
 #include "touchfc/wake.hpp"
@@ -526,4 +529,74 @@ TEST_CASE("yolo decode drops below-threshold anchors") {
   REQUIRE(out[0].score >= 0.9f);              // sorted by score, 0.95 first
   REQUIRE(out[0].class_id == 3);
   REQUIRE(out[1].class_id == 0);
+}
+
+TEST_CASE("1D kalman converges to the measured velocity") {
+  Kalman1D k;
+  k.p = 0.f;
+  k.v = 0.f;
+  k.Pxx = 100.f;
+  k.Pvv = 100.f;
+  const float dt = 1.f / 30.f;      // 30 fps
+  const float true_v = 50.f;        // pixels per second
+  float noise = 1.0f;
+  // 90 iterations; velocity should be within 10% of truth.
+  for (int i = 0; i < 90; ++i) {
+    k.predict(dt, 0.5f, 0.5f);
+    const float z = true_v * (i + 1) * dt + (i & 1 ? noise : -noise);
+    k.update(z, 2.0f);
+  }
+  REQUIRE(std::abs(k.v - true_v) < 5.f);
+  // A diagonal P (Pxv == 0 always) would still estimate position; the
+  // velocity would stay near zero. This test fails if Pxv is dropped.
+}
+
+TEST_CASE("gmc translation finds the camera pan under outliers") {
+  float px[] = {100, 200, 300, 400, 500, 50};
+  float py[] = {100, 100, 100, 100, 100, 100};
+  float cx[] = {110, 210, 310, 410, 510, 400};  // last pair is a mismatch
+  float cy[] = {105, 105, 105, 105, 105, 300};
+  const auto gmc = estimate_translation(px, py, cx, cy, 6);
+  REQUIRE(std::abs(gmc.dx - 10.f) < 1.f);
+  REQUIRE(std::abs(gmc.dy - 5.f) < 1.f);
+  REQUIRE(gmc.confidence > 0.5f);
+}
+
+TEST_CASE("tracker holds ids over a straight-line pan") {
+  Tracker tr;
+  TrackerParams params;
+  params.conf_new_track = 0.5f;
+  const float dt = 1.f / 50.f;
+  Detection dets[2]{};
+  dets[0] = {100, 300, 40, 80, 0.9f, 0, 0};
+  dets[1] = {500, 300, 40, 80, 0.9f, 0, 0};
+  tr.update(dets, 2, dt, {}, params);
+  const std::uint16_t id0 = dets[0].track_id;
+  const std::uint16_t id1 = dets[1].track_id;
+  REQUIRE(id0 != 0);
+  REQUIRE(id1 != 0);
+  REQUIRE(id0 != id1);
+  // Move both by the same delta each frame (a pure camera pan).
+  for (int i = 0; i < 50; ++i) {
+    dets[0] = {100 + 5.f * (i + 1), 300, 40, 80, 0.9f, 0, 0};
+    dets[1] = {500 + 5.f * (i + 1), 300, 40, 80, 0.9f, 0, 0};
+    tr.update(dets, 2, dt, {}, params);
+    REQUIRE(dets[0].track_id == id0);
+    REQUIRE(dets[1].track_id == id1);
+  }
+}
+
+TEST_CASE("tracker drops a tentative that misses enough frames") {
+  Tracker tr;
+  TrackerParams params;
+  Detection d{100, 100, 20, 40, 0.9f, 0, 0};
+  tr.update(&d, 1, 0.02f, {}, params);
+  REQUIRE(d.track_id != 0);
+  // No detections for many frames.
+  for (std::uint32_t i = 0; i < params.max_misses_tent + 2; ++i) {
+    tr.update(nullptr, 0, 0.02f, {}, params);
+  }
+  int alive = 0;
+  for (const auto& t : tr.tracks) if (t.id != 0) ++alive;
+  REQUIRE(alive == 0);
 }
