@@ -2,6 +2,8 @@ build/
 .tools/
 third_party/ffmpeg/
 third_party/downloads/
+third_party/onnxruntime/
+third_party/models/
 vcpkg_installed/
 telemetry.csv
 *.user

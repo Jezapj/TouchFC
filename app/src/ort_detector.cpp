@@ -92,15 +92,35 @@ class OrtDetector final : public Detector {
                                                       input_tensor_.size(), in_shape, 4);
       const char* in_names[] = {input_name_.c_str()};
       const char* out_names[] = {output_name_.c_str()};
-      Ort::Value out = session_->Run(Ort::RunOptions{nullptr}, in_names, &in, 1, out_names, 1)[0];
-      const float* data = out.GetTensorData<float>();
+      auto outputs = session_->Run(Ort::RunOptions{nullptr}, in_names, &in, 1, out_names, 1);
+      if (outputs.empty() || !outputs[0].IsTensor()) {
+        slot.det_count = 0;
+        return;
+      }
+      const float* data = outputs[0].GetTensorData<float>();
       std::uint32_t count = 0;
       bool truncated = false;
       decode_yolov8(data, num_classes_, num_anchors_, 0.25f, lb, slot.dets.data(),
                     static_cast<std::uint32_t>(slot.dets.size()), count, truncated);
       count = greedy_nms(slot.dets.data(), count, 0.45f);
       if (count > slot.dets.size()) count = static_cast<std::uint32_t>(slot.dets.size());
+      // COCO YOLOv8 is 80 classes and class 0 is "person". A broadcast frame is
+      // full of other classes (ball ads, cars, seats). Keep people only so the
+      // tracker follows players. A smaller model is a soccer head and keeps
+      // every class it was trained with.
+      if (num_classes_ >= 80) {
+        std::uint32_t kept = 0;
+        for (std::uint32_t i = 0; i < count; ++i) {
+          if (slot.dets[i].class_id == 0) slot.dets[kept++] = slot.dets[i];
+        }
+        count = kept;
+      }
       slot.det_count = count;
+      if (logged_frames_ < 3) {
+        ++logged_frames_;
+        log_line("ORT detections: " + std::to_string(count) +
+                 (truncated ? " (truncated)" : ""));
+      }
       (void)truncated;
     } catch (const Ort::Exception&) {
       slot.det_count = 0;
@@ -120,6 +140,7 @@ class OrtDetector final : public Detector {
   std::uint32_t num_anchors_ = 0;
   std::vector<float> input_tensor_;
   std::vector<float> output_buffer_;
+  int logged_frames_ = 0;
 };
 
 }  // namespace

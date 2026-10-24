@@ -86,7 +86,7 @@ Second-pass read of the primitives and the pipeline against Part A, done after t
 
 Not done, by choice:
 - **YUV-direct preprocess.** FFmpeg already does YUV->BGRA through `sws_scale` on T1 of the replay path, and the BGRA letterbox is 1 ms. A direct `AV_PIX_FMT_YUV420P` reader skips one copy and saves bandwidth; it is the first thing to add if profiling shows preprocess as a tail-latency problem.
-- **Full ORT bring-up.** The code compiles against `third_party/onnxruntime` when present and the user runs with `--model`. Session options, output allocation and preprocess tensor are already there. It has not been exercised against a model this session because weights are not committed (YOLOv8 is claimed AGPL by Ultralytics; a licence check must land before the first run).
+- **ORT bring-up.** ONNX Runtime 1.20.1 and Ultralytics YOLOv8n v8.4.0 (AGPL-3.0, confirmed on the v8.4.0 `LICENSE`) live under `third_party/` and are gitignored. `--replay` of the Ultralytics bus still through `yolov8n.onnx` logged `classes=80` and 4 person boxes on three frames. A live match window has not been captured in this run.
 - **Execution-provider selection in the HUD.** Only "stub" or "ort" is reported today.
 
 Hot-path status:
