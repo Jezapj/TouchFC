@@ -33,6 +33,10 @@ struct FrameSlot {
   float reproj_m = 0.f;
   std::array<float, kMaxDetections> pitch_x{};
   std::array<float, kMaxDetections> pitch_y{};
+  std::array<std::uint8_t, kMaxDetections> det_team{};
+  std::uint8_t pc_valid = 0;
+  float territory = 0.5f;
+  std::array<std::uint8_t, 160> pc_ds{};
 };
 
 // Slots are allocated once. The index from SlotPool is the vector index.

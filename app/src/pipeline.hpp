@@ -73,6 +73,7 @@ class Pipeline {
   void run_t6();
   void note(int producer, FrameId frame, Stage stage, TimeNs begin, TimeNs end) noexcept;
   void drain_ring(BlockingSpsc<std::uint32_t, kDepth>& ring);
+  void assign_teams(FrameSlot& slot);
 
   FramePool& pool_;
   FrameSource* source_ = nullptr;
@@ -119,6 +120,25 @@ class Pipeline {
   float pan_x_ = 0.f;
   float pan_y_ = 0.f;
   int pitch_logs_ = 0;
+  Lab seed_[2]{};
+  bool seed_ok_[2]{};
+  std::uint16_t seed_req_id_ = 0;
+  std::uint8_t seed_req_team_ = 0;
+  struct Mem {
+    std::uint16_t id = 0;
+    float x = 0.f;
+    float y = 0.f;
+    Lab lab{};
+    std::uint8_t team = 0;
+  };
+  Mem prev_[64]{};
+  int prev_n_ = 0;
+  LostLabel lost_[16]{};
+  int lost_n_ = 0;
+  TimeNs last_pc_ns_ = 0;
+  std::uint8_t pc_valid_ = 0;
+  float territory_ = 0.5f;
+  std::uint8_t pc_ds_[160]{};
 };
 
 }  // namespace touchfc

@@ -4,6 +4,7 @@
 #include "marker.hpp"
 #include "threads_win.hpp"
 
+#include "touchfc/pitch_control.hpp"
 #include "touchfc/pitch_landmarks.hpp"
 
 #include "touchfc/frame_check.hpp"
@@ -201,6 +202,147 @@ void Pipeline::run_t2() {
   to_track_.wake();
 }
 
+void Pipeline::assign_teams(FrameSlot& slot) {
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) slot.det_team[i] = 0;
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    const Detection& d = slot.dets[i];
+    if (d.track_id == 0) continue;
+    Lab sample;
+    if (!torso_lab(slot.bgra.get(), slot.stride, slot.meta.width, slot.meta.height, d.x, d.y, d.w, d.h,
+                   sample))
+      continue;
+    for (auto& t : tracker_.tracks) {
+      if (t.id != d.track_id) continue;
+      if (t.hits <= 1) t.lab = sample;
+      else {
+        t.lab.L = 0.8f * t.lab.L + 0.2f * sample.L;
+        t.lab.a = 0.8f * t.lab.a + 0.2f * sample.a;
+        t.lab.b = 0.8f * t.lab.b + 0.2f * sample.b;
+      }
+      break;
+    }
+  }
+  if (seed_req_id_ != 0) {
+    for (auto& t : tracker_.tracks) {
+      if (t.id != seed_req_id_) continue;
+      const int s = seed_req_team_ - 1;
+      seed_[s] = t.lab;
+      seed_ok_[s] = true;
+      t.team = seed_req_team_;
+      t.team_lock = true;
+      break;
+    }
+    seed_req_id_ = 0;
+  }
+  if (seed_ok_[0] || seed_ok_[1]) {
+    for (auto& t : tracker_.tracks) {
+      if (t.id == 0 || t.team_lock) continue;
+      t.team = static_cast<std::uint8_t>(nearest_team(t.lab, seed_[0], seed_ok_[0], seed_[1], seed_ok_[1]));
+    }
+  }
+  for (auto& t : tracker_.tracks) {
+    if (t.id == 0 || t.hits != 1 || t.team != 0) continue;
+    float px = 0, py = 0;
+    bool have = false;
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      if (slot.dets[i].track_id != t.id || !slot.pitch_valid) continue;
+      px = slot.pitch_x[i];
+      py = slot.pitch_y[i];
+      have = true;
+      break;
+    }
+    if (!have) continue;
+    const int inherited = inherit_team(lost_, lost_n_, px, py, t.lab, last_track_t_ns_);
+    if (inherited != 0) {
+      t.team = static_cast<std::uint8_t>(inherited);
+      t.team_lock = true;
+    }
+  }
+  Mem next[64]{};
+  int next_n = 0;
+  for (const auto& t : tracker_.tracks) {
+    if (t.id == 0 || next_n >= 64) continue;
+    Mem m;
+    m.id = t.id;
+    m.lab = t.lab;
+    m.team = t.team;
+    bool have = false;
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      if (slot.dets[i].track_id != t.id) continue;
+      m.x = slot.pitch_x[i];
+      m.y = slot.pitch_y[i];
+      have = slot.pitch_valid != 0;
+      break;
+    }
+    if (!have) {
+      for (int k = 0; k < prev_n_; ++k) {
+        if (prev_[k].id != t.id) continue;
+        m.x = prev_[k].x;
+        m.y = prev_[k].y;
+        break;
+      }
+    }
+    next[next_n++] = m;
+  }
+  const TimeNs now = last_track_t_ns_;
+  for (int k = 0; k < prev_n_; ++k) {
+    if (prev_[k].team == 0) continue;
+    bool alive = false;
+    for (int i = 0; i < next_n; ++i)
+      if (next[i].id == prev_[k].id) alive = true;
+    if (alive) continue;
+    if (lost_n_ < 16) {
+      lost_[lost_n_++] = {prev_[k].x, prev_[k].y, prev_[k].lab, prev_[k].team, now};
+    } else {
+      lost_[0] = {prev_[k].x, prev_[k].y, prev_[k].lab, prev_[k].team, now};
+    }
+  }
+  prev_n_ = next_n;
+  for (int i = 0; i < next_n; ++i) prev_[i] = next[i];
+
+  int n0 = 0, n1 = 0;
+  for (const auto& t : tracker_.tracks) {
+    if (t.team == 1) ++n0;
+    else if (t.team == 2) ++n1;
+  }
+  if (n0 > 0 && n1 > 0 && slot.pitch_valid && now - last_pc_ns_ > 100000000LL) {
+    PcPlayer players[kPcMaxPlayers]{};
+    int n = 0;
+    for (std::uint32_t i = 0; i < slot.det_count && n < kPcMaxPlayers; ++i) {
+      const auto id = slot.dets[i].track_id;
+      if (id == 0) continue;
+      std::uint8_t team = 0;
+      for (const auto& t : tracker_.tracks)
+        if (t.id == id) team = t.team;
+      if (team != 1 && team != 2) continue;
+      players[n++] = {slot.pitch_x[i], slot.pitch_y[i], 0.f, 0.f, static_cast<std::uint8_t>(team - 1)};
+    }
+    if (n >= 2) {
+      float grid[kPcCells];
+      territory_ = pitch_control(players, n, 0.f, 0.f, false, grid);
+      for (int j = 0; j < 10; ++j) {
+        for (int i = 0; i < 16; ++i) {
+          const int si = i * kPcNx / 16;
+          const int sj = j * kPcNy / 10;
+          const float p = grid[sj * kPcNx + si];
+          pc_ds_[j * 16 + i] = static_cast<std::uint8_t>(p < 0.f ? 0 : p > 1.f ? 255 : p * 255.f);
+        }
+      }
+      pc_valid_ = 1;
+      last_pc_ns_ = now;
+    }
+  }
+  slot.pc_valid = pc_valid_;
+  slot.territory = territory_;
+  for (int i = 0; i < 160; ++i) slot.pc_ds[static_cast<std::uint32_t>(i)] = pc_ds_[i];
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    const auto id = slot.dets[i].track_id;
+    if (id == 0) continue;
+    for (const auto& t : tracker_.tracks)
+      if (t.id == id) slot.det_team[i] = t.team;
+  }
+}
+
 void Pipeline::run_t3() {
   if (pin_) pin_current_thread_to_one_ccd();
   set_pipeline_thread();
@@ -209,6 +351,9 @@ void Pipeline::run_t3() {
     while (commands_.try_pop(command)) {
       if (command.type == CmdType::ApplyAttackDir) {
         attack_dir.store(command.u8a == 0 ? -1 : 1, std::memory_order_relaxed);
+      } else if (command.type == CmdType::SetTeamSeed && (command.u8a == 1 || command.u8a == 2)) {
+        seed_req_id_ = command.u16a;
+        seed_req_team_ = command.u8a;
       }
     }
     std::uint32_t index = 0;
@@ -304,6 +449,7 @@ void Pipeline::run_t3() {
       }
       apply_homography(pitch_h_, fx, fy, slot.pitch_x[i], slot.pitch_y[i]);
     }
+    assign_teams(slot);
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;

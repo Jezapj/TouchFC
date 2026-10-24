@@ -18,6 +18,7 @@
 #include "touchfc/scene.hpp"
 #include "touchfc/slot_pool.hpp"
 #include "touchfc/spsc_ring.hpp"
+#include "touchfc/team.hpp"
 #include "touchfc/telemetry.hpp"
 #include "touchfc/time.hpp"
 #include "touchfc/tracker.hpp"
@@ -728,4 +729,15 @@ TEST_CASE("statsbomb frame is a pitch-control input") {
   pitch_control(crowd, 22, 0.f, 0.f, true, grid);
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   REQUIRE(ms < 100.0);
+}
+
+TEST_CASE("team colour follows the seed and survives a gap") {
+  const Lab red = rgb_to_lab(180, 30, 30);
+  const Lab blue = rgb_to_lab(30, 60, 180);
+  REQUIRE(nearest_team(rgb_to_lab(170, 40, 40), red, true, blue, true) == 1);
+  REQUIRE(nearest_team(rgb_to_lab(40, 70, 190), red, true, blue, true) == 2);
+  LostLabel lost[1] = {{10.f, 2.f, red, 1, 1000}};
+  REQUIRE(inherit_team(lost, 1, 12.f, 3.f, red, 1500) == 1);
+  REQUIRE(inherit_team(lost, 1, 40.f, 3.f, red, 1500) == 0);
+  REQUIRE(inherit_team(lost, 1, 12.f, 3.f, blue, 1500) == 0);
 }

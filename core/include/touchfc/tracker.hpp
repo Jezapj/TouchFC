@@ -4,6 +4,7 @@
 #include "touchfc/gmc.hpp"
 #include "touchfc/kalman.hpp"
 #include "touchfc/nms.hpp"
+#include "touchfc/team.hpp"
 
 #include <cstdint>
 
@@ -19,6 +20,9 @@ struct Track {
   std::uint32_t hits = 0;
   std::uint32_t misses = 0;
   bool confirmed = false;
+  bool team_lock = false;
+  std::uint8_t team = 0;
+  Lab lab{};
   Detection to_detection() const noexcept {
     Detection d;
     d.w = kf.w.p;

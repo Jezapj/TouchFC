@@ -110,6 +110,10 @@ class App {
   float last_reproj_m_ = 0.f;
   std::array<float, kMaxDetections> last_pitch_x_{};
   std::array<float, kMaxDetections> last_pitch_y_{};
+  std::array<std::uint8_t, kMaxDetections> last_team_{};
+  std::uint8_t last_pc_valid_ = 0;
+  float last_territory_ = 0.5f;
+  std::array<std::uint8_t, 160> last_pc_ds_{};
   TimeNs anchor_wall_ = 0;
   TimeNs anchor_pts_ = 0;
   int held_ = -1;
@@ -274,7 +278,11 @@ void App::remember(const FrameSlot& slot) {
   for (std::uint32_t i = 0; i < slot.det_count && i < last_pitch_x_.size(); ++i) {
     last_pitch_x_[i] = slot.pitch_x[i];
     last_pitch_y_[i] = slot.pitch_y[i];
+    last_team_[i] = slot.det_team[i];
   }
+  last_pc_valid_ = slot.pc_valid;
+  last_territory_ = slot.territory;
+  last_pc_ds_ = slot.pc_ds;
   have_frame_ = true;
   const TimeNs now = now_ns();
   if (pipe_) pipe_->note_present(slot.meta.id, slot.meta.t_capture, now);
@@ -411,13 +419,16 @@ void App::draw_view() {
     auto* dl = ImGui::GetForegroundDrawList();
     for (std::uint32_t i = 0; i < last_det_count_; ++i) {
       const Detection& d = last_dets_[i];
-      const ImU32 col = kClassColor[d.class_id < 4 ? d.class_id : 4];
+      const bool teamed = last_team_[i] == 1 || last_team_[i] == 2;
+      const ImU32 col = teamed ? (last_team_[i] == 1 ? IM_COL32(40, 140, 255, 255) : IM_COL32(255, 70, 70, 255))
+                               : kClassColor[d.class_id < 4 ? d.class_id : 4];
       const ImVec2 a(ox + d.x * scale, oy + d.y * scale);
       const ImVec2 b(ox + (d.x + d.w) * scale, oy + (d.y + d.h) * scale);
       dl->AddRect(a, b, col, 0.f, 0, 1.5f);
       if (d.track_id != 0) {
         char label[16];
-        std::snprintf(label, sizeof(label), "#%u", static_cast<unsigned>(d.track_id));
+        const char* tag = last_team_[i] == 1 ? "A" : last_team_[i] == 2 ? "B" : "";
+        std::snprintf(label, sizeof(label), "#%u%s%s", static_cast<unsigned>(d.track_id), tag[0] ? " " : "", tag);
         dl->AddText(ImVec2(a.x + 2.f, a.y + 2.f), col, label);
       }
     }
@@ -425,6 +436,18 @@ void App::draw_view() {
       const float mx = 16.f, my = ch - 128.f, mw = 150.f, mh = 100.f;
       dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
       dl->AddRect(ImVec2(mx + 8, my + 8), ImVec2(mx + mw - 8, my + mh - 8), IM_COL32(220, 220, 220, 180));
+      if (last_pc_valid_) {
+        const float iw = mw - 16.f;
+        const float ih = mh - 16.f;
+        for (int j = 0; j < 10; ++j) {
+          for (int i = 0; i < 16; ++i) {
+            const int p = last_pc_ds_[static_cast<std::uint32_t>((9 - j) * 16 + i)];
+            const ImU32 col = IM_COL32(200 - p * 160 / 255, 40, 40 + p * 180 / 255, 110);
+            dl->AddRectFilled(ImVec2(mx + 8.f + i * iw / 16.f, my + 8.f + j * ih / 10.f),
+                              ImVec2(mx + 8.f + (i + 1) * iw / 16.f, my + 8.f + (j + 1) * ih / 10.f), col);
+          }
+        }
+      }
       auto map = [&](float px, float py) {
         const float u = (px + 52.5f) / 105.f;
         const float v = (34.f - py) / 68.f;
@@ -432,7 +455,9 @@ void App::draw_view() {
       };
       for (std::uint32_t i = 0; i < last_det_count_; ++i) {
         if (last_dets_[i].class_id > 1) continue;
-        const ImU32 col = kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
+        const ImU32 col = (last_team_[i] == 1) ? IM_COL32(40, 140, 255, 255)
+                          : (last_team_[i] == 2) ? IM_COL32(255, 70, 70, 255)
+                                                 : kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
         dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
       }
     }
@@ -447,6 +472,7 @@ void App::draw_view() {
   if (last_pitch_valid_) {
     const char* scene = last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other";
     ImGui::Text("pitch %s   fit error %.2f m", scene, last_reproj_m_);
+    if (last_pc_valid_) ImGui::Text("territory A %.0f%%", last_territory_ * 100.f);
   }
   if (pipe_) {
     const auto drops = pipe_->drops.load() + (source_ ? source_->capture_drops() : 0);
@@ -594,7 +620,36 @@ void App::draw_control() {
         pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    ImGui::SameLine();
+    ImGui::TextUnformatted("Click a track to set its team. Others follow that colour.");
+    int shown = 0;
+    for (std::uint32_t i = 0; i < last_det_count_ && shown < 12; ++i) {
+      const auto id = last_dets_[i].track_id;
+      if (id == 0) continue;
+      bool dup = false;
+      for (std::uint32_t k = 0; k < i; ++k)
+        if (last_dets_[k].track_id == id) dup = true;
+      if (dup) continue;
+      ++shown;
+      const char* tag = last_team_[i] == 1 ? "A" : last_team_[i] == 2 ? "B" : "-";
+      ImGui::PushID(static_cast<int>(id));
+      ImGui::Text("#%u  %s", static_cast<unsigned>(id), tag);
+      ImGui::SameLine();
+      auto send = [&](std::uint8_t team) {
+        UiCommand cmd;
+        cmd.type = CmdType::SetTeamSeed;
+        cmd.u8a = team;
+        cmd.u16a = id;
+        if (!pipe_->commands().try_push(cmd)) {
+          pending_ = cmd;
+          pending_cmd_ = true;
+          pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
+        }
+      };
+      if (ImGui::SmallButton("A")) send(1);
+      ImGui::SameLine();
+      if (ImGui::SmallButton("B")) send(2);
+      ImGui::PopID();
+    }
     ImGui::Text("dir %d   command warns %llu", pipe_->attack_dir.load(),
                 static_cast<unsigned long long>(pipe_->command_warns.load()));
     if (pending_cmd_) ImGui::TextUnformatted("command queue full; will retry");
