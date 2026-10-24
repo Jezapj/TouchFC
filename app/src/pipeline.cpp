@@ -210,6 +210,40 @@ void Pipeline::run_t3() {
       marker.h = 0;
       slot.det_count = 0;
     }
+    const TimeNs now = now_ns();
+    float dt = tracker_params_.dt_default;
+    if (last_track_t_ns_ != 0) {
+      const float measured = static_cast<float>(now - last_track_t_ns_) * 1.0e-9f;
+      if (measured > 0.f && measured < 0.2f) dt = measured;
+    }
+    last_track_t_ns_ = now;
+    if (cfg.iou_match_thresh > 0.f) tracker_params_.iou_hi = cfg.iou_match_thresh;
+    tracker_params_.conf_new_track = cfg.conf_player;
+    tracker_.update(slot.dets.data(), slot.det_count, dt, last_gmc_, tracker_params_);
+    float pcx[64], pcy[64], ccx[64], ccy[64];
+    std::uint32_t pairs = 0;
+    for (std::uint32_t i = 0; i < slot.det_count && pairs < 64; ++i) {
+      const auto id = slot.dets[i].track_id;
+      if (id == 0) continue;
+      for (std::uint32_t j = 0; j < gmc_n_; ++j) {
+        if (gmc_id_[j] != id) continue;
+        pcx[pairs] = gmc_px_[j];
+        pcy[pairs] = gmc_py_[j];
+        ccx[pairs] = slot.dets[i].x + 0.5f * slot.dets[i].w;
+        ccy[pairs] = slot.dets[i].y + 0.5f * slot.dets[i].h;
+        ++pairs;
+        break;
+      }
+    }
+    last_gmc_ = pairs >= 3 ? estimate_translation(pcx, pcy, ccx, ccy, pairs) : GmcTranslation{};
+    gmc_n_ = 0;
+    for (std::uint32_t i = 0; i < slot.det_count && gmc_n_ < 64; ++i) {
+      if (slot.dets[i].track_id == 0) continue;
+      gmc_id_[gmc_n_] = slot.dets[i].track_id;
+      gmc_px_[gmc_n_] = slot.dets[i].x + 0.5f * slot.dets[i].w;
+      gmc_py_[gmc_n_] = slot.dets[i].y + 0.5f * slot.dets[i].h;
+      ++gmc_n_;
+    }
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;

@@ -3,7 +3,9 @@
 #include "touchfc/cpu.hpp"
 #include "touchfc/detection.hpp"
 #include "touchfc/frame_check.hpp"
+#include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
+#include "touchfc/kalman.hpp"
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
@@ -13,6 +15,7 @@
 #include "touchfc/spsc_ring.hpp"
 #include "touchfc/telemetry.hpp"
 #include "touchfc/time.hpp"
+#include "touchfc/tracker.hpp"
 #include "touchfc/triple_buffer.hpp"
 #include "touchfc/types.hpp"
 #include "touchfc/wake.hpp"
@@ -526,4 +529,48 @@ TEST_CASE("yolo decode drops below-threshold anchors") {
   REQUIRE(out[0].score >= 0.9f);              // sorted by score, 0.95 first
   REQUIRE(out[0].class_id == 3);
   REQUIRE(out[1].class_id == 0);
+}
+
+TEST_CASE("1D kalman learns velocity") {
+  Kalman1D k;
+  k.Pxx = 100.f;
+  k.Pvv = 100.f;
+  const float dt = 1.f / 30.f;
+  for (int i = 0; i < 90; ++i) {
+    k.predict(dt, 0.5f, 0.5f);
+    k.update(50.f * (i + 1) * dt, 2.f);
+  }
+  REQUIRE(std::abs(k.v - 50.f) < 5.f);
+}
+
+TEST_CASE("gmc ignores one bad pair") {
+  float px[] = {100, 200, 300, 400, 500, 50};
+  float py[] = {100, 100, 100, 100, 100, 100};
+  float cx[] = {110, 210, 310, 410, 510, 400};
+  float cy[] = {105, 105, 105, 105, 105, 300};
+  const auto g = estimate_translation(px, py, cx, cy, 6);
+  REQUIRE(std::abs(g.dx - 10.f) < 1.f);
+  REQUIRE(std::abs(g.dy - 5.f) < 1.f);
+}
+
+TEST_CASE("tracker keeps ids across a pan") {
+  Tracker tr;
+  TrackerParams params;
+  params.conf_new_track = 0.5f;
+  Detection dets[2]{};
+  dets[0] = {100, 300, 40, 80, 0.9f, 0, 0};
+  dets[1] = {500, 300, 40, 80, 0.9f, 0, 0};
+  tr.update(dets, 2, 0.02f, {}, params);
+  const auto a = dets[0].track_id;
+  const auto b = dets[1].track_id;
+  REQUIRE(a != 0);
+  REQUIRE(b != 0);
+  REQUIRE(a != b);
+  for (int i = 0; i < 40; ++i) {
+    dets[0] = {100.f + 5.f * (i + 1), 300, 40, 80, 0.9f, 0, 0};
+    dets[1] = {500.f + 5.f * (i + 1), 300, 40, 80, 0.9f, 0, 0};
+    tr.update(dets, 2, 0.02f, {}, params);
+    REQUIRE(dets[0].track_id == a);
+    REQUIRE(dets[1].track_id == b);
+  }
 }

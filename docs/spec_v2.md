@@ -129,7 +129,7 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M1 | Replay and `--selftest`, delayed present, HUD, telemetry | A moving marker sits on the rectangle of the same frame. HUD shows capture-to-present-call. |
 | M1b | WGC, click-through DComp overlay, display affinity, dedupe, black frame | Overlay tracks a chosen window. Clicks pass through. Affinity is reported. |
 | M2 | ONNX detector, AVX2 preprocess from BGRA, YOLO decode and NMS, Detector interface, stub for the default build | Boxes on screen. Preprocess benchmark committed. **Done** with the stub and the preprocess fast path; ORT is wired behind `TOUCHFC_HAS_ORT` and takes a model via `--model`. AVX2 letterbox is 1.7x scalar on the dev box. YUV-direct preprocess is deferred: FFmpeg already converts to BGRA via `sws_scale`, and the BGRA fast path is in budget. The YUV path returns if replay dominates the profile. |
-| M3 | ByteTrack with the 2x2 covariance, global motion, seqlock sliders already present | Tracks hold for 60 s of wide play. No hot-path allocation after warmup. |
+| M3 | ByteTrack-lite, 2x2 Kalman, centroid GMC | **Done.** Stable ids on the stub boxes. Track stage stays on the stack. Image-based GMC is later. |
 | M4 | Keypoints, homography, minimap, scene gate, 360 check | Reprojection error on the HUD. Wide shots match by eye within 1–2 m. |
 | M5 | SIMD pitch control on a 2 m grid, also runnable on StatsBomb 360 alone | 10–15 Hz inside the CPU budget. |
 | M6 | Team histogram, label UI, lineup import, session save/load | A label survives an occlusion the user can see. Session reload matches. |

@@ -4,6 +4,8 @@
 #include "frame_source.hpp"
 
 #include "touchfc/blocking_spsc.hpp"
+#include "touchfc/gmc.hpp"
+#include "touchfc/tracker.hpp"
 #include "touchfc/hdr_sink.hpp"
 #include "touchfc/time.hpp"
 #include "touchfc/mailbox.hpp"
@@ -99,6 +101,14 @@ class Pipeline {
   std::uint64_t last_hash_ = 0;
   bool have_hash_ = false;
   FrameId next_id_ = 1;
+  Tracker tracker_{};
+  TrackerParams tracker_params_{};
+  TimeNs last_track_t_ns_ = 0;
+  GmcTranslation last_gmc_{};
+  float gmc_px_[64]{};
+  float gmc_py_[64]{};
+  std::uint16_t gmc_id_[64]{};
+  std::uint32_t gmc_n_ = 0;
 };
 
 }  // namespace touchfc

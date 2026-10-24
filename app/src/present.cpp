@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
@@ -400,6 +401,11 @@ void App::draw_view() {
       const ImVec2 a(ox + d.x * scale, oy + d.y * scale);
       const ImVec2 b(ox + (d.x + d.w) * scale, oy + (d.y + d.h) * scale);
       dl->AddRect(a, b, col, 0.f, 0, 1.5f);
+      if (d.track_id != 0) {
+        char label[16];
+        std::snprintf(label, sizeof(label), "#%u", static_cast<unsigned>(d.track_id));
+        dl->AddText(ImVec2(a.x + 2.f, a.y + 2.f), col, label);
+      }
     }
   }
   ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
