@@ -10,6 +10,7 @@
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
+#include "touchfc/pitch_control.hpp"
 #include "touchfc/pitch_landmarks.hpp"
 #include "touchfc/pitch_pose.hpp"
 #include "touchfc/preprocess.hpp"
@@ -27,6 +28,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <cmath>
 
 #include <atomic>
@@ -656,4 +658,74 @@ TEST_CASE("pitch pose decode keeps the visible keypoints") {
   REQUIRE(found[0].id == 0);
   REQUIRE(std::abs(found[0].x - 100.f) < 0.01f);
   REQUIRE(std::abs(found[0].y - 50.f) < 0.01f);
+}
+
+TEST_CASE("tti row matches the scalar intercept time") {
+  const float tx[8] = {-40, -20, -5, 0, 8, 15, 30, 48};
+  const float ty[8] = {0, 4, -10, 20, -20, 6, 12, -8};
+  float row[8];
+  tti_row8(-10.f, 2.f, 3.f, -1.f, tx, ty, row);
+  for (int i = 0; i < 8; ++i) {
+    const float s = tti_seconds(-10.f, 2.f, 3.f, -1.f, tx[i], ty[i]);
+    REQUIRE(std::abs(row[i] - s) < 0.02f);
+  }
+}
+
+TEST_CASE("pitch control favours the nearer team") {
+  PcPlayer players[2] = {};
+  players[0] = {-20.f, 0.f, 0.f, 0.f, 0};
+  players[1] = {20.f, 0.f, 0.f, 0.f, 1};
+  float grid[kPcCells];
+  const float territory = pitch_control(players, 2, 0.f, 0.f, false, grid);
+  int i0 = 0, i1 = 0;
+  float best0 = 1e9f, best1 = 1e9f;
+  for (int i = 0; i < kPcNx; ++i) {
+    const float d0 = std::abs(pc_cell_x(i) - -20.f);
+    const float d1 = std::abs(pc_cell_x(i) - 20.f);
+    if (d0 < best0) { best0 = d0; i0 = i; }
+    if (d1 < best1) { best1 = d1; i1 = i; }
+  }
+  const int row = kPcNy / 2;
+  REQUIRE(grid[row * kPcNx + i0] > 0.65f);
+  REQUIRE(grid[row * kPcNx + i1] < 0.35f);
+  REQUIRE(territory > 0.35f);
+  REQUIRE(territory < 0.65f);
+}
+
+TEST_CASE("statsbomb frame is a pitch-control input") {
+  const PitchPoint centre = statsbomb_to_internal(60.f, 40.f);
+  REQUIRE(std::abs(centre.x) < 0.01f);
+  REQUIRE(std::abs(centre.y) < 0.01f);
+  PcPlayer players[10]{};
+  for (int i = 0; i < 5; ++i) {
+    const PitchPoint h = statsbomb_to_internal(90.f + static_cast<float>(i), 30.f + static_cast<float>(i) * 4.f);
+    players[i] = {h.x, h.y, 0.f, 0.f, 0};
+    const PitchPoint a = statsbomb_to_internal(20.f + static_cast<float>(i), 28.f + static_cast<float>(i) * 4.f);
+    players[5 + i] = {a.x, a.y, 0.f, 0.f, 1};
+  }
+  float grid[kPcCells];
+  const auto t0 = std::chrono::steady_clock::now();
+  pitch_control(players, 10, 0.f, 0.f, false, grid);
+  const PitchPoint home = statsbomb_to_internal(92.f, 40.f);
+  const PitchPoint away = statsbomb_to_internal(22.f, 40.f);
+  int ih = 0, ia = 0;
+  float dh = 1e9f, da = 1e9f;
+  for (int i = 0; i < kPcNx; ++i) {
+    const float dxh = std::abs(pc_cell_x(i) - home.x);
+    const float dxa = std::abs(pc_cell_x(i) - away.x);
+    if (dxh < dh) { dh = dxh; ih = i; }
+    if (dxa < da) { da = dxa; ia = i; }
+  }
+  const int mid = kPcNy / 2;
+  REQUIRE(grid[mid * kPcNx + ih] > 0.65f);
+  REQUIRE(grid[mid * kPcNx + ia] < 0.35f);
+  PcPlayer crowd[22]{};
+  for (int i = 0; i < 22; ++i) {
+    crowd[i].x = -40.f + static_cast<float>(i) * 4.f;
+    crowd[i].y = (i % 2 == 0) ? -15.f : 15.f;
+    crowd[i].team = static_cast<std::uint8_t>(i < 11 ? 0 : 1);
+  }
+  pitch_control(crowd, 22, 0.f, 0.f, true, grid);
+  const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  REQUIRE(ms < 100.0);
 }

@@ -20,6 +20,14 @@ inline PitchPoint internal_to_spadl(PitchPoint internal, int attack_dir, float l
   return out;
 }
 
+// StatsBomb locations live on a 120 x 80 pitch, origin at the left-bottom corner.
+inline PitchPoint statsbomb_to_internal(float sb_x, float sb_y) noexcept {
+  PitchPoint out;
+  out.x = (sb_x / 120.f - 0.5f) * 105.f;
+  out.y = (sb_y / 80.f - 0.5f) * 68.f;
+  return out;
+}
+
 inline PitchPoint spadl_to_internal(PitchPoint spadl, int attack_dir, float length = 105.f,
                                     float width = 68.f) noexcept {
   const float dir = attack_dir >= 0 ? 1.f : -1.f;
