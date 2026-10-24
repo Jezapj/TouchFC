@@ -1,0 +1,74 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "MSVC, FetchContent deps",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "TOUCHFC_BUILD_TESTS": "ON",
+        "TOUCHFC_BUILD_BENCH": "ON",
+        "TOUCHFC_BUILD_APP": "ON",
+        "TOUCHFC_USE_VCPKG": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-vcpkg",
+      "displayName": "MSVC + vcpkg manifest",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "TOUCHFC_BUILD_TESTS": "ON",
+        "TOUCHFC_BUILD_BENCH": "ON",
+        "TOUCHFC_BUILD_APP": "ON",
+        "TOUCHFC_USE_VCPKG": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "linux-clang-tsan",
+      "displayName": "clang ThreadSanitizer, core only",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "TOUCHFC_BUILD_TESTS": "ON",
+        "TOUCHFC_BUILD_BENCH": "ON",
+        "TOUCHFC_BUILD_APP": "OFF",
+        "TOUCHFC_TSAN": "ON",
+        "TOUCHFC_USE_VCPKG": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc-release",
+      "configurePreset": "windows-msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "linux-clang-tsan",
+      "configurePreset": "linux-clang-tsan"
+    }
+  ]
+}

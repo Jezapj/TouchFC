@@ -1,0 +1,11 @@
+build/
+.tools/
+third_party/ffmpeg/
+third_party/downloads/
+vcpkg_installed/
+telemetry.csv
+*.user
+.vs/
+CMakeUserPresets.json
+docs/bench/last_run.csv
+docs/bench/presentmon.csv

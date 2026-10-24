@@ -1,0 +1,16 @@
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define UNICODE
+#define _UNICODE
+
+#include <windows.h>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif

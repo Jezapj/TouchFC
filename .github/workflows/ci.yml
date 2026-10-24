@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+      - name: configure
+        run: cmake -S . -B build -DTOUCHFC_BUILD_APP=OFF
+      - name: test
+        run: cmake --build build --config Release && ctest --test-dir build -C Release --output-on-failure
+
+  linux-tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build cmake
+      - name: configure
+        run: cmake --preset linux-clang-tsan
+      - name: test
+        run: cmake --build build/linux-clang-tsan && ./build/linux-clang-tsan/touchfc_tests
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: sudo apt-get update && sudo apt-get install -y clang ninja-build cmake
+      - name: configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++ -DTOUCHFC_BUILD_APP=OFF -DTOUCHFC_TSAN=ON
+      - name: test
+        run: cmake --build build && ./build/touchfc_tests
