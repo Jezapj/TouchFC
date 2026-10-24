@@ -64,6 +64,7 @@ class App {
   void refresh_windows();
   bool start_overlay_capture();
   std::unique_ptr<Detector> make_detector();
+  std::unique_ptr<PitchModel> make_pitch();
   void imgui_begin(Binding& binding);
   void imgui_end(ID3D11RenderTargetView* rtv);
 
@@ -126,6 +127,7 @@ class App {
   std::unique_ptr<FramePool> pool_;
   std::unique_ptr<HdrSink> sink_;
   std::unique_ptr<Detector> detector_;
+  std::unique_ptr<PitchModel> pitch_;
   std::unique_ptr<Pipeline> pipe_;
 };
 
@@ -502,6 +504,14 @@ std::unique_ptr<Detector> App::make_detector() {
   return make_stub_detector();
 }
 
+std::unique_ptr<PitchModel> App::make_pitch() {
+  if (args_.keypoints_path.empty()) return nullptr;
+  std::string error;
+  auto model = make_pitch_model(args_.keypoints_path, error);
+  if (!model) log_line("pitch model unavailable (" + error + "); template homography");
+  return model;
+}
+
 bool App::start_overlay_capture() {
   if (!selected_ || !IsWindow(selected_)) {
     status_ = "pick a window first";
@@ -518,8 +528,10 @@ bool App::start_overlay_capture() {
   sink_ = std::make_unique<HdrSink>();
   detector_ = make_detector();
   if (!detector_) return false;
+  pipe_.reset();
+  pitch_ = make_pitch();
   pipe_ = std::make_unique<Pipeline>(*pool_);
-  pipe_->start(*source_, *sink_, *detector_, args_.pin);
+  pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
   status_ = std::string("capturing: ") + detector_->label();
   ShowWindow(view_hwnd_, SW_SHOWNOACTIVATE);
   return true;
@@ -660,8 +672,9 @@ int App::run() {
         log_line("detector init failed; falling back to stub");
         detector_ = make_stub_detector();
       }
+      pitch_ = make_pitch();
       pipe_ = std::make_unique<Pipeline>(*pool_);
-      pipe_->start(*source_, *sink_, *detector_, args_.pin);
+      pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
       if (!create_window(view_hwnd_, L"TouchFC", WS_OVERLAPPEDWINDOW, 0, 1280, 760, view_binding_)) return 1;
       if (!create_hwnd_swap(view_hwnd_, view_swap_, false)) return 1;
       recreate_rtv(view_swap_.Get(), view_rtv_);

@@ -9,6 +9,7 @@ struct AppArgs {
   Mode mode = Mode::SelfTest;
   std::string replay_path;
   std::string model_path;
+  std::string keypoints_path;
   double seconds = 0;
   bool pin = false;
   std::string telemetry_path = "telemetry.csv";

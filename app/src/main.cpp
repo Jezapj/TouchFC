@@ -8,11 +8,12 @@ namespace {
 
 void print_usage() {
   std::fputs(
-      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--seconds N] [--pin] [--telemetry path]\n"
+      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path]\n"
       "  --selftest   synthetic 50 fps clip (default)\n"
       "  --replay     pace a video file through the same pipeline\n"
       "  --overlay    pick a window and draw a click-through capture overlay\n"
       "  --model      YOLOv8 ONNX model; without this a deterministic stub paints boxes\n"
+      "  --keypoints  pitch-keypoint ONNX; without this the minimap uses a fixed template\n"
       "  --seconds    exit after N seconds (useful for a smoke run)\n"
       "  --pin        pin pipeline threads to one L3 cache\n",
       stderr);
@@ -41,6 +42,8 @@ int main(int argc, char** argv) {
       args.seconds = std::atof(argv[++i]);
     } else if (a == "--model" && i + 1 < argc) {
       args.model_path = argv[++i];
+    } else if (a == "--keypoints" && i + 1 < argc) {
+      args.keypoints_path = argv[++i];
     } else if (a == "--telemetry" && i + 1 < argc) {
       args.telemetry_path = argv[++i];
     } else {

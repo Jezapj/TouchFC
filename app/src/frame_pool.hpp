@@ -25,6 +25,11 @@ struct FrameSlot {
   std::array<Detection, kMaxDetections> dets{};
   std::uint8_t scene = 0;
   std::uint8_t pitch_valid = 0;
+  std::uint8_t kp_fresh = 0;
+  std::uint8_t kp_n = 0;
+  std::array<std::uint8_t, 32> kp_id{};
+  std::array<float, 32> kp_x{};
+  std::array<float, 32> kp_y{};
   float reproj_m = 0.f;
   std::array<float, kMaxDetections> pitch_x{};
   std::array<float, kMaxDetections> pitch_y{};

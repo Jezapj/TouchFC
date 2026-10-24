@@ -121,4 +121,65 @@ inline bool fit_homography(const float* sx, const float* sy, const float* dx, co
   return true;
 }
 
+// Fit, then keep the sample whose inliers agree within inlier_m. A 4-point
+// sample can always interpolate, so the refit has to see at least 6 points.
+inline bool fit_homography_ransac(const float* sx, const float* sy, const float* dx, const float* dy,
+                                  int n, float inlier_m, Homography& out) noexcept {
+  out = {};
+  if (n < 6 || n > 32) return false;
+  const float limit = inlier_m * inlier_m;
+  std::uint32_t rng = 0xA341316Cu ^ static_cast<std::uint32_t>(n * 17);
+  int best_n = 0;
+  std::uint8_t best[32]{};
+  for (int iter = 0; iter < 48; ++iter) {
+    rng = rng * 1664525u + 1013904223u;
+    int idx[4] = {-1, -1, -1, -1};
+    for (int j = 0; j < 4; ++j) {
+      for (int guard = 0; guard < 16; ++guard) {
+        rng = rng * 1664525u + 1013904223u;
+        const int k = static_cast<int>(rng % static_cast<std::uint32_t>(n));
+        bool dup = false;
+        for (int p = 0; p < j; ++p)
+          if (idx[p] == k) dup = true;
+        if (!dup) {
+          idx[j] = k;
+          break;
+        }
+      }
+    }
+    if (idx[3] < 0) continue;
+    float ssx[4], ssy[4], ddx[4], ddy[4];
+    for (int j = 0; j < 4; ++j) {
+      ssx[j] = sx[idx[j]];
+      ssy[j] = sy[idx[j]];
+      ddx[j] = dx[idx[j]];
+      ddy[j] = dy[idx[j]];
+    }
+    Homography trial;
+    if (!fit_homography(ssx, ssy, ddx, ddy, 4, trial)) continue;
+    std::uint8_t inl[32];
+    int ni = 0;
+    for (int i = 0; i < n; ++i) {
+      float X = 0, Y = 0;
+      apply_homography(trial, sx[i], sy[i], X, Y);
+      const float ex = X - dx[i];
+      const float ey = Y - dy[i];
+      if (ex * ex + ey * ey <= limit) inl[ni++] = static_cast<std::uint8_t>(i);
+    }
+    if (ni > best_n) {
+      best_n = ni;
+      for (int i = 0; i < ni; ++i) best[i] = inl[i];
+    }
+  }
+  if (best_n < 6) return false;
+  float fx[32], fy[32], gx[32], gy[32];
+  for (int i = 0; i < best_n; ++i) {
+    fx[i] = sx[best[i]];
+    fy[i] = sy[best[i]];
+    gx[i] = dx[best[i]];
+    gy[i] = dy[best[i]];
+  }
+  return fit_homography(fx, fy, gx, gy, best_n, out);
+}
+
 }  // namespace touchfc

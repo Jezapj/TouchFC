@@ -1,7 +1,10 @@
 #include "pipeline.hpp"
 
+#include "log.hpp"
 #include "marker.hpp"
 #include "threads_win.hpp"
+
+#include "touchfc/pitch_landmarks.hpp"
 
 #include "touchfc/frame_check.hpp"
 #include "touchfc/time.hpp"
@@ -14,10 +17,12 @@ Pipeline::Pipeline(FramePool& pool) : pool_(pool) {}
 
 Pipeline::~Pipeline() { join(); }
 
-void Pipeline::start(FrameSource& source, HdrSink& sink, Detector& detector, bool pin) {
+void Pipeline::start(FrameSource& source, HdrSink& sink, Detector& detector, bool pin,
+                      PitchModel* pitch) {
   source_ = &source;
   sink_ = &sink;
   detector_ = &detector;
+  pitch_ = pitch;
   live_ = source.is_live();
   pin_ = pin;
   stop_.store(false, std::memory_order_relaxed);
@@ -169,7 +174,14 @@ void Pipeline::run_t2() {
 
     FrameSlot& slot = pool_.slot(index);
     const TimeNs begin = slot.meta.t_pre_done;
+    slot.kp_fresh = 0;
+    slot.kp_n = 0;
     if (detector_) detector_->run(slot);
+    if (pitch_ && (slot.meta.id % 8u) == 1u) {
+      const Config cfg = config_.load();
+      const float kp_conf = cfg.conf_keypoint > 0.f ? cfg.conf_keypoint : 0.40f;
+      pitch_->run(slot, kp_conf);
+    }
     slot.meta.t_inf_done = now_ns();
     note(1, slot.meta.id, Stage::Inference, begin, slot.meta.t_inf_done);
     if (live_) {
@@ -246,7 +258,32 @@ void Pipeline::run_t3() {
     }
     slot.scene = static_cast<std::uint8_t>(
         classify_scene_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride));
-    if (!pitch_h_.valid || slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
+    if (pitch_) {
+      if (slot.kp_fresh && slot.kp_n >= 6) {
+        float sx[32], sy[32], dx[32], dy[32];
+        const int n = slot.kp_n;
+        for (int i = 0; i < n; ++i) {
+          sx[i] = slot.kp_x[static_cast<std::uint32_t>(i)];
+          sy[i] = slot.kp_y[static_cast<std::uint32_t>(i)];
+          pitch_landmark_m(slot.kp_id[static_cast<std::uint32_t>(i)], dx[i], dy[i]);
+        }
+        Homography fitted;
+        if (fit_homography_ransac(sx, sy, dx, dy, n, 2.f, fitted) && fitted.rms_m <= 2.5f) {
+          pitch_h_ = fitted;
+          pitch_from_kp_ = true;
+          pan_x_ = 0.f;
+          pan_y_ = 0.f;
+          if (pitch_logs_ < 3) {
+            ++pitch_logs_;
+            log_line("pitch fit: " + std::to_string(n) + " pts, error " +
+                     std::to_string(fitted.rms_m) + " m");
+          }
+        }
+      } else if (pitch_from_kp_ && last_gmc_.confidence >= 0.5f) {
+        pan_x_ += last_gmc_.dx;
+        pan_y_ += last_gmc_.dy;
+      }
+    } else if (!pitch_h_.valid || slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
       const float W = static_cast<float>(slot.meta.width);
       const float H = static_cast<float>(slot.meta.height);
       const float sx[5] = {0.12f * W, 0.88f * W, 0.30f * W, 0.70f * W, 0.50f * W};
@@ -258,8 +295,8 @@ void Pipeline::run_t3() {
     slot.pitch_valid = pitch_h_.valid ? 1 : 0;
     slot.reproj_m = pitch_h_.rms_m;
     for (std::uint32_t i = 0; i < slot.det_count; ++i) {
-      const float fx = slot.dets[i].x + 0.5f * slot.dets[i].w;
-      const float fy = slot.dets[i].y + slot.dets[i].h;
+      const float fx = slot.dets[i].x + 0.5f * slot.dets[i].w - pan_x_;
+      const float fy = slot.dets[i].y + slot.dets[i].h - pan_y_;
       if (!pitch_h_.valid) {
         slot.pitch_x[i] = 0;
         slot.pitch_y[i] = 0;

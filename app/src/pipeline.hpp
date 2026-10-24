@@ -2,6 +2,7 @@
 
 #include "detector.hpp"
 #include "frame_source.hpp"
+#include "pitch_model.hpp"
 
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/gmc.hpp"
@@ -36,7 +37,8 @@ class Pipeline {
   Pipeline(const Pipeline&) = delete;
   Pipeline& operator=(const Pipeline&) = delete;
 
-  void start(FrameSource& source, HdrSink& sink, Detector& detector, bool pin);
+  void start(FrameSource& source, HdrSink& sink, Detector& detector, bool pin,
+             PitchModel* pitch = nullptr);
   void request_stop();
   void join();
 
@@ -76,6 +78,7 @@ class Pipeline {
   FrameSource* source_ = nullptr;
   HdrSink* sink_ = nullptr;
   Detector* detector_ = nullptr;
+  PitchModel* pitch_ = nullptr;
   bool live_ = false;
   bool pin_ = false;
   std::atomic<bool> stop_{false};
@@ -112,6 +115,10 @@ class Pipeline {
   std::uint16_t gmc_id_[64]{};
   std::uint32_t gmc_n_ = 0;
   Homography pitch_h_{};
+  bool pitch_from_kp_ = false;
+  float pan_x_ = 0.f;
+  float pan_y_ = 0.f;
+  int pitch_logs_ = 0;
 };
 
 }  // namespace touchfc

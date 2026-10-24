@@ -10,6 +10,8 @@
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
+#include "touchfc/pitch_landmarks.hpp"
+#include "touchfc/pitch_pose.hpp"
 #include "touchfc/preprocess.hpp"
 #include "touchfc/seqlock.hpp"
 #include "touchfc/scene.hpp"
@@ -604,4 +606,54 @@ TEST_CASE("green frame is a wide scene") {
   REQUIRE(classify_scene_bgra(px.data(), 64, 64, 64 * 4) == Scene::Wide);
   std::fill(px.begin(), px.end(), 0);
   REQUIRE(classify_scene_bgra(px.data(), 64, 64, 64 * 4) == Scene::Other);
+}
+
+TEST_CASE("pitch landmarks sit on the 105 by 68 frame") {
+  float x = 0, y = 0;
+  pitch_landmark_m(0, x, y);
+  REQUIRE(std::abs(x - -52.5f) < 0.05f);
+  REQUIRE(std::abs(y - 34.f) < 0.05f);
+  pitch_landmark_m(13, x, y);
+  REQUIRE(std::abs(x) < 0.05f);
+  REQUIRE(std::abs(y - 34.f) < 0.05f);
+}
+
+TEST_CASE("ransac homography ignores one bad point") {
+  const float sx[] = {10, 40, 10, 40, 25, 70, 70, 25};
+  const float sy[] = {10, 10, 40, 40, 25, 15, 50, 55};
+  float dx[8], dy[8];
+  for (int i = 0; i < 8; ++i) {
+    dx[i] = 2.f * sx[i] + 1.f;
+    dy[i] = 3.f * sy[i] - 4.f;
+  }
+  dx[7] += 30.f;
+  Homography H;
+  REQUIRE(fit_homography_ransac(sx, sy, dx, dy, 8, 1.f, H));
+  float X = 0, Y = 0;
+  apply_homography(H, 15.f, 15.f, X, Y);
+  REQUIRE(std::abs(X - 31.f) < 0.05f);
+  REQUIRE(std::abs(Y - 41.f) < 0.05f);
+}
+
+TEST_CASE("pitch pose decode keeps the visible keypoints") {
+  constexpr std::uint32_t anchors = 2;
+  constexpr std::uint32_t kpts = 2;
+  constexpr std::uint32_t channels = 5 + 3 * kpts;
+  float out[channels * anchors]{};
+  out[4 * anchors + 1] = 0.9f;
+  const std::size_t k0 = static_cast<std::size_t>(5) * anchors;
+  out[k0 + 1] = 100.f;
+  out[k0 + anchors + 1] = 50.f;
+  out[k0 + 2 * anchors + 1] = 0.8f;
+  const std::size_t k1 = static_cast<std::size_t>(8) * anchors;
+  out[k1 + 1] = 10.f;
+  out[k1 + anchors + 1] = 10.f;
+  out[k1 + 2 * anchors + 1] = 0.1f;
+  const LetterboxParams lb = make_letterbox(640, 640, 640);
+  PitchKeypoint found[4];
+  const std::uint32_t n = decode_pitch_pose(out, kpts, anchors, 0.25f, 0.4f, lb, found, 4);
+  REQUIRE(n == 1);
+  REQUIRE(found[0].id == 0);
+  REQUIRE(std::abs(found[0].x - 100.f) < 0.01f);
+  REQUIRE(std::abs(found[0].y - 50.f) < 0.01f);
 }

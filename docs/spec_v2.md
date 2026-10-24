@@ -130,7 +130,7 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M1b | WGC, click-through DComp overlay, display affinity, dedupe, black frame | Overlay tracks a chosen window. Clicks pass through. Affinity is reported. |
 | M2 | ONNX detector, AVX2 preprocess from BGRA, YOLO decode and NMS, Detector interface, stub for the default build | Boxes on screen. Preprocess benchmark committed. **Done** with the stub and the preprocess fast path; ORT is wired behind `TOUCHFC_HAS_ORT` and takes a model via `--model`. AVX2 letterbox is 1.7x scalar on the dev box. YUV-direct preprocess is deferred: FFmpeg already converts to BGRA via `sws_scale`, and the BGRA fast path is in budget. The YUV path returns if replay dominates the profile. |
 | M3 | ByteTrack-lite, 2x2 Kalman, centroid GMC | **Done.** Stable ids on the stub boxes. Track stage stays on the stack. Image-based GMC is later. |
-| M4 | Homography, scene gate, minimap | **Done** as a stand-in fit from a wide-shot template, refit while the frame looks wide. Minimap and fit error are on the HUD. A keypoint model replaces the template later. |
+| M4 | Homography, scene gate, minimap | **Done.** `--keypoints` runs a 32-point YOLOv8 pose model every 8th frame, fits with RANSAC, and holds that homography between fits by the centroid pan. Without the file, the minimap still uses the wide-shot template. |
 | M5 | SIMD pitch control on a 2 m grid, also runnable on StatsBomb 360 alone | 10–15 Hz inside the CPU budget. |
 | M6 | Team histogram, label UI, lineup import, session save/load | A label survives an occlusion the user can see. Session reload matches. |
 | M7 | Ball, possession, then pass/shot only if recall allows, SPADL export | Precision/recall table. Export columns match SPADL. |
