@@ -94,29 +94,6 @@ Hot-path status:
 - `OrtDetector::run` reuses pre-sized `input_tensor_` and `output_buffer_`. ORT's own `Run` is the only path that could allocate internally, which is outside this process's control; the Session is created once in `prepare`.
 - `FrameSlot` grew from ~24 B of metadata plus a BGRA buffer to also carry `std::array<Detection, 128>` (3 KiB). The slot is 16 x per pool, so this adds ~48 KiB on top of pixel memory.
 
-## M3 state
-
-223 assertions, 26 cases, Release / MSVC 19.50, two fresh-seed runs green. `touchfc.exe --selftest --seconds 3` draws numbered boxes (`#1..#4`) that keep their IDs for the whole run. Track-stage p50 ~36 us for 4 detections.
-
-| What | Where | Notes |
-|---|---|---|
-| 2x2 per-axis Kalman | [`core/include/touchfc/kalman.hpp`](../core/include/touchfc/kalman.hpp) | `(Pxx, Pxv, Pvv)` per axis for `cx`, `cy`, `w`, `h`. Closed-form predict and update. The convergence test fails if `Pxv` is dropped — a diagonal `P` cannot estimate velocity. This is the fix for Part A1 item 1. |
-| GMC (translation) | [`core/include/touchfc/gmc.hpp`](../core/include/touchfc/gmc.hpp) | Weighted median of per-pair centroid displacements. Robust to a few mismatches. 128-pair stack buffer. Image-based GMC (optical flow + `estimateAffinePartial2D`) is on the deferred list and is the single thing that will fix ID drift on fast pans. |
-| ByteTrack-lite | [`core/include/touchfc/tracker.hpp`](../core/include/touchfc/tracker.hpp) | Fixed capacity 64. Two-stage greedy IoU match (high-conf then low-conf). Spawn above `conf_new_track`. Confirm after 3 hits; drop tentatives after 5 misses, confirmed tracks after 30. |
-| Pipeline integration | [`app/src/pipeline.cpp`](../app/src/pipeline.cpp) run_t3 | `dt` from actual elapsed time, clamped to 0.2 s. GMC estimated from last frame's matched centroid pairs. Config sliders feed `iou_hi` and `conf_new_track`. |
-| Present | [`app/src/present.cpp`](../app/src/present.cpp) draw_view | Each box labelled `#<track_id>` in the per-class colour. |
-
-Hot-path audit after M3:
-- `Tracker` is a 64-slot `Track[]` member. All match scratch (`det_used`, `trk_used`, `hi_idx`, `lo_idx`) is on the stack.
-- Pipeline T3 has four `float[kMaxDetections]` scratch arrays declared inside the loop. These are stack locals; MSVC lays them out once per function call. No heap allocation.
-- `std::sort` inside GMC is on a stack array; `libstdc++` and MS STL use introsort in place.
-- `Pipeline` grew by `Tracker tracker_` (~ 6 KB) and four 128-entry float scratch arrays (~ 2 KB), all one-time startup cost.
-
-Known gaps:
-- Image-based GMC. The current centroid-based estimate needs at least three matched tracks to produce a reading; a scene cut or a frame with zero players will keep the previous estimate until the next good match. Optical flow would close that gap.
-- Track class carry-over. If a detector flips a player's class (player ↔ goalkeeper), the current implementation treats the second detection as a new object. ReID is M6.
-- The seqlock `attack_dir` slider updates `pipe_->attack_dir`, which the tracker does not yet read. It is a HUD state only until the pitch model lands.
-
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.

@@ -210,61 +210,6 @@ void Pipeline::run_t3() {
       marker.h = 0;
       slot.det_count = 0;
     }
-
-    // Tracker: assign stable IDs across frames. The caller already filled
-    // slot.dets in T2 (detector output). GMC comes from the previous frame's
-    // matched centroids: for each surviving track, compare its previous
-    // centre (stored by id) against the current detection it matched to.
-    // The estimate is used to shift all track states before matching, so
-    // camera pan does not get modelled as player motion.
-    const TimeNs now = now_ns();
-    float dt = tracker_params_.dt_default;
-    if (last_track_t_ns_ != 0) {
-      const float measured = static_cast<float>(now - last_track_t_ns_) * 1.0e-9f;
-      if (measured > 0.f && measured < 0.2f) dt = measured;
-    }
-    last_track_t_ns_ = now;
-
-    tracker_params_.iou_hi = cfg.iou_match_thresh > 0.f ? cfg.iou_match_thresh : 0.30f;
-    tracker_params_.iou_lo = tracker_params_.iou_hi * 0.33f;
-    tracker_params_.conf_new_track = cfg.conf_player;
-    tracker_.update(slot.dets.data(), slot.det_count, dt, last_gmc_, tracker_params_);
-
-    // Compute GMC for the NEXT frame from the current frame's matched pairs.
-    float curr_cx[kMaxDetections];
-    float curr_cy[kMaxDetections];
-    float prev_cx[kMaxDetections];
-    float prev_cy[kMaxDetections];
-    std::uint32_t n_pairs = 0;
-    for (std::uint32_t i = 0; i < slot.det_count && n_pairs < kMaxDetections; ++i) {
-      const auto tid = slot.dets[i].track_id;
-      if (tid == 0) continue;
-      for (std::uint32_t j = 0; j < gmc_prev_n_; ++j) {
-        if (gmc_prev_tid_[j] == static_cast<float>(tid)) {
-          prev_cx[n_pairs] = gmc_prev_cx_[j];
-          prev_cy[n_pairs] = gmc_prev_cy_[j];
-          curr_cx[n_pairs] = slot.dets[i].x + 0.5f * slot.dets[i].w;
-          curr_cy[n_pairs] = slot.dets[i].y + 0.5f * slot.dets[i].h;
-          ++n_pairs;
-          break;
-        }
-      }
-    }
-    if (n_pairs >= 3) {
-      last_gmc_ = estimate_translation(prev_cx, prev_cy, curr_cx, curr_cy, n_pairs);
-    } else {
-      last_gmc_ = {};
-    }
-    // Stash current centroids keyed by track id for the next frame.
-    gmc_prev_n_ = 0;
-    for (std::uint32_t i = 0; i < slot.det_count && gmc_prev_n_ < kMaxDetections; ++i) {
-      const auto tid = slot.dets[i].track_id;
-      if (tid == 0) continue;
-      gmc_prev_tid_[gmc_prev_n_] = static_cast<float>(tid);
-      gmc_prev_cx_[gmc_prev_n_] = slot.dets[i].x + 0.5f * slot.dets[i].w;
-      gmc_prev_cy_[gmc_prev_n_] = slot.dets[i].y + 0.5f * slot.dets[i].h;
-      ++gmc_prev_n_;
-    }
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;
