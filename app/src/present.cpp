@@ -316,8 +316,17 @@ void App::pump_pipeline() {
 void App::draw_view() {
   if (!view_hwnd_ || !view_swap_) return;
   if (view_dirty_) {
+    // A composition swap chain rejects 0,0. Pass the client size, and unbind
+    // the old target first or the device is removed.
+    ID3D11RenderTargetView* none = nullptr;
+    gpu_.context->OMSetRenderTargets(1, &none, nullptr);
     view_rtv_.Reset();
-    view_swap_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+    RECT crc{};
+    GetClientRect(view_hwnd_, &crc);
+    const UINT rw = static_cast<UINT>(std::max(1L, crc.right - crc.left));
+    const UINT rh = static_cast<UINT>(std::max(1L, crc.bottom - crc.top));
+    if (FAILED(view_swap_->ResizeBuffers(0, rw, rh, DXGI_FORMAT_UNKNOWN, 0)))
+      log_line("view ResizeBuffers failed");
     recreate_rtv(view_swap_.Get(), view_rtv_);
     view_dirty_ = false;
     if (args_.mode == AppArgs::Mode::Overlay) {
@@ -489,12 +498,13 @@ void App::track_target() {
   const int h = std::max(1L, frame.bottom - frame.top);
   RECT now{};
   GetWindowRect(view_hwnd_, &now);
-  if (now.left != frame.left || now.top != frame.top || (now.right - now.left) != w ||
-      (now.bottom - now.top) != h) {
-    SetWindowPos(view_hwnd_, HWND_TOPMOST, frame.left, frame.top, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    view_dirty_ = true;
-  }
+  auto gap = [](int a, int b) { return a > b ? a - b : b - a; };
+  const int dw = gap(now.right - now.left, w);
+  const int dh = gap(now.bottom - now.top, h);
+  // A one-pixel mismatch would resize the swap chain every frame.
+  if (gap(now.left, frame.left) <= 4 && gap(now.top, frame.top) <= 4 && dw <= 4 && dh <= 4) return;
+  SetWindowPos(view_hwnd_, HWND_TOPMOST, frame.left, frame.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  if (dw > 4 || dh > 4) view_dirty_ = true;
 }
 
 void App::draw_control() {
