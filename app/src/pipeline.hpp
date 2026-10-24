@@ -5,6 +5,8 @@
 
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/gmc.hpp"
+#include "touchfc/homography.hpp"
+#include "touchfc/scene.hpp"
 #include "touchfc/tracker.hpp"
 #include "touchfc/hdr_sink.hpp"
 #include "touchfc/time.hpp"
@@ -109,6 +111,7 @@ class Pipeline {
   float gmc_py_[64]{};
   std::uint16_t gmc_id_[64]{};
   std::uint32_t gmc_n_ = 0;
+  Homography pitch_h_{};
 };
 
 }  // namespace touchfc

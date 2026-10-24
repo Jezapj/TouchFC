@@ -1,6 +1,7 @@
 #pragma once
 
 #include "touchfc/detection.hpp"
+#include "touchfc/homography.hpp"
 #include "touchfc/slot_pool.hpp"
 #include "touchfc/types.hpp"
 
@@ -22,6 +23,11 @@ struct FrameSlot {
   std::unique_ptr<std::uint8_t[]> bgra;
   std::uint32_t det_count = 0;
   std::array<Detection, kMaxDetections> dets{};
+  std::uint8_t scene = 0;
+  std::uint8_t pitch_valid = 0;
+  float reproj_m = 0.f;
+  std::array<float, kMaxDetections> pitch_x{};
+  std::array<float, kMaxDetections> pitch_y{};
 };
 
 // Slots are allocated once. The index from SlotPool is the vector index.

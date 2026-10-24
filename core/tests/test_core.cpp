@@ -5,12 +5,14 @@
 #include "touchfc/frame_check.hpp"
 #include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
+#include "touchfc/homography.hpp"
 #include "touchfc/kalman.hpp"
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
 #include "touchfc/preprocess.hpp"
 #include "touchfc/seqlock.hpp"
+#include "touchfc/scene.hpp"
 #include "touchfc/slot_pool.hpp"
 #include "touchfc/spsc_ring.hpp"
 #include "touchfc/telemetry.hpp"
@@ -573,4 +575,33 @@ TEST_CASE("tracker keeps ids across a pan") {
     REQUIRE(dets[0].track_id == a);
     REQUIRE(dets[1].track_id == b);
   }
+}
+
+TEST_CASE("homography recovers a scale and shift") {
+  const float sx[] = {10, 40, 10, 40, 25};
+  const float sy[] = {10, 10, 40, 40, 25};
+  float dx[5], dy[5];
+  for (int i = 0; i < 5; ++i) {
+    dx[i] = 2.f * sx[i] + 1.f;
+    dy[i] = 3.f * sy[i] - 4.f;
+  }
+  Homography H;
+  REQUIRE(fit_homography(sx, sy, dx, dy, 5, H));
+  float X = 0, Y = 0;
+  apply_homography(H, 15.f, 15.f, X, Y);
+  REQUIRE(std::abs(X - 31.f) < 0.05f);
+  REQUIRE(std::abs(Y - 41.f) < 0.05f);
+  REQUIRE(H.rms_m < 0.05f);
+}
+
+TEST_CASE("green frame is a wide scene") {
+  std::vector<std::uint8_t> px(64 * 64 * 4, 0);
+  for (std::size_t i = 0; i < px.size(); i += 4) {
+    px[i] = 30;
+    px[i + 1] = 170;
+    px[i + 2] = 30;
+  }
+  REQUIRE(classify_scene_bgra(px.data(), 64, 64, 64 * 4) == Scene::Wide);
+  std::fill(px.begin(), px.end(), 0);
+  REQUIRE(classify_scene_bgra(px.data(), 64, 64, 64 * 4) == Scene::Other);
 }

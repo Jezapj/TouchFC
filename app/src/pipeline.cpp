@@ -244,6 +244,29 @@ void Pipeline::run_t3() {
       gmc_py_[gmc_n_] = slot.dets[i].y + 0.5f * slot.dets[i].h;
       ++gmc_n_;
     }
+    slot.scene = static_cast<std::uint8_t>(
+        classify_scene_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride));
+    if (!pitch_h_.valid || slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
+      const float W = static_cast<float>(slot.meta.width);
+      const float H = static_cast<float>(slot.meta.height);
+      const float sx[5] = {0.12f * W, 0.88f * W, 0.30f * W, 0.70f * W, 0.50f * W};
+      const float sy[5] = {0.90f * H, 0.90f * H, 0.48f * H, 0.48f * H, 0.66f * H};
+      const float dx[5] = {-52.5f, 52.5f, -52.5f, 52.5f, 0.f};
+      const float dy[5] = {-34.f, -34.f, 34.f, 34.f, 0.f};
+      fit_homography(sx, sy, dx, dy, 5, pitch_h_);
+    }
+    slot.pitch_valid = pitch_h_.valid ? 1 : 0;
+    slot.reproj_m = pitch_h_.rms_m;
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      const float fx = slot.dets[i].x + 0.5f * slot.dets[i].w;
+      const float fy = slot.dets[i].y + slot.dets[i].h;
+      if (!pitch_h_.valid) {
+        slot.pitch_x[i] = 0;
+        slot.pitch_y[i] = 0;
+        continue;
+      }
+      apply_homography(pitch_h_, fx, fy, slot.pitch_x[i], slot.pitch_y[i]);
+    }
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;

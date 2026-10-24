@@ -104,6 +104,11 @@ class App {
   FrameId last_frame_ = 0;
   TimeNs last_capture_ = 0;
   std::uint8_t last_flags_ = 0;
+  std::uint8_t last_scene_ = 0;
+  std::uint8_t last_pitch_valid_ = 0;
+  float last_reproj_m_ = 0.f;
+  std::array<float, kMaxDetections> last_pitch_x_{};
+  std::array<float, kMaxDetections> last_pitch_y_{};
   TimeNs anchor_wall_ = 0;
   TimeNs anchor_pts_ = 0;
   int held_ = -1;
@@ -261,6 +266,13 @@ void App::remember(const FrameSlot& slot) {
   last_frame_ = slot.meta.id;
   last_capture_ = slot.meta.t_capture;
   last_flags_ = slot.meta.flags;
+  last_scene_ = slot.scene;
+  last_pitch_valid_ = slot.pitch_valid;
+  last_reproj_m_ = slot.reproj_m;
+  for (std::uint32_t i = 0; i < slot.det_count && i < last_pitch_x_.size(); ++i) {
+    last_pitch_x_[i] = slot.pitch_x[i];
+    last_pitch_y_[i] = slot.pitch_y[i];
+  }
   have_frame_ = true;
   const TimeNs now = now_ns();
   if (pipe_) pipe_->note_present(slot.meta.id, slot.meta.t_capture, now);
@@ -407,6 +419,21 @@ void App::draw_view() {
         dl->AddText(ImVec2(a.x + 2.f, a.y + 2.f), col, label);
       }
     }
+    if (last_pitch_valid_) {
+      const float mx = 16.f, my = ch - 128.f, mw = 150.f, mh = 100.f;
+      dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
+      dl->AddRect(ImVec2(mx + 8, my + 8), ImVec2(mx + mw - 8, my + mh - 8), IM_COL32(220, 220, 220, 180));
+      auto map = [&](float px, float py) {
+        const float u = (px + 52.5f) / 105.f;
+        const float v = (34.f - py) / 68.f;
+        return ImVec2(mx + 8.f + u * (mw - 16.f), my + 8.f + v * (mh - 16.f));
+      };
+      for (std::uint32_t i = 0; i < last_det_count_; ++i) {
+        if (last_dets_[i].class_id > 1) continue;
+        const ImU32 col = kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
+        dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
+      }
+    }
   }
   ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
   ImGui::SetNextWindowBgAlpha(0.55f);
@@ -415,6 +442,10 @@ void App::draw_view() {
   const double p99 = pipe_ ? static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6 : 0;
   ImGui::Text("capture-to-present-call  p50 %.2f ms   p99 %.2f ms", p50, p99);
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
+  if (last_pitch_valid_) {
+    const char* scene = last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other";
+    ImGui::Text("pitch %s   fit error %.2f m", scene, last_reproj_m_);
+  }
   if (pipe_) {
     const auto drops = pipe_->drops.load() + (source_ ? source_->capture_drops() : 0);
     ImGui::Text("drops %llu   deduped %llu   late %llu   free slots %d",
