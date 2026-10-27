@@ -1,11 +1,12 @@
 {
   "name": "touchfc",
   "version-string": "0.1.0",
-  "description": "Soccer broadcast overlay. Manifest for an optional from-source dependency install. The default CMake build fetches Catch2, Google Benchmark and HdrHistogram itself, and uses a prebuilt LGPL FFmpeg.",
+  "description": "Soccer broadcast overlay. Manifest for an optional from-source dependency install. The default CMake build fetches Catch2, Google Benchmark, HdrHistogram and nlohmann-json itself, and uses a prebuilt LGPL FFmpeg.",
   "dependencies": [
     "catch2",
     "benchmark",
     "hdr-histogram",
+    "nlohmann-json",
     {
       "name": "imgui",
       "features": ["dx11-binding", "win32-binding"]

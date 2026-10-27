@@ -46,7 +46,8 @@ struct GmcParams {
 };
 
 inline void gmc_reduce_bgra(const std::uint8_t* bgra, std::uint32_t w, std::uint32_t h,
-                            std::uint32_t stride, GmcImage& out, int margin = 12) noexcept {
+                            std::uint32_t stride, GmcImage& out, int margin = 12,
+                            int min_green = 40) noexcept {
   out.w = w;
   out.h = h;
   std::uint32_t xs[2 * kGmcW];
@@ -63,7 +64,7 @@ inline void gmc_reduce_bgra(const std::uint8_t* bgra, std::uint32_t w, std::uint
         for (int sx = 0; sx < 2; ++sx) {
           const std::uint8_t* p = row + xs[2 * i + sx];
           const int b = p[0], g = p[1], r = p[2];
-          const bool grass = g > r + margin && g > b + margin && g > 40;
+          const bool grass = g > r + margin && g > b + margin && g > min_green;
           const int hi = b > g ? (b > r ? b : r) : (g > r ? g : r);
           const int lo = b < g ? (b < r ? b : r) : (g < r ? g : r);
           const bool line = lo > 150 && hi - lo < 40;

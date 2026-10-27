@@ -96,25 +96,52 @@ Hot-path status:
 
 ## M9 state
 
-`touchfc_tests`: 421 assertions in 40 cases, Release, MSVC 19.50, all green. `touchfc.exe --selftest --seconds 3` exits 0. `BM_ImageGmc` 0.86 ms per 1080p frame ([bench](bench/README.md)).
+`touchfc_tests`: 538 assertions in 45 cases after M9 to M11, Release, MSVC 19.50, all green. `touchfc.exe --selftest --seconds 3` exits 0. `BM_ImageGmc` 0.86 ms per 1080p frame, `BM_LineRefine` 0.10 ms ([bench](bench/README.md)).
 
 | What | Where | Notes |
 |---|---|---|
-| Landmark table | [`pitch_landmarks.hpp`](../core/include/touchfc/pitch_landmarks.hpp) | Order checked against Roboflow's `SoccerPitchConfiguration` vertex list. Positions are now the real IFAB markings (16.5 m box, 40.32 m wide, 9.15 m circle) instead of Roboflow's not-to-scale template squeezed onto 105 x 68, which put the box corners up to 1.1 m off and made the centre circle an ellipse. Test: a synthetic `H` maps all 32 landmarks round-trip within 1 cm. |
+| Landmark table | [`pitch_landmarks.hpp`](../core/include/touchfc/pitch_landmarks.hpp) | Order checked against Roboflow's `SoccerPitchConfiguration` vertex list. Positions are the real IFAB markings (16.5 m box, 40.32 m wide, 9.15 m circle), not Roboflow's not-to-scale template squeezed onto 105 x 68 (box corners were up to 1.1 m off, the centre circle an ellipse). Test: a synthetic `H` maps all 32 landmarks round-trip within 1 cm. |
 | Projection guard | [`homography.hpp`](../core/include/touchfc/homography.hpp) | Fits are unit-norm with `w > 0` on the fitted points; `apply_homography` returns false at or above the horizon. Detections more than 3 m off the pitch get `pitch_ok = 0` and are skipped by possession, team inheritance and pitch control. |
-| Image GMC | [`image_gmc.hpp`](../core/include/touchfc/image_gmc.hpp) | Grass and line pixels only, so players and the scorebug do not pull the match. Scale + translation. Test: recovers a 1% zoom and a (37, -18) px pan; a grey frame is rejected. Player-centroid pan is gone from the homography path (the tracker still uses it). |
-| Fit validation and smoothing | [`pitch_calib.hpp`](../core/include/touchfc/pitch_calib.hpp) | Rejects on error, < 4 inliers, one quadrant, determinant flip, horizon below the top 10% of player boxes, bottom centre > 10 m off. Blends four image-space corners by `h_smooth`; a jump over `h_jump_m` waits for a second agreeing fit. Holdover cap `h_holdover`; a lost GMC lock (cut) invalidates. Each rule has a test. |
-| Keypoint cadence | `pipeline.cpp` T2 | Scene is classified on T2 now; keypoints every `kp_interval` wide frames (default 4), every 8th otherwise. |
-| No model, no positions | `pipeline.cpp`, `present.cpp` | Five-point template deleted. Without `--keypoints` the minimap says "not calibrated" until 4+ landmarks are clicked on the frame thumbnail in the control window (`SetAnchor`; `ResetHomography` clears). Anchors move with the GMC and are dropped on a cut. |
+| Image GMC | [`image_gmc.hpp`](../core/include/touchfc/image_gmc.hpp) | Grass and line pixels only, so players and the scorebug do not pull the match. Scale + translation. Test: recovers a 1% zoom and a (37, -18) px pan; a grey frame is rejected. Locks on 346/347 and 222/223 frames of the two elevated test clips. |
+| Line tracking | [`line_fit.hpp`](../core/include/touchfc/line_fit.hpp) | Markings projected through `H^-1`; each sample searches its image normal for a bright ridge between grass flanks; refit is point-to-line (one linear row per match) with a light prior so a direction the visible lines do not pin stays put. Keeps a fit alive on a third of the pitch, between keypoint runs. Test: on a painted synthetic frame of one penalty area, a 9 px + 1% drift comes back within 15 cm. |
+| Line support | same | Share of in-view marking samples that sit on a painted line. A keypoint fit is snapped to the lines, then must score `line_min_support` (0.35). Test: true fit > 0.8, a fit 6 m / 4 m off < 0.35. |
+| Fit validation and smoothing | [`pitch_calib.hpp`](../core/include/touchfc/pitch_calib.hpp) | Rejects on error, < 4 inliers, one quadrant, main-camera orientation (image right = +x, image up = far side: resolves left/right and near/far mirrors of the symmetric markings), horizon below the top 10% of player boxes, bottom centre > 10 m off, low line support. Blends four image-space corners by `h_smooth`; a jump over `h_jump_m` waits for a second agreeing fit. Holdover cap `h_holdover`; a lost GMC lock (cut) invalidates. |
+| Keypoint cadence | `pipeline.cpp` T2 | Scene classified on T2; keypoints every `kp_interval` wide frames, none in other views (set pieces and close-ups pause the fit). |
+| No model, no positions | `pipeline.cpp`, `present.cpp` | Five-point template deleted. Without `--keypoints` the minimap says "not calibrated" until 4+ landmarks are clicked on the frame thumbnail (`SetAnchor`; `ResetHomography` clears). Manual is a fallback only; line tracking then keeps it. |
 | Minimap | `present.cpp` | 105:68, scales with the window, `PushClipRect`, pitch markings drawn. |
-| Reprojection view | `present.cpp` | Control-window toggle: magenta pitch lines and landmark crosses through `H^-1`, yellow raw keypoints with ids. A yellow id sitting on the matching magenta cross is the id-order check. |
-| Config | `types.hpp` | `h_max_rms_m`, `h_jump_m`, `h_smooth`, `gmc_max_cost`, `h_holdover`, `kp_interval`, `minimap_dead_mode` (64 B). Sliders with live values in the control window's "Pitch calibration" section until M10's Tuning tab. |
+| Reprojection view | `present.cpp` | Toggle: magenta pitch lines and landmark crosses through `H^-1`, yellow raw keypoints with ids. |
+| `--pitch-dump path.csv` | `present.cpp` | Per-frame H, keypoints, verdict, line support and play state, written on the present thread. For offline overlays. |
 
-Found on the way: `SeqLock<Config>` default-constructs to zero words and nothing stored a `Config` at start, so every in-class default (`show_boxes`, `conf_player`, ...) read as 0 until a UI change. `Pipeline` now stores `Config{}` in its constructor.
+Found on the way: `SeqLock<Config>` default-constructs to zero words and nothing stored a `Config` at start, so every in-class default read as 0 until a UI change. `Pipeline` now stores `Config{}` in its constructor.
+
+Test clips (`test_clips/`, gitignored): two elevated views of an amateur ground and one low pitch-side set piece. The Roboflow keypoint model is out of its training distribution there: it outputs a whole-pitch layout on bare grass. Before line support those fits were accepted; now 280 of 347 frames of `middle_pan_to_right` and every frame of `right_side_pitch` reject them (support 0.15 to 0.29). One fit is accepted where that ground really has a vertical line with a circle centred on it; its markings are non-standard (overlaid small-sided pitches), so it decays. The set-piece clip never runs keypoints (not a wide view).
 
 Not verified:
-- **The done-when check.** `pitch.mp4` is a collage of two annotated dataset images, so the fit is correctly rejected (horizon below the far touchline). Needs a real broadcast clip with `--keypoints`, the reprojection view on, through an attack and a pan.
-- `minimap_dead_mode` is a field only; it acts once M11 has a play state.
+- **The done-when check on broadcast footage.** Needs a Premier League / LaLiga style main-camera clip with standard markings, `--keypoints`, through an attack and a pan. The amateur clips cannot pass it with any standard-pitch model.
+- Bench numbers on the target machine; this one runs CPU inference at about 2 fps.
+
+## M10 state
+
+| What | Where | Notes |
+|---|---|---|
+| Config v2 | [`types.hpp`](../core/include/touchfc/types.hpp) | 136 B, grouped Detection / Pitch / Teams / Play state / Events / Overlay. New: `nms_iou`, scene fractions, `green_margin`, `green_min`, `team_max_dist`, `team_min_px`, play-state and event thresholds, overlay flip settings, `panel_side`, `mini_replay`. |
+| Field table | [`config_fields.hpp`](../core/include/touchfc/config_fields.hpp) | One row per field (key, label, group, type, range). Drives the Tuning tab, reset per group and profiles. A test checks every default sits inside its range. |
+| Tuning tab | `present.cpp` | One slider per field, with the live signal beside it where one exists (fit error, holdover age, motion cost, line support, grass share and scene, view angle, player height, play state, box count). Changes store into the seqlock; T2/T3 read it every frame. |
+| Profiles | [`config_json.hpp`](../core/include/touchfc/config_json.hpp) | `profiles/<name>.json` (gitignored) by key, on the present thread at click time. Unknown keys ignored, missing ones default, visible fields clamped. Last used loads at start (`profiles/last.txt`). Test: JSON round trip equals the struct byte for byte. nlohmann-json 3.11.3 by FetchContent (URL + SHA256). |
+| Wired thresholds | `pipeline.cpp`, `ort_detector.cpp`, `scene.hpp`, `team.hpp` | Detector score floor and NMS IoU via `Detector::configure`; scene classifier, GMC, line search and torso colour use `green_margin` / `green_min`; `nearest_team` leaves a player unassigned beyond `team_max_dist` (referee, keeper). |
+
+Still hard-coded, by choice (internal, not a kit or pitch difference): tracker gating (`iou_lo`, `conf_high`, miss counts), possession miss count (5), team inheritance radius and window, GMC search ranges, RANSAC inlier distance (2 m), pose checks (10 m bottom, 3 m `pitch_ok`). `pass_min_dist_m`, `ball_flight_min_mps`, panel flip and mini replay fields exist for M13 to M15.
+
+## M11 state
+
+| What | Where | Notes |
+|---|---|---|
+| Gate | [`play_state.hpp`](../core/include/touchfc/play_state.hpp) | `PlayGate`: Dead when any available signal holds `dead_enter_ms` (400); InPlay only after every available signal is clear for `live_enter_ms` (700). Test: a 240 ms pan does not trigger, a 480 ms close-up does, a signal returning inside the 700 ms keeps it dead, an unavailable signal cannot. Replay runs the hysteresis on video time. |
+| Signals | `pipeline.cpp` `update_play` | View angle (pitch long axis at the image centre via `H^-1`; > 90 is a reverse angle), median player height, scene class, ball > 1 m off the lines. Scorebug presence is defined but unavailable until M12 learns the ROI. |
+| While Dead | `pipeline.cpp`, `present.cpp` | Possession spell closes and none starts, pitch control stops, the tracker keeps running. HUD shows "dead ball" with the reasons. Minimap follows `minimap_dead_mode`: Freeze (last in-play positions, dimmed, "paused") or Hide. |
+| Event log | `pipeline.cpp`, `possession.hpp` | Each Dead interval is an `EventType::DeadBall` record; SPADL export writes it as type 22 (outside the SPADL list, like possession's 21). Event log raised from 64 to 4096 records. |
+
+Not verified: the done-when replay check on throw-ins, corners, a substitution and a broadcast replay. That needs broadcast footage; the test clips only cover a set-piece angle.
 
 ## Licence and weights
 

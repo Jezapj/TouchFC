@@ -84,6 +84,11 @@ class OrtDetector final : public Detector {
     }
   }
 
+  void configure(float score_min, float nms_iou) noexcept override {
+    score_min_ = score_min;
+    nms_iou_ = nms_iou;
+  }
+
   void run(FrameSlot& slot) noexcept override {
     try {
       const LetterboxParams lb = make_letterbox(slot.meta.width, slot.meta.height, side_);
@@ -103,9 +108,9 @@ class OrtDetector final : public Detector {
       const float* data = outputs[0].GetTensorData<float>();
       std::uint32_t count = 0;
       bool truncated = false;
-      decode_yolov8(data, num_classes_, num_anchors_, 0.25f, lb, slot.dets.data(),
+      decode_yolov8(data, num_classes_, num_anchors_, score_min_, lb, slot.dets.data(),
                     static_cast<std::uint32_t>(slot.dets.size()), count, truncated);
-      count = greedy_nms(slot.dets.data(), count, 0.45f);
+      count = greedy_nms(slot.dets.data(), count, nms_iou_);
       if (count > slot.dets.size()) count = static_cast<std::uint32_t>(slot.dets.size());
       // COCO YOLOv8 is 80 classes and class 0 is "person". A broadcast frame is
       // full of other classes (ball ads, cars, seats). Keep people only so the
@@ -134,6 +139,12 @@ class OrtDetector final : public Detector {
   }
 
   const char* label() const noexcept override { return "ort"; }
+
+ private:
+  float score_min_ = 0.25f;
+  float nms_iou_ = 0.45f;
+
+ public:
 
  private:
   std::string model_path_;

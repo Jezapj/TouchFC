@@ -135,9 +135,9 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M5 | SIMD pitch control on a 2 m grid, also runnable on StatsBomb 360 alone | **Done.** 53×34 Spearman time-to-intercept, AVX2 over each row. A 360 frame is just positions and a team bit; no video. The minimap waits for team labels (M6) before painting it. |
 | M6 | Team histogram, label UI, lineup import, session save/load | **Done** without lineup import or session save/load. A control-window click sets team A or B from the torso colour; other tracks follow the nearer colour. A new id within 8 m and the same colour keeps the team for 2 s. |
 | M7 | Ball, possession, then pass/shot only if recall allows, SPADL export | **Done** for the ball and possession. COCO class 32 is kept as the ball. A player within 1.5 m holds it; a change closes a spell. Pass and shot are not emitted. `spadl.csv` uses the SPADL columns, with type_id 21 for a possession spell. |
-| M9 | Minimap and homography fix, reprojection debug view | **Code done, visual check pending.** Image GMC, fit validation and smoothing, metric landmark table, manual calibration, clipped minimap. The done-when check needs a real broadcast clip with `--keypoints` (`pitch.mp4` is a collage of two dataset images). Section 11.1, `review_gate.md` M9. |
-| M10 | Config v2, tuning panel, profiles | Section 11.2. |
-| M11 | Play-state gate (in play / dead) | Section 11.3. |
+| M9 | Minimap and homography fix, reprojection debug view | **Code done, broadcast check pending.** Image GMC, line tracking and line-support validation, main-camera orientation rule, fit smoothing, metric landmark table, manual fallback, clipped minimap. Rejects the keypoint model's made-up fits on the amateur test clips; the done-when check needs a broadcast clip. `review_gate.md` M9. |
+| M10 | Config v2, tuning panel, profiles | **Done.** Field table drives the Tuning tab (live values, reset per group) and JSON profiles (byte-exact round trip, last used loads at start). `review_gate.md` M10. |
+| M11 | Play-state gate (in play / dead) | **Code done, broadcast check pending.** `PlayGate` with view angle, player size, scene and ball-off signals; scorebug waits on M12. Dead stops possession, pitch control and events; logged as type 22. `review_gate.md` M11. |
 | M12 | Match setup: scorebug OCR or manual entry, pre-match stats (ESPN), lineups, kit colours | Section 11.4. |
 | M13 | Pass / shot events, team stats accumulators | Section 11.5. |
 | M14 | Stats overlay, ball-avoid flip, on-ball player card | Section 11.6. |
@@ -200,6 +200,8 @@ Work, in order:
 - **Minimap drawing.** `PushClipRect`, size scales with the window, aspect 105:68. On a dead ball (M11) the minimap follows `Config.minimap_dead_mode`: `Freeze` (default: keep the last in-play positions, dimmed, with a "paused" label) or `Hide`.
 
 Done when: on a replay clip with `--keypoints`, the warped pitch lines sit on the painted lines within a few pixels across a full attack and through a pan, and no icon is ever drawn outside the minimap rectangle.
+
+Revised after testing on real clips: the keypoint model guesses a whole-pitch layout when out of distribution, and a broadcast window shows about a third of the pitch, so keypoints alone are not enough. The fit is now driven by the painted lines (`line_fit.hpp`): every keypoint fit is snapped to the lines and must sit on them (`line_min_support`), and between keypoint runs the lines alone refit the motion-predicted `H`. The keypoint model (or a manual click) is only needed to start or to recover after a cut. Fits must also match the main-camera pose (image right = +x, image up = far side). Set-piece and other non-wide views pause the fit.
 
 ### 11.2 M10: config v2, tuning panel, profiles
 

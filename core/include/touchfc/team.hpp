@@ -39,7 +39,8 @@ inline Lab rgb_to_lab(std::uint8_t R, std::uint8_t G, std::uint8_t B) noexcept {
 // Mean jersey colour. The upper half of the box, skipping green grass.
 // Returns false when the crop has almost no non-grass pixels.
 inline bool torso_lab(const std::uint8_t* bgra, std::uint32_t stride, std::uint32_t frame_w,
-                      std::uint32_t frame_h, float x, float y, float w, float h, Lab& out) noexcept {
+                      std::uint32_t frame_h, float x, float y, float w, float h, Lab& out,
+                      int margin = 12, int min_green = 40, int min_px = 8) noexcept {
   if (bgra == nullptr || w < 4.f || h < 8.f) return false;
   int x0 = static_cast<int>(x);
   int y0 = static_cast<int>(y);
@@ -56,25 +57,28 @@ inline bool torso_lab(const std::uint8_t* bgra, std::uint32_t stride, std::uint3
     const std::uint8_t* row = bgra + static_cast<std::uint32_t>(py) * stride;
     for (int px = x0; px < x1; px += 2) {
       const std::uint8_t* p = row + static_cast<std::uint32_t>(px) * 4u;
-      if (p[1] > p[2] + 12 && p[1] > p[0] + 12 && p[1] > 40) continue;
+      if (p[1] > p[2] + margin && p[1] > p[0] + margin && p[1] > min_green) continue;
       b += p[0];
       g += p[1];
       r += p[2];
       ++n;
     }
   }
-  if (n < 8) return false;
+  if (n < min_px) return false;
   out = rgb_to_lab(static_cast<std::uint8_t>(r / n), static_cast<std::uint8_t>(g / n),
                    static_cast<std::uint8_t>(b / n));
   return true;
 }
 
-// 1 or 2 when that seed is nearer. 0 when neither seed is set.
-inline int nearest_team(Lab sample, Lab seed_a, bool a_ok, Lab seed_b, bool b_ok) noexcept {
-  if (!a_ok && !b_ok) return 0;
-  if (!b_ok) return 1;
-  if (!a_ok) return 2;
-  return lab_dist(sample, seed_a) <= lab_dist(sample, seed_b) ? 1 : 2;
+// 1 or 2 when that seed is nearer. 0 when neither seed is set, or the nearer
+// one is further than max_dist (a referee or keeper in a third colour).
+inline int nearest_team(Lab sample, Lab seed_a, bool a_ok, Lab seed_b, bool b_ok,
+                        float max_dist = 1e9f) noexcept {
+  const float da = a_ok ? lab_dist(sample, seed_a) : 1e30f;
+  const float db = b_ok ? lab_dist(sample, seed_b) : 1e30f;
+  const float d = da <= db ? da : db;
+  if (d > max_dist) return 0;
+  return da <= db ? 1 : 2;
 }
 
 struct LostLabel {

@@ -8,8 +8,8 @@
 namespace touchfc {
 
 // One closed possession spell. Pass and shot are not produced: there is no
-// labeled set to quote a recall for them. type_id 21 is outside the SPADL
-// action list on purpose.
+// labeled set to quote a recall for them. type_id 21 (possession) and 22
+// (dead ball) are outside the SPADL action list on purpose.
 struct Possession {
   bool held = false;
   int miss = 0;
@@ -71,9 +71,10 @@ inline void format_spadl_row(char* buf, int n, const Event& e, int attack_dir) n
   const PitchPoint s = internal_to_spadl({e.sx, e.sy}, dir);
   const PitchPoint t = internal_to_spadl({e.ex, e.ey}, dir);
   std::snprintf(buf, static_cast<std::size_t>(n),
-                "touchfc,%llu,1,%.3f,%u,%u,%.2f,%.2f,%.2f,%.2f,21,1,0\n",
+                "touchfc,%llu,1,%.3f,%u,%u,%.2f,%.2f,%.2f,%.2f,%d,1,0\n",
                 static_cast<unsigned long long>(e.id), e.match_ms_end / 1000.0,
-                static_cast<unsigned>(e.team), static_cast<unsigned>(e.track), s.x, s.y, t.x, t.y);
+                static_cast<unsigned>(e.team), static_cast<unsigned>(e.track), s.x, s.y, t.x, t.y,
+                e.type == EventType::DeadBall ? 22 : 21);
 }
 
 }  // namespace touchfc

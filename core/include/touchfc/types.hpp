@@ -24,7 +24,8 @@ enum class EventType : std::uint8_t {
   Clearance,
   Dribble,
   Foul,
-  Other
+  Other,
+  DeadBall  // a play-state gap, so exports show where stats stopped
 };
 
 enum class EventStatus : std::uint8_t { Tentative = 0, Confirmed, Rejected, Manual };
@@ -118,40 +119,68 @@ struct UiCommand {
 
 // Live-tuned POD. Multiple of 8 so it can sit in a SeqLock.
 // version increments on every store. Readers copy it once per frame.
+// Fields are grouped as the Tuning tab shows them; config_fields.hpp lists
+// each with its range, and profiles save them by name.
 struct Config {
   std::uint32_t version = 1;
+  // Detection
   float conf_player = 0.35f;
   float conf_ball = 0.25f;
-  float conf_keypoint = 0.40f;
+  float nms_iou = 0.45f;
   float iou_match_thresh = 0.30f;
+  // Pitch
+  float conf_keypoint = 0.40f;
+  float h_max_rms_m = 1.5f;        // reject a pitch fit above this error
+  float h_jump_m = 3.f;            // a fit this far from the prediction waits one more fit
+  float h_smooth = 0.4f;           // weight of a new fit against the prediction
+  float gmc_max_cost = 18.f;       // image motion worse than this is a cut
+  float line_search_px = 12.f;     // line search +- px, at 1920 wide
+  float line_contrast = 18.f;      // painted line over grass, grey levels
+  float line_min_support = 0.35f;  // share of in-view markings on painted lines
+  float scene_wide_frac = 0.28f;   // grass share of the frame for a wide shot
+  float scene_mid_frac = 0.15f;    // ... and of the middle third
+  float scene_close_frac = 0.12f;  // below this grass share: not a pitch view
+  // Teams
+  float team_max_dist = 45.f;      // Lab distance to the nearer kit seed; beyond it, no team
+  // Play state
+  float view_angle_max_deg = 40.f;     // pitch long axis tilt at the image centre
+  float player_height_max_frac = 0.25f;  // median player box height / frame height
+  float scorebug_match_min = 0.6f;
+  // Events
   float poss_dist_m = 1.5f;
+  float pass_min_dist_m = 5.f;
+  float ball_flight_min_mps = 6.f;
+  float shot_speed_mps = 8.f;
+  // Overlay
   float delay_margin_ms = 0.f;
+  float flip_margin_px = 24.f;
+  std::uint32_t layers = 0xffffffffu;
+  std::uint16_t h_holdover = 50;     // frames a fit lives on camera motion alone
+  std::uint16_t team_min_px = 8;     // non-grass torso samples for a kit colour
+  std::uint16_t dead_enter_ms = 400;
+  std::uint16_t live_enter_ms = 700;
+  std::uint16_t flip_hold_ms = 2000;
   std::uint8_t det_interval = 1;
   std::uint8_t show_boxes = 1;
   std::uint8_t attack_dir = 1;
   std::uint8_t ball_tiling = 0;
-  std::uint32_t layers = 0xffffffffu;
-  float shot_speed_mps = 8.f;
-  float h_max_rms_m = 1.5f;     // reject a pitch fit above this error
-  float h_jump_m = 3.f;         // a fit this far from the prediction waits one more fit
-  float h_smooth = 0.4f;        // weight of a new fit against the prediction
-  float gmc_max_cost = 18.f;    // image motion worse than this is a cut
-  std::uint16_t h_holdover = 50;  // frames a fit lives on camera motion alone
-  std::uint8_t kp_interval = 4;   // keypoint model every Nth wide frame
-  std::uint8_t minimap_dead_mode = 0;  // MinimapDeadMode, used from M11
-  std::uint8_t green_margin = 8;   // grass: green over red and blue by this much
-  std::uint8_t line_interval = 2;  // line refit every Nth wide frame
-  std::uint16_t pad0 = 0;
-  float line_search_px = 12.f;     // line search +- px, at 1920 wide
-  float line_contrast = 18.f;      // painted line over grass, grey levels
-  float line_min_support = 0.35f;  // share of in-view markings on painted lines
-  float pad1 = 0.f;
+  std::uint8_t kp_interval = 4;      // keypoint model every Nth wide frame
+  std::uint8_t line_interval = 2;    // line refit every Nth wide frame
+  std::uint8_t green_margin = 8;     // grass: green over red and blue by this much
+  std::uint8_t green_min = 40;       // ... and green above this
+  std::uint8_t minimap_dead_mode = 0;  // MinimapDeadMode
+  std::uint8_t panel_side = 0;         // PanelSide
+  std::uint8_t mini_replay = 1;
+  std::uint8_t pad[7]{};
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };
+enum class PanelSide : std::uint8_t { Auto = 0, Left = 1, Right = 2 };
 
 static_assert(std::is_trivially_copyable_v<Config>);
+static_assert(std::is_standard_layout_v<Config>);
 static_assert(sizeof(Config) % 8 == 0, "SeqLock payload must be a multiple of 8");
+static_assert(sizeof(Config) <= 4096);
 static_assert(std::is_trivially_copyable_v<OverlayState>);
 static_assert(std::is_trivially_copyable_v<UiCommand>);
 static_assert(std::is_trivially_copyable_v<FrameMeta>);

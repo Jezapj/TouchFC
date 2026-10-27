@@ -10,6 +10,7 @@
 #include "touchfc/image_gmc.hpp"
 #include "touchfc/line_fit.hpp"
 #include "touchfc/pitch_calib.hpp"
+#include "touchfc/play_state.hpp"
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/possession.hpp"
 #include "touchfc/scene.hpp"
@@ -79,7 +80,7 @@ class Pipeline {
   void run_t6();
   void note(int producer, FrameId frame, Stage stage, TimeNs begin, TimeNs end) noexcept;
   void drain_ring(BlockingSpsc<std::uint32_t, kDepth>& ring);
-  void assign_teams(FrameSlot& slot);
+  void assign_teams(FrameSlot& slot, const Config& cfg);
   void update_possession(FrameSlot& slot);
 
   FramePool& pool_;
@@ -123,6 +124,11 @@ class Pipeline {
   std::uint16_t gmc_id_[64]{};
   std::uint32_t gmc_n_ = 0;
   void update_pitch(FrameSlot& slot, const Config& cfg);
+  void update_play(FrameSlot& slot, const Config& cfg);
+  void log_event(const Event& e) noexcept;
+  PlayGate play_{};
+  bool play_dead_ = false;
+  std::int64_t dead_start_ns_ = 0;
   void set_anchor(const UiCommand& command);
   PitchCalib calib_{};
   GmcImage gmc_img_[2]{};
@@ -154,7 +160,8 @@ class Pipeline {
   float territory_ = 0.5f;
   std::uint8_t pc_ds_[160]{};
   Possession poss_{};
-  Event poss_events_[64]{};
+  static constexpr int kMaxEvents = 4096;
+  Event poss_events_[kMaxEvents]{};
   int poss_n_ = 0;
   std::int64_t poss_t0_ = 0;
 };

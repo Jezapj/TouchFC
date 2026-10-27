@@ -22,6 +22,11 @@ class Detector {
   // Fill slot.dets / slot.det_count using slot.bgra and slot.meta.
   // Must not allocate and must not throw.
   virtual void run(FrameSlot& slot) noexcept = 0;
+  // Live thresholds from Config, set on T2 before each run.
+  virtual void configure(float score_min, float nms_iou) noexcept {
+    (void)score_min;
+    (void)nms_iou;
+  }
 
   // Short label for the HUD, e.g. "stub" or "ort-cpu".
   virtual const char* label() const noexcept = 0;

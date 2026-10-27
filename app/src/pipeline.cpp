@@ -182,10 +182,19 @@ void Pipeline::run_t2() {
     const TimeNs begin = slot.meta.t_pre_done;
     slot.kp_fresh = 0;
     slot.kp_n = 0;
-    if (detector_) detector_->run(slot);
     const Config cfg = config_.load();
+    if (detector_) {
+      detector_->configure(std::min(cfg.conf_player, cfg.conf_ball), cfg.nms_iou);
+      detector_->run(slot);
+    }
+    SceneParams sp;
+    sp.margin = cfg.green_margin;
+    sp.min_green = cfg.green_min;
+    sp.wide_frac = cfg.scene_wide_frac;
+    sp.mid_frac = cfg.scene_mid_frac;
+    sp.close_frac = cfg.scene_close_frac;
     slot.scene = static_cast<std::uint8_t>(classify_scene_bgra(slot.bgra.get(), slot.meta.width,
-                                                               slot.meta.height, slot.stride, cfg.green_margin));
+                                                               slot.meta.height, slot.stride, sp, &slot.green_frac));
     // Keypoints on every kp_interval-th wide frame. Close-ups and set-piece
     // angles pause the pitch fit, so they are skipped.
     if (pitch_ && slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
@@ -224,7 +233,8 @@ void Pipeline::update_possession(FrameSlot& slot) {
     best_score = slot.dets[i].score;
     ball = static_cast<int>(i);
   }
-  const bool have = ball >= 0 && slot.pitch_ok[static_cast<std::uint32_t>(ball)];
+  // Dead ball: no holder, so an open spell closes and none starts.
+  const bool have = !play_dead_ && ball >= 0 && slot.pitch_ok[static_cast<std::uint32_t>(ball)];
   float bx = 0, by = 0;
   if (have) {
     bx = slot.pitch_x[static_cast<std::uint32_t>(ball)];
@@ -249,11 +259,7 @@ void Pipeline::update_possession(FrameSlot& slot) {
   if (poss_t0_ == 0) poss_t0_ = last_track_t_ns_;
   const float dist = track != 0 ? std::sqrt(best_d) : 99.f;
   const PossOut out = step_possession(poss_, have, bx, by, track, team, dist, limit, last_track_t_ns_, poss_t0_);
-  if (out.emitted && poss_n_ < 64) {
-    poss_events_[poss_n_] = out.event;
-    poss_events_[poss_n_].id = static_cast<EventId>(poss_n_ + 1);
-    ++poss_n_;
-  }
+  if (out.emitted) log_event(out.event);
   slot.ball_ok = have ? 1 : 0;
   slot.ball_x = bx;
   slot.ball_y = by;
@@ -275,14 +281,14 @@ void Pipeline::write_spadl(const char* path) const {
   std::fclose(f);
 }
 
-void Pipeline::assign_teams(FrameSlot& slot) {
+void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
   for (std::uint32_t i = 0; i < slot.det_count; ++i) slot.det_team[i] = 0;
   for (std::uint32_t i = 0; i < slot.det_count; ++i) {
     const Detection& d = slot.dets[i];
     if (d.track_id == 0 || d.class_id == 3) continue;
     Lab sample;
     if (!torso_lab(slot.bgra.get(), slot.stride, slot.meta.width, slot.meta.height, d.x, d.y, d.w, d.h,
-                   sample))
+                   sample, cfg.green_margin, cfg.green_min, cfg.team_min_px))
       continue;
     for (auto& t : tracker_.tracks) {
       if (t.id != d.track_id) continue;
@@ -310,7 +316,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
   if (seed_ok_[0] || seed_ok_[1]) {
     for (auto& t : tracker_.tracks) {
       if (t.id == 0 || t.team_lock || t.class_id == 3) continue;
-      t.team = static_cast<std::uint8_t>(nearest_team(t.lab, seed_[0], seed_ok_[0], seed_[1], seed_ok_[1]));
+      t.team = static_cast<std::uint8_t>(nearest_team(t.lab, seed_[0], seed_ok_[0], seed_[1], seed_ok_[1], cfg.team_max_dist));
     }
   }
   for (auto& t : tracker_.tracks) {
@@ -379,7 +385,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
     if (t.team == 1) ++n0;
     else if (t.team == 2) ++n1;
   }
-  if (n0 > 0 && n1 > 0 && slot.pitch_valid && now - last_pc_ns_ > 100000000LL) {
+  if (n0 > 0 && n1 > 0 && slot.pitch_valid && !play_dead_ && now - last_pc_ns_ > 100000000LL) {
     PcPlayer players[kPcMaxPlayers]{};
     int n = 0;
     for (std::uint32_t i = 0; i < slot.det_count && n < kPcMaxPlayers; ++i) {
@@ -457,12 +463,13 @@ void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
   lp.contrast = cfg.line_contrast;
   lp.min_support = cfg.line_min_support;
   lp.green_margin = cfg.green_margin;
+  lp.green_min = cfg.green_min;
   const int iw = static_cast<int>(slot.meta.width), ih = static_cast<int>(slot.meta.height);
   const int stride = static_cast<int>(slot.stride);
   const bool wide = slot.scene == static_cast<std::uint8_t>(Scene::Wide);
 
   GmcImage& cur = gmc_img_[gmc_cur_];
-  gmc_reduce_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride, cur, cfg.green_margin);
+  gmc_reduce_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride, cur, cfg.green_margin, cfg.green_min);
   const GmcMotion motion = estimate_gmc(gmc_img_[gmc_cur_ ^ 1], cur, gp);
   gmc_cur_ ^= 1;
   float G[9];
@@ -548,6 +555,76 @@ void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
   }
 }
 
+void Pipeline::log_event(const Event& e) noexcept {
+  if (poss_n_ >= kMaxEvents) return;
+  poss_events_[poss_n_] = e;
+  poss_events_[poss_n_].id = static_cast<EventId>(poss_n_ + 1);
+  ++poss_n_;
+}
+
+// M11: InPlay / Dead from several signals with hysteresis. While Dead the
+// tracker keeps running; possession, pitch control and events stop.
+void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
+  const float W = static_cast<float>(slot.meta.width);
+  const float H = static_cast<float>(slot.meta.height);
+  std::uint8_t avail = kSigScene, dead = 0;
+  if (slot.scene != static_cast<std::uint8_t>(Scene::Wide)) dead |= kSigScene;
+
+  float angle = 0.f;
+  if (slot.pitch_valid && view_angle_deg(calib_.current(), W, H, angle)) {
+    avail |= kSigAngle;
+    if (angle > cfg.view_angle_max_deg) dead |= kSigAngle;
+  }
+  slot.view_angle_deg = angle;
+
+  float hs[kMaxDetections];
+  int nh = 0;
+  int ball = -1;
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    if (slot.dets[i].class_id <= 1) hs[nh++] = slot.dets[i].h;
+    else if (slot.dets[i].class_id == 3 && (ball < 0 || slot.dets[i].score > slot.dets[ball].score))
+      ball = static_cast<int>(i);
+  }
+  slot.player_height_frac = 0.f;
+  if (nh > 0) {
+    std::nth_element(hs, hs + nh / 2, hs + nh);
+    slot.player_height_frac = hs[nh / 2] / H;
+    avail |= kSigSize;
+    if (slot.player_height_frac > cfg.player_height_max_frac) dead |= kSigSize;
+  }
+
+  if (slot.pitch_valid && ball >= 0) {
+    const Detection& b = slot.dets[static_cast<std::uint32_t>(ball)];
+    float X, Y;
+    if (apply_homography(calib_.current(), b.x + 0.5f * b.w, b.y + b.h, X, Y)) {
+      avail |= kSigBallOff;
+      if (!on_pitch(X, Y, 1.f)) dead |= kSigBallOff;
+    }
+  }
+
+  // Hysteresis runs on video time in replay (inference can be slower than real
+  // time) and on the track clock live. Event times stay on the track clock.
+  const std::int64_t now = last_track_t_ns_;
+  const std::int64_t t_gate = live_ ? now : slot.meta.pts_ns;
+  if (play_.update(t_gate, avail, dead, cfg.dead_enter_ms, cfg.live_enter_ms)) {
+    play_dead_ = play_.state() == PlayState::Dead;
+    if (poss_t0_ == 0) poss_t0_ = now;
+    if (play_dead_) {
+      dead_start_ns_ = now;
+    } else {
+      Event e{};
+      e.type = EventType::DeadBall;
+      e.status = EventStatus::Confirmed;
+      e.flags = play_.reasons();
+      e.match_ms_start = static_cast<std::int32_t>((dead_start_ns_ - poss_t0_) / 1000000LL);
+      e.match_ms_end = static_cast<std::int32_t>((now - poss_t0_) / 1000000LL);
+      log_event(e);
+    }
+  }
+  slot.play_dead = play_dead_ ? 1 : 0;
+  slot.play_reasons = play_.reasons();
+}
+
 void Pipeline::run_t3() {
   if (pin_) pin_current_thread_to_one_ccd();
   set_pipeline_thread();
@@ -612,7 +689,8 @@ void Pipeline::run_t3() {
       ++gmc_n_;
     }
     update_pitch(slot, cfg);
-    assign_teams(slot);
+    update_play(slot, cfg);
+    assign_teams(slot, cfg);
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;

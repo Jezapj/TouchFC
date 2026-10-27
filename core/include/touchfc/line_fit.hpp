@@ -17,6 +17,7 @@ struct LineFitParams {
   float contrast = 18.f;     // ridge over the brighter flank, grey levels
   float min_support = 0.35f; // matched / in-view samples to trust a fit
   int green_margin = 8;      // flank must be this much greener than red and blue
+  int green_min = 40;
   int iters = 3;
 };
 
@@ -75,8 +76,8 @@ void for_each_mark_sample(F&& f) {
 
 inline int luma(const std::uint8_t* p) noexcept { return (p[0] + 2 * p[1] + p[2]) >> 2; }
 
-inline bool grass_px(const std::uint8_t* p, int m) noexcept {
-  return p[1] > p[2] + m && p[1] > p[0] + m && p[1] > 40;
+inline bool grass_px(const std::uint8_t* p, int m, int lo) noexcept {
+  return p[1] > p[2] + m && p[1] > p[0] + m && p[1] > lo;
 }
 
 struct LineView {
@@ -105,7 +106,7 @@ inline int ridge_search(const LineView& v, float x, float y, float nx, float ny,
     const std::uint8_t* a = v.at(static_cast<int>(qx + d * nx + 0.5f), static_cast<int>(qy + d * ny + 0.5f));
     const std::uint8_t* b = v.at(static_cast<int>(qx - d * nx + 0.5f), static_cast<int>(qy - d * ny + 0.5f));
     float e = -1e9f;
-    if (grass_px(a, p.green_margin) && grass_px(b, p.green_margin)) {
+    if (grass_px(a, p.green_margin, p.green_min) && grass_px(b, p.green_margin, p.green_min)) {
       const int fl = luma(a) > luma(b) ? luma(a) : luma(b);
       e = static_cast<float>(luma(c) - fl);
     }

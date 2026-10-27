@@ -32,6 +32,7 @@ if(TOUCHFC_USE_VCPKG)
   find_package(Catch2 CONFIG REQUIRED)
   find_package(benchmark CONFIG REQUIRED)
   find_package(hdr_histogram CONFIG REQUIRED)
+  find_package(nlohmann_json CONFIG REQUIRED)
 else()
   include(FetchContent)
   set(CATCH_INSTALL_DOCS OFF CACHE BOOL "" FORCE)
@@ -66,7 +67,14 @@ else()
     FetchContent_MakeAvailable(benchmark)
   endif()
   FetchContent_MakeAvailable(hdr_histogram_proj)
+  # Profiles (M10). The release tarball is the single-include header tree only.
+  FetchContent_Declare(
+    nlohmann_json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
+  FetchContent_MakeAvailable(nlohmann_json)
 endif()
+target_link_libraries(touchfc_headers INTERFACE nlohmann_json::nlohmann_json)
 
 if(TARGET hdr_histogram_static)
   set(TOUCHFC_HDR_TARGET hdr_histogram_static)

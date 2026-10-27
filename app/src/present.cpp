@@ -6,9 +6,11 @@
 #include "threads_win.hpp"
 #include "win_time.hpp"
 
+#include "touchfc/config_json.hpp"
 #include "touchfc/homography.hpp"
 #include "touchfc/pitch_calib.hpp"
 #include "touchfc/pitch_landmarks.hpp"
+#include "touchfc/play_state.hpp"
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
@@ -21,6 +23,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -109,6 +116,10 @@ class App {
   void remember(const FrameSlot& slot);
   void draw_view();
   void draw_control();
+  void draw_tuning(Config& cfg);
+  bool live_value(const char* key, char* buf, int n) const;
+  bool load_profile(const char* name);
+  void load_last_profile();
   void pump_pipeline();
   void track_target();
   void refresh_windows();
@@ -171,6 +182,23 @@ class App {
   std::array<float, 32> last_kp_x_{};
   std::array<float, 32> last_kp_y_{};
   bool debug_reproj_ = false;
+  char profile_name_[48] = "default";
+  std::string profile_msg_;
+  float last_green_frac_ = 0.f;
+  float last_view_angle_ = 0.f;
+  float last_height_frac_ = 0.f;
+  std::uint8_t last_play_dead_ = 0;
+  std::uint8_t last_play_reasons_ = 0;
+  // Minimap positions, refreshed only in play so a dead ball can freeze them.
+  bool mm_valid_ = false;
+  std::uint32_t mm_n_ = 0;
+  std::array<float, kMaxDetections> mm_x_{};
+  std::array<float, kMaxDetections> mm_y_{};
+  std::array<ImU32, kMaxDetections> mm_col_{};
+  bool mm_ball_ = false;
+  float mm_bx_ = 0.f;
+  float mm_by_ = 0.f;
+  std::uint8_t minimap_dead_mode_ = 0;
   std::FILE* pitch_dump_ = nullptr;
   int calib_pick_ = 0;
   bool sent_anchor_[32]{};
@@ -354,6 +382,29 @@ void App::remember(const FrameSlot& slot) {
   last_pitch_manual_ = slot.pitch_manual;
   last_gmc_cost_ = slot.gmc_cost;
   last_line_support_ = slot.line_support;
+  last_green_frac_ = slot.green_frac;
+  last_view_angle_ = slot.view_angle_deg;
+  last_height_frac_ = slot.player_height_frac;
+  last_play_dead_ = slot.play_dead;
+  last_play_reasons_ = slot.play_reasons;
+  if (!slot.play_dead) {
+    mm_valid_ = slot.pitch_valid != 0;
+    mm_n_ = 0;
+    for (std::uint32_t i = 0; mm_valid_ && i < slot.det_count; ++i) {
+      if (slot.dets[i].class_id > 1 || !slot.pitch_ok[i]) continue;
+      const std::uint8_t t = slot.det_team[i];
+      mm_x_[mm_n_] = slot.pitch_x[i];
+      mm_y_[mm_n_] = slot.pitch_y[i];
+      mm_col_[mm_n_] = t == 1 ? IM_COL32(40, 140, 255, 255)
+                       : t == 2 ? IM_COL32(255, 70, 70, 255)
+                       : slot.dets[i].class_id == 1 ? IM_COL32(255, 220, 32, 255)
+                                                    : IM_COL32(0, 220, 220, 255);
+      ++mm_n_;
+    }
+    mm_ball_ = slot.ball_ok != 0;
+    mm_bx_ = slot.ball_x;
+    mm_by_ = slot.ball_y;
+  }
   last_gmc_ok_ = slot.gmc_ok;
   if (pitch_dump_) {
     // Present thread, not the hot path. One row per frame.
@@ -364,7 +415,8 @@ void App::remember(const FrameSlot& slot) {
     std::fprintf(pitch_dump_, ",");
     for (std::uint32_t k = 0; slot.kp_fresh && k < slot.kp_n; ++k)
       std::fprintf(pitch_dump_, "%u:%.1f:%.1f;", slot.kp_id[k], slot.kp_x[k], slot.kp_y[k]);
-    std::fprintf(pitch_dump_, ",%.3f\n", slot.line_support);
+    std::fprintf(pitch_dump_, ",%.3f,%u,%u,%.1f,%.3f\n", slot.line_support, slot.play_dead, slot.play_reasons,
+                 slot.view_angle_deg, slot.player_height_frac);
   }
   if (slot.kp_fresh) {
     last_kp_n_ = slot.kp_n;
@@ -569,8 +621,11 @@ void App::draw_view() {
         dl->AddText(ImVec2(p.x + 6, p.y + 2), IM_COL32(255, 230, 0, 255), id);
       }
     }
-    {
+    if (pipe_) minimap_dead_mode_ = pipe_->config().load().minimap_dead_mode;
+    const bool dead = last_play_dead_ != 0;
+    if (!(dead && minimap_dead_mode_ == static_cast<std::uint8_t>(MinimapDeadMode::Hide))) {
       // 105:68, scales with the window, clipped so nothing lands outside it.
+      // Dead ball + Freeze: the last in-play positions, dimmed.
       const float pad = 8.f;
       const float mw = std::clamp(cw * 0.22f, 160.f, 420.f);
       const float iw = mw - 2.f * pad;
@@ -580,7 +635,7 @@ void App::draw_view() {
       const float ix = mx + pad, iy = my + pad;
       dl->PushClipRect(ImVec2(mx, my), ImVec2(mx + mw, my + mh), true);
       dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
-      if (last_pitch_valid_ && last_pc_valid_) {
+      if (!dead && last_pitch_valid_ && last_pc_valid_) {
         for (int j = 0; j < 10; ++j) {
           for (int i = 0; i < 16; ++i) {
             const int p = last_pc_ds_[static_cast<std::uint32_t>((9 - j) * 16 + i)];
@@ -595,19 +650,15 @@ void App::draw_view() {
       };
       draw_pitch_lines(dl, [&](float X, float Y, ImVec2& out) { out = map(X, Y); return true; },
                        IM_COL32(220, 220, 220, 150), 1.f);
-      if (!last_pitch_valid_) {
-        const char* msg = "not calibrated";
+      const ImU32 dim = dead ? 0x60FFFFFFu : 0xFFFFFFFFu;  // alpha mask
+      if (mm_valid_) {
+        for (std::uint32_t i = 0; i < mm_n_; ++i) dl->AddCircleFilled(map(mm_x_[i], mm_y_[i]), 3.f, mm_col_[i] & dim);
+        if (mm_ball_) dl->AddCircleFilled(map(mm_bx_, mm_by_), 4.f, IM_COL32(255, 255, 255, 255) & dim);
+      }
+      const char* msg = dead ? "paused" : mm_valid_ ? nullptr : "not calibrated";
+      if (msg) {
         const ImVec2 sz = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(mx + 0.5f * (mw - sz.x), my + 0.5f * (mh - sz.y)), IM_COL32(255, 255, 255, 230), msg);
-      } else {
-        for (std::uint32_t i = 0; i < last_det_count_; ++i) {
-          if (last_dets_[i].class_id > 1 || !last_pitch_ok_[i]) continue;
-          const ImU32 col = (last_team_[i] == 1) ? IM_COL32(40, 140, 255, 255)
-                            : (last_team_[i] == 2) ? IM_COL32(255, 70, 70, 255)
-                                                   : kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
-          dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
-        }
-        if (last_ball_ok_) dl->AddCircleFilled(map(last_ball_x_, last_ball_y_), 4.f, IM_COL32(255, 255, 255, 255));
       }
       dl->PopClipRect();
     }
@@ -619,6 +670,15 @@ void App::draw_view() {
   const double p99 = pipe_ ? static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6 : 0;
   ImGui::Text("capture-to-present-call  p50 %.2f ms   p99 %.2f ms", p50, p99);
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
+  if (last_play_dead_) {
+    char why[64] = "";
+    for (int k = 0; k < kPlaySignals; ++k)
+      if (last_play_reasons_ & (1u << k)) {
+        std::strncat(why, " ", sizeof(why) - std::strlen(why) - 1);
+        std::strncat(why, kPlaySignalName[k], sizeof(why) - std::strlen(why) - 1);
+      }
+    ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "dead ball:%s", why);
+  }
   {
     const char* scene = last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other";
     if (last_pitch_valid_)
@@ -716,6 +776,7 @@ bool App::start_overlay_capture() {
   pitch_ = make_pitch();
   pipe_ = std::make_unique<Pipeline>(*pool_);
   pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
+  load_last_profile();
   status_ = std::string("capturing: ") + detector_->label();
   ShowWindow(view_hwnd_, SW_SHOWNOACTIVATE);
   return true;
@@ -740,6 +801,119 @@ void App::track_target() {
   if (dw > 4 || dh > 4) view_dirty_ = true;
 }
 
+// The live value each threshold is compared against, so a slider can be moved
+// against a number on screen. False when the field has none.
+bool App::live_value(const char* key, char* buf, int n) const {
+  auto is = [&](const char* k) { return std::strcmp(key, k) == 0; };
+  if (is("h_max_rms_m")) return std::snprintf(buf, n, "now %.2f", last_reproj_m_) > 0;
+  if (is("h_holdover")) return std::snprintf(buf, n, "age %u", static_cast<unsigned>(last_pitch_age_)) > 0;
+  if (is("gmc_max_cost"))
+    return std::snprintf(buf, n, "now %.1f%s", last_gmc_cost_, last_gmc_ok_ ? "" : " lost") > 0;
+  if (is("line_min_support")) return std::snprintf(buf, n, "now %.2f", last_line_support_) > 0;
+  if (is("green_margin") || is("green_min") || is("scene_wide_frac") || is("scene_close_frac"))
+    return std::snprintf(buf, n, "grass %.2f %s", last_green_frac_,
+                         last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other") > 0;
+  if (is("view_angle_max_deg")) return std::snprintf(buf, n, "now %.0f", last_view_angle_) > 0;
+  if (is("player_height_max_frac")) return std::snprintf(buf, n, "now %.2f", last_height_frac_) > 0;
+  if (is("dead_enter_ms") || is("live_enter_ms"))
+    return std::snprintf(buf, n, "%s", last_play_dead_ ? "dead" : "in play") > 0;
+  if (is("conf_player")) return std::snprintf(buf, n, "%u boxes", last_det_count_) > 0;
+  return false;
+}
+
+namespace {
+bool profile_name_ok(const char* s) {
+  if (!s[0]) return false;
+  for (const char* p = s; *p; ++p)
+    if (!std::isalnum(static_cast<unsigned char>(*p)) && *p != '_' && *p != '-') return false;
+  return true;
+}
+}  // namespace
+
+bool App::load_profile(const char* name) {
+  if (!pipe_ || !profile_name_ok(name)) return false;
+  std::ifstream in(std::string("profiles/") + name + ".json");
+  if (!in) return false;
+  const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  Config cfg;
+  if (!config_from_json(text, cfg)) return false;
+  cfg.version = pipe_->config().load().version + 1;
+  pipe_->config().store(cfg);
+  std::ofstream("profiles/last.txt") << name;
+  return true;
+}
+
+void App::load_last_profile() {
+  std::ifstream in("profiles/last.txt");
+  std::string name;
+  if (in >> name && name.size() < sizeof(profile_name_)) {
+    std::snprintf(profile_name_, sizeof(profile_name_), "%s", name.c_str());
+    profile_msg_ = load_profile(profile_name_) ? "loaded " + name : "could not load " + name;
+  }
+}
+
+// Tuning tab: every Config field by group, with its live value and a reset.
+void App::draw_tuning(Config& cfg) {
+  ImGui::SetNextItemWidth(160.f);
+  ImGui::InputText("##profile", profile_name_, sizeof(profile_name_));
+  ImGui::SameLine();
+  if (ImGui::Button("save profile")) {
+    if (!profile_name_ok(profile_name_)) {
+      profile_msg_ = "name: letters, digits, _ and - only";
+    } else {
+      std::error_code ec;
+      std::filesystem::create_directories("profiles", ec);
+      std::ofstream(std::string("profiles/") + profile_name_ + ".json") << config_to_json(cfg);
+      std::ofstream("profiles/last.txt") << profile_name_;
+      profile_msg_ = std::string("saved ") + profile_name_;
+    }
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("load profile")) {
+    profile_msg_ = load_profile(profile_name_) ? std::string("loaded ") + profile_name_ : "no such profile";
+    cfg = pipe_->config().load();
+  }
+  if (!profile_msg_.empty()) ImGui::TextDisabled("%s", profile_msg_.c_str());
+
+  bool changed = false;
+  for (int g = 0; g < static_cast<int>(CfgGroup::Hidden); ++g) {
+    if (!ImGui::CollapsingHeader(kCfgGroupName[g])) continue;
+    ImGui::PushID(g);
+    if (ImGui::SmallButton("reset group")) {
+      cfg_reset_group(cfg, static_cast<CfgGroup>(g));
+      changed = true;
+    }
+    for (const CfgField& f : kConfigFields) {
+      if (static_cast<int>(f.group) != g) continue;
+      const double v = cfg_get(cfg, f);
+      ImGui::SetNextItemWidth(220.f);
+      if (f.type == CfgType::F32) {
+        float x = static_cast<float>(v);
+        if (ImGui::SliderFloat(f.label, &x, f.lo, f.hi)) {
+          cfg_set(cfg, f, x);
+          changed = true;
+        }
+      } else {
+        int x = static_cast<int>(v);
+        if (ImGui::SliderInt(f.label, &x, static_cast<int>(f.lo), static_cast<int>(f.hi))) {
+          cfg_set(cfg, f, x);
+          changed = true;
+        }
+      }
+      char live[48];
+      if (live_value(f.key, live, sizeof(live))) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", live);
+      }
+    }
+    ImGui::PopID();
+  }
+  if (changed) {
+    ++cfg.version;
+    pipe_->config().store(cfg);
+  }
+}
+
 void App::draw_control() {
   if (control_dirty_ && control_swap_) {
     control_rtv_.Reset();
@@ -754,20 +928,23 @@ void App::draw_control() {
   ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
   ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
   ImGui::Begin("TouchFC", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove);
-  ImGui::TextUnformatted("TouchFC  M1");
+  ImGui::TextUnformatted("TouchFC");
   if (!status_.empty()) ImGui::TextWrapped("%s", status_.c_str());
   if (pipe_) {
     Config cfg = pipe_->config().load();
-    bool boxes = cfg.show_boxes != 0;
-    if (ImGui::Checkbox("show marker box", &boxes)) {
-      cfg.show_boxes = boxes ? 1 : 0;
-      ++cfg.version;
-      pipe_->config().store(cfg);
+    bool main_tab = false;
+    if (ImGui::BeginTabBar("tabs")) {
+      if (ImGui::BeginTabItem("Main")) {
+        main_tab = true;
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Tuning")) {
+        draw_tuning(cfg);
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
     }
-    if (ImGui::SliderFloat("present margin ms", &cfg.delay_margin_ms, 0.f, 80.f)) {
-      ++cfg.version;
-      pipe_->config().store(cfg);
-    }
+    if (main_tab) {
     if (ImGui::Button("attack direction")) {
       UiCommand cmd;
       cmd.type = CmdType::ApplyAttackDir;
@@ -816,51 +993,16 @@ void App::draw_control() {
           pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
         }
       };
-      auto store = [&] {
-        ++cfg.version;
-        pipe_->config().store(cfg);
-      };
       ImGui::Checkbox("reprojection view", &debug_reproj_);
       ImGui::SameLine();
       ImGui::TextDisabled("magenta = H^-1 lines, yellow = raw keypoints");
       ImGui::Text("%s   last fit: %s",
                   last_pitch_valid_ ? (last_pitch_manual_ ? "manual" : "keypoints") : "not calibrated",
                   fit_reject_name(static_cast<FitReject>(last_pitch_reject_ < kFitRejectCount ? last_pitch_reject_ : 0)));
-      int kp = cfg.kp_interval;
-      if (ImGui::SliderInt("keypoint interval", &kp, 1, 16)) {
-        cfg.kp_interval = static_cast<std::uint8_t>(kp);
-        store();
-      }
-      if (ImGui::SliderFloat("fit max error m", &cfg.h_max_rms_m, 0.3f, 4.f)) store();
-      ImGui::SameLine();
-      ImGui::Text("now %.2f", last_reproj_m_);
-      if (ImGui::SliderFloat("fit jump m", &cfg.h_jump_m, 0.5f, 10.f)) store();
-      if (ImGui::SliderFloat("fit smoothing", &cfg.h_smooth, 0.05f, 1.f)) store();
-      int hold = cfg.h_holdover;
-      if (ImGui::SliderInt("holdover frames", &hold, 5, 250)) {
-        cfg.h_holdover = static_cast<std::uint16_t>(hold);
-        store();
-      }
-      ImGui::SameLine();
-      ImGui::Text("age %u", static_cast<unsigned>(last_pitch_age_));
-      if (ImGui::SliderFloat("motion max cost", &cfg.gmc_max_cost, 4.f, 40.f)) store();
-      ImGui::SameLine();
-      ImGui::Text("now %.1f%s", last_gmc_cost_, last_gmc_ok_ ? "" : " (lost)");
-      int gm = cfg.green_margin;
-      if (ImGui::SliderInt("green margin", &gm, 2, 30)) {
-        cfg.green_margin = static_cast<std::uint8_t>(gm);
-        store();
-      }
-      int li = cfg.line_interval;
-      if (ImGui::SliderInt("line refit interval", &li, 1, 8)) {
-        cfg.line_interval = static_cast<std::uint8_t>(li);
-        store();
-      }
-      if (ImGui::SliderFloat("line search px", &cfg.line_search_px, 4.f, 40.f)) store();
-      if (ImGui::SliderFloat("line contrast", &cfg.line_contrast, 5.f, 60.f)) store();
-      if (ImGui::SliderFloat("line min support", &cfg.line_min_support, 0.05f, 0.9f)) store();
-      ImGui::SameLine();
-      ImGui::Text("now %.2f", last_line_support_);
+      ImGui::Text("fit error %.2f m   age %u   motion %.1f%s   lines %.2f", last_reproj_m_,
+                  static_cast<unsigned>(last_pitch_age_), last_gmc_cost_, last_gmc_ok_ ? "" : " (lost)",
+                  last_line_support_);
+      ImGui::TextDisabled("Thresholds are in the Tuning tab.");
 
       ImGui::Separator();
       ImGui::TextWrapped("Manual: pick a landmark, click it on the frame. 4 or more fit. Pause first.");
@@ -908,6 +1050,7 @@ void App::draw_control() {
     const double p99 = static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6;
     ImGui::Text("capture-to-present-call p50 %.2f ms  p99 %.2f ms", p50, p99);
     ImGui::TextWrapped("Glass-to-photon latency needs PresentMon. See scripts/presentmon_check.ps1.");
+    }
   }
   if (args_.mode == AppArgs::Mode::Overlay && !pipe_) {
     refresh_windows();
@@ -982,6 +1125,7 @@ int App::run() {
       pitch_ = make_pitch();
       pipe_ = std::make_unique<Pipeline>(*pool_);
       pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
+      load_last_profile();
       if (!create_window(view_hwnd_, L"TouchFC", WS_OVERLAPPEDWINDOW, 0, 1280, 760, view_binding_)) return 1;
       if (!create_hwnd_swap(view_hwnd_, view_swap_, false)) return 1;
       recreate_rtv(view_swap_.Get(), view_rtv_);

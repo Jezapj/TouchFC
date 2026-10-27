@@ -1,5 +1,6 @@
 #include "touchfc/arena.hpp"
 #include "touchfc/blocking_spsc.hpp"
+#include "touchfc/config_json.hpp"
 #include "touchfc/cpu.hpp"
 #include "touchfc/detection.hpp"
 #include "touchfc/frame_check.hpp"
@@ -17,6 +18,7 @@
 #include "touchfc/possession.hpp"
 #include "touchfc/pitch_landmarks.hpp"
 #include "touchfc/pitch_pose.hpp"
+#include "touchfc/play_state.hpp"
 #include "touchfc/preprocess.hpp"
 #include "touchfc/seqlock.hpp"
 #include "touchfc/scene.hpp"
@@ -1072,4 +1074,107 @@ TEST_CASE("line fit scores, rejects and snaps to painted lines") {
   // A plain grass frame: nothing to match, no refit.
   painted_frame(px, Homography{});
   REQUIRE_FALSE(line_refine(px.data(), 1920, 1080, 1920 * 4, truth, p, refined, st));
+}
+
+TEST_CASE("config profile round-trips byte for byte") {
+  Config c{};
+  c.version = 77;
+  c.conf_player = 0.4123f;
+  c.h_smooth = 0.123456789f;
+  c.line_min_support = 0.5f;
+  c.h_holdover = 123;
+  c.green_margin = 11;
+  c.layers = 0xdeadbeefu;
+  c.attack_dir = 0;
+  c.minimap_dead_mode = 1;
+  Config back{};
+  REQUIRE(config_from_json(config_to_json(c), back));
+  REQUIRE(std::memcmp(&c, &back, sizeof(Config)) == 0);
+
+  // Out-of-range values clamp; unknown keys and bad JSON do not break a load.
+  REQUIRE(config_from_json(R"({"conf_player": 9, "nope": 1})", back));
+  REQUIRE(back.conf_player == 0.95f);
+  REQUIRE(back.h_smooth == Config{}.h_smooth);
+  REQUIRE_FALSE(config_from_json("{not json", back));
+
+  Config r = c;
+  cfg_reset_group(r, CfgGroup::Pitch);
+  REQUIRE(r.h_smooth == Config{}.h_smooth);
+  REQUIRE(r.conf_player == c.conf_player);
+
+  // Every visible field's default sits inside its slider range.
+  const Config d{};
+  for (const CfgField& f : kConfigFields) {
+    if (f.group == CfgGroup::Hidden) continue;
+    const double v = cfg_get(d, f);
+    INFO(f.key);
+    REQUIRE(v >= f.lo);
+    REQUIRE(v <= f.hi);
+  }
+}
+
+TEST_CASE("play gate: short pan ignored, close-up enters, return needs all-clear") {
+  constexpr std::int64_t ms = 1000000;
+  const std::uint8_t all = kSigAngle | kSigSize | kSigScene;
+  PlayGate g;
+  std::int64_t t = 0;
+  auto run = [&](int dur_ms, std::uint8_t dead) {
+    for (int k = 0; k < dur_ms; k += 40) {
+      g.update(t, all, dead, 400, 700);
+      t += 40 * ms;
+    }
+  };
+  run(1000, 0);
+  REQUIRE(g.state() == PlayState::InPlay);
+  run(240, kSigAngle);  // a quick pan tilts the view for a moment
+  run(400, 0);
+  REQUIRE(g.state() == PlayState::InPlay);
+  run(480, kSigSize);  // a close-up
+  REQUIRE(g.state() == PlayState::Dead);
+  REQUIRE(g.reasons() == kSigSize);
+  run(400, 0);
+  run(120, kSigScene);  // one signal back before 700 ms of all-clear
+  run(400, 0);
+  REQUIRE(g.state() == PlayState::Dead);
+  run(400, 0);
+  REQUIRE(g.state() == PlayState::InPlay);
+  // A signal that is not available cannot hold the ball dead.
+  for (int k = 0; k < 30; ++k, t += 40 * ms) g.update(t, kSigScene, kSigBallOff, 400, 700);
+  REQUIRE(g.state() == PlayState::InPlay);
+}
+
+TEST_CASE("view angle: side-on is small, end-on is large, reverse is over 90") {
+  float sx[32], sy[32], dx[32], dy[32];
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    pitch_landmark_m(i, dx[i], dy[i]);
+    project(kP, dx[i], dy[i], sx[i], sy[i]);
+  }
+  Homography side;
+  REQUIRE(fit_homography(sx, sy, dx, dy, kPitchLandmarks, side));
+  float deg = 0;
+  REQUIRE(view_angle_deg(side, 1920, 1080, deg));
+  REQUIRE(deg < 15.f);
+  // Behind the goal: pitch x runs up the image.
+  const float E[9] = {0.f, 12.f, 960.f, -12.f, 0.f, 540.f, 0.004f, 0.f, 1.f};
+  for (int i = 0; i < kPitchLandmarks; ++i) project(E, dx[i], dy[i], sx[i], sy[i]);
+  Homography end;
+  REQUIRE(fit_homography(sx, sy, dx, dy, kPitchLandmarks, end));
+  REQUIRE(view_angle_deg(end, 1920, 1080, deg));
+  REQUIRE(deg > 60.f);
+  // Reverse angle: pitch x runs right to left.
+  const float R[9] = {-12.f, 0.f, 960.f, 0.f, 12.f, 540.f, -0.0005f, -0.004f, 1.f};
+  for (int i = 0; i < kPitchLandmarks; ++i) project(R, dx[i], dy[i], sx[i], sy[i]);
+  Homography rev;
+  REQUIRE(fit_homography(sx, sy, dx, dy, kPitchLandmarks, rev));
+  REQUIRE(view_angle_deg(rev, 1920, 1080, deg));
+  REQUIRE(deg > 90.f);
+}
+
+TEST_CASE("dead-ball records export as type 22") {
+  Event e{};
+  e.type = EventType::DeadBall;
+  e.match_ms_end = 5000;
+  char row[256];
+  format_spadl_row(row, 256, e, 1);
+  REQUIRE(std::strstr(row, ",22,1,0") != nullptr);
 }

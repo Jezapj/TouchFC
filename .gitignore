@@ -16,3 +16,4 @@ test_clips/
 # phase 2 runtime output
 cache/
 spadl.csv
+profiles/

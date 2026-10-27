@@ -63,3 +63,13 @@ One 1920x1080 BGRA frame reduced to a 160x90 grass-and-line image, then the coar
 
 Under 5% of the 20 ms budget at 50 fps. If T3 p99 needs it, the reduce (strided reads from the 8 MiB frame) and the float bilinear zoom are the parts to look at first.
 
+
+## Line refit (M9)
+
+`BM_LineRefine`: three search-and-refit passes plus a scoring pass on a 1920x1080 frame showing a third of the pitch around one penalty area, starting 9 px off. About 300 marking samples, each a +-12 px ridge search along its image normal.
+
+| Benchmark | Time per call |
+|---|---|
+| `BM_LineRefine` | 0.10 ms (0.15 ms wall while a replay shared the CPU) |
+
+It runs on T3 every `line_interval` wide frames (default 2), and once per keypoint run to snap and score the keypoint fit.
