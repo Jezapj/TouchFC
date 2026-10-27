@@ -31,6 +31,14 @@ struct FrameSlot {
   std::array<float, 32> kp_x{};
   std::array<float, 32> kp_y{};
   float reproj_m = 0.f;
+  std::array<float, 9> pitch_h{};  // image -> pitch, valid when pitch_valid
+  std::uint16_t pitch_age = 0;     // frames since the last accepted fit
+  std::uint8_t pitch_reject = 0;   // FitReject of the last keypoint fit
+  std::uint8_t pitch_manual = 0;
+  float gmc_cost = 0.f;
+  float line_support = 0.f;  // share of in-view markings on painted lines
+  std::uint8_t gmc_ok = 0;
+  std::array<std::uint8_t, kMaxDetections> pitch_ok{};  // on the pitch within 3 m
   std::array<float, kMaxDetections> pitch_x{};
   std::array<float, kMaxDetections> pitch_y{};
   std::array<std::uint8_t, kMaxDetections> det_team{};

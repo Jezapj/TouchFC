@@ -6,6 +6,9 @@
 #include "threads_win.hpp"
 #include "win_time.hpp"
 
+#include "touchfc/homography.hpp"
+#include "touchfc/pitch_calib.hpp"
+#include "touchfc/pitch_landmarks.hpp"
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
 #include <imgui_impl_win32.h>
@@ -18,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -29,6 +33,52 @@ namespace touchfc {
 namespace {
 
 class App;
+
+// Pitch markings as polylines in metres, for the minimap and the reprojection view.
+constexpr float kLineX[] = {-52.5f, 52.5f, 52.5f, -52.5f, -52.5f};
+constexpr float kLineY[] = {34.f, 34.f, -34.f, -34.f, 34.f};
+constexpr float kHalfX[] = {0.f, 0.f};
+constexpr float kHalfY[] = {34.f, -34.f};
+constexpr float kBoxX[] = {-52.5f, -36.f, -36.f, -52.5f};
+constexpr float kBoxY[] = {20.16f, 20.16f, -20.16f, -20.16f};
+constexpr float kSixX[] = {-52.5f, -47.f, -47.f, -52.5f};
+constexpr float kSixY[] = {9.16f, 9.16f, -9.16f, -9.16f};
+
+// to_screen(X, Y, out) is false for a point that cannot be drawn (above the horizon).
+template <class F>
+void draw_pitch_lines(ImDrawList* dl, F&& to_screen, ImU32 col, float thick) {
+  auto poly = [&](const float* xs, const float* ys, int n, float mirror) {
+    ImVec2 prev;
+    bool have = false;
+    for (int k = 0; k + 1 < n; ++k) {
+      for (int t = 0; t <= 8; ++t) {
+        if (t == 0 && k > 0) continue;
+        const float a = t / 8.f;
+        ImVec2 p;
+        const bool ok = to_screen(mirror * (xs[k] + a * (xs[k + 1] - xs[k])), ys[k] + a * (ys[k + 1] - ys[k]), p);
+        if (ok && have) dl->AddLine(prev, p, col, thick);
+        prev = p;
+        have = ok;
+      }
+    }
+  };
+  poly(kLineX, kLineY, 5, 1.f);
+  poly(kHalfX, kHalfY, 2, 1.f);
+  for (const float m : {1.f, -1.f}) {
+    poly(kBoxX, kBoxY, 4, m);
+    poly(kSixX, kSixY, 4, m);
+  }
+  ImVec2 prev;
+  bool have = false;
+  for (int i = 0; i <= 48; ++i) {
+    const float a = i * 6.2831853f / 48.f;
+    ImVec2 p;
+    const bool ok = to_screen(9.15f * std::cos(a), 9.15f * std::sin(a), p);
+    if (ok && have) dl->AddLine(prev, p, col, thick);
+    prev = p;
+    have = ok;
+  }
+}
 
 struct Binding {
   ImGuiContext* imgui = nullptr;
@@ -108,6 +158,24 @@ class App {
   std::uint8_t last_scene_ = 0;
   std::uint8_t last_pitch_valid_ = 0;
   float last_reproj_m_ = 0.f;
+  std::array<float, 9> last_pitch_h_{};
+  std::array<std::uint8_t, kMaxDetections> last_pitch_ok_{};
+  std::uint16_t last_pitch_age_ = 0;
+  std::uint8_t last_pitch_reject_ = 0;
+  std::uint8_t last_pitch_manual_ = 0;
+  float last_gmc_cost_ = 0.f;
+  float last_line_support_ = 0.f;
+  std::uint8_t last_gmc_ok_ = 0;
+  std::uint8_t last_kp_n_ = 0;
+  std::array<std::uint8_t, 32> last_kp_id_{};
+  std::array<float, 32> last_kp_x_{};
+  std::array<float, 32> last_kp_y_{};
+  bool debug_reproj_ = false;
+  std::FILE* pitch_dump_ = nullptr;
+  int calib_pick_ = 0;
+  bool sent_anchor_[32]{};
+  float sent_ax_[32]{};
+  float sent_ay_[32]{};
   std::array<float, kMaxDetections> last_pitch_x_{};
   std::array<float, kMaxDetections> last_pitch_y_{};
   std::array<std::uint8_t, kMaxDetections> last_team_{};
@@ -280,10 +348,35 @@ void App::remember(const FrameSlot& slot) {
   last_scene_ = slot.scene;
   last_pitch_valid_ = slot.pitch_valid;
   last_reproj_m_ = slot.reproj_m;
+  last_pitch_h_ = slot.pitch_h;
+  last_pitch_age_ = slot.pitch_age;
+  last_pitch_reject_ = slot.pitch_reject;
+  last_pitch_manual_ = slot.pitch_manual;
+  last_gmc_cost_ = slot.gmc_cost;
+  last_line_support_ = slot.line_support;
+  last_gmc_ok_ = slot.gmc_ok;
+  if (pitch_dump_) {
+    // Present thread, not the hot path. One row per frame.
+    std::fprintf(pitch_dump_, "%llu,%lld,%u,%u,%u,%u,%u,%.2f,%u", static_cast<unsigned long long>(slot.meta.id),
+                 static_cast<long long>(slot.meta.pts_ns), slot.pitch_valid, slot.pitch_manual, slot.pitch_age,
+                 slot.pitch_reject, slot.gmc_ok, slot.gmc_cost, slot.scene);
+    for (const float v : slot.pitch_h) std::fprintf(pitch_dump_, ",%.9g", v);
+    std::fprintf(pitch_dump_, ",");
+    for (std::uint32_t k = 0; slot.kp_fresh && k < slot.kp_n; ++k)
+      std::fprintf(pitch_dump_, "%u:%.1f:%.1f;", slot.kp_id[k], slot.kp_x[k], slot.kp_y[k]);
+    std::fprintf(pitch_dump_, ",%.3f\n", slot.line_support);
+  }
+  if (slot.kp_fresh) {
+    last_kp_n_ = slot.kp_n;
+    last_kp_id_ = slot.kp_id;
+    last_kp_x_ = slot.kp_x;
+    last_kp_y_ = slot.kp_y;
+  }
   for (std::uint32_t i = 0; i < slot.det_count && i < last_pitch_x_.size(); ++i) {
     last_pitch_x_[i] = slot.pitch_x[i];
     last_pitch_y_[i] = slot.pitch_y[i];
     last_team_[i] = slot.det_team[i];
+    last_pitch_ok_[i] = slot.pitch_ok[i];
   }
   last_pc_valid_ = slot.pc_valid;
   last_territory_ = slot.territory;
@@ -442,35 +535,81 @@ void App::draw_view() {
         dl->AddText(ImVec2(a.x + 2.f, a.y + 2.f), col, label);
       }
     }
-    if (last_pitch_valid_) {
-      const float mx = 16.f, my = ch - 128.f, mw = 150.f, mh = 100.f;
+    if (debug_reproj_ && last_pitch_valid_) {
+      // Pitch lines and landmarks warped by H^-1 onto the video.
+      Homography inv;
+      if (invert3(last_pitch_h_.data(), inv.h)) {
+        auto to_img = [&](float X, float Y, ImVec2& out) {
+          float x, y;
+          if (!apply_homography(inv, X, Y, x, y)) return false;
+          if (std::fabs(x) > 4.f * last_w_ || std::fabs(y) > 4.f * last_h_) return false;
+          out = ImVec2(ox + x * scale, oy + y * scale);
+          return true;
+        };
+        draw_pitch_lines(dl, to_img, IM_COL32(255, 0, 255, 220), 2.f);
+        for (int k = 0; k < kPitchLandmarks; ++k) {
+          ImVec2 p;
+          if (!to_img(kPitchLandmarkM[k].x, kPitchLandmarkM[k].y, p)) continue;
+          char id[4];
+          std::snprintf(id, sizeof(id), "%d", k);
+          dl->AddLine(ImVec2(p.x - 4, p.y), ImVec2(p.x + 4, p.y), IM_COL32(255, 0, 255, 255));
+          dl->AddLine(ImVec2(p.x, p.y - 4), ImVec2(p.x, p.y + 4), IM_COL32(255, 0, 255, 255));
+          dl->AddText(ImVec2(p.x + 4, p.y - 16), IM_COL32(255, 0, 255, 255), id);
+        }
+      }
+    }
+    if (debug_reproj_) {
+      // Raw keypoints with the model's ids. Each should sit on its magenta cross.
+      for (int k = 0; k < last_kp_n_; ++k) {
+        const ImVec2 p(ox + last_kp_x_[static_cast<std::uint32_t>(k)] * scale,
+                       oy + last_kp_y_[static_cast<std::uint32_t>(k)] * scale);
+        char id[4];
+        std::snprintf(id, sizeof(id), "%d", last_kp_id_[static_cast<std::uint32_t>(k)]);
+        dl->AddCircle(p, 5.f, IM_COL32(255, 230, 0, 255), 0, 2.f);
+        dl->AddText(ImVec2(p.x + 6, p.y + 2), IM_COL32(255, 230, 0, 255), id);
+      }
+    }
+    {
+      // 105:68, scales with the window, clipped so nothing lands outside it.
+      const float pad = 8.f;
+      const float mw = std::clamp(cw * 0.22f, 160.f, 420.f);
+      const float iw = mw - 2.f * pad;
+      const float ih = iw * 68.f / 105.f;
+      const float mh = ih + 2.f * pad;
+      const float mx = 16.f, my = ch - mh - 16.f;
+      const float ix = mx + pad, iy = my + pad;
+      dl->PushClipRect(ImVec2(mx, my), ImVec2(mx + mw, my + mh), true);
       dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
-      dl->AddRect(ImVec2(mx + 8, my + 8), ImVec2(mx + mw - 8, my + mh - 8), IM_COL32(220, 220, 220, 180));
-      if (last_pc_valid_) {
-        const float iw = mw - 16.f;
-        const float ih = mh - 16.f;
+      if (last_pitch_valid_ && last_pc_valid_) {
         for (int j = 0; j < 10; ++j) {
           for (int i = 0; i < 16; ++i) {
             const int p = last_pc_ds_[static_cast<std::uint32_t>((9 - j) * 16 + i)];
             const ImU32 col = IM_COL32(200 - p * 160 / 255, 40, 40 + p * 180 / 255, 110);
-            dl->AddRectFilled(ImVec2(mx + 8.f + i * iw / 16.f, my + 8.f + j * ih / 10.f),
-                              ImVec2(mx + 8.f + (i + 1) * iw / 16.f, my + 8.f + (j + 1) * ih / 10.f), col);
+            dl->AddRectFilled(ImVec2(ix + i * iw / 16.f, iy + j * ih / 10.f),
+                              ImVec2(ix + (i + 1) * iw / 16.f, iy + (j + 1) * ih / 10.f), col);
           }
         }
       }
       auto map = [&](float px, float py) {
-        const float u = (px + 52.5f) / 105.f;
-        const float v = (34.f - py) / 68.f;
-        return ImVec2(mx + 8.f + u * (mw - 16.f), my + 8.f + v * (mh - 16.f));
+        return ImVec2(ix + (px + 52.5f) / 105.f * iw, iy + (34.f - py) / 68.f * ih);
       };
-      for (std::uint32_t i = 0; i < last_det_count_; ++i) {
-        if (last_dets_[i].class_id > 1) continue;
-        const ImU32 col = (last_team_[i] == 1) ? IM_COL32(40, 140, 255, 255)
-                          : (last_team_[i] == 2) ? IM_COL32(255, 70, 70, 255)
-                                                 : kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
-        dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
+      draw_pitch_lines(dl, [&](float X, float Y, ImVec2& out) { out = map(X, Y); return true; },
+                       IM_COL32(220, 220, 220, 150), 1.f);
+      if (!last_pitch_valid_) {
+        const char* msg = "not calibrated";
+        const ImVec2 sz = ImGui::CalcTextSize(msg);
+        dl->AddText(ImVec2(mx + 0.5f * (mw - sz.x), my + 0.5f * (mh - sz.y)), IM_COL32(255, 255, 255, 230), msg);
+      } else {
+        for (std::uint32_t i = 0; i < last_det_count_; ++i) {
+          if (last_dets_[i].class_id > 1 || !last_pitch_ok_[i]) continue;
+          const ImU32 col = (last_team_[i] == 1) ? IM_COL32(40, 140, 255, 255)
+                            : (last_team_[i] == 2) ? IM_COL32(255, 70, 70, 255)
+                                                   : kClassColor[last_dets_[i].class_id < 4 ? last_dets_[i].class_id : 4];
+          dl->AddCircleFilled(map(last_pitch_x_[i], last_pitch_y_[i]), 3.f, col);
+        }
+        if (last_ball_ok_) dl->AddCircleFilled(map(last_ball_x_, last_ball_y_), 4.f, IM_COL32(255, 255, 255, 255));
       }
-      if (last_ball_ok_) dl->AddCircleFilled(map(last_ball_x_, last_ball_y_), 4.f, IM_COL32(255, 255, 255, 255));
+      dl->PopClipRect();
     }
   }
   ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
@@ -480,9 +619,15 @@ void App::draw_view() {
   const double p99 = pipe_ ? static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6 : 0;
   ImGui::Text("capture-to-present-call  p50 %.2f ms   p99 %.2f ms", p50, p99);
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
-  if (last_pitch_valid_) {
+  {
     const char* scene = last_scene_ == 1 ? "wide" : last_scene_ == 2 ? "close" : "other";
-    ImGui::Text("pitch %s   fit error %.2f m", scene, last_reproj_m_);
+    if (last_pitch_valid_)
+      ImGui::Text("pitch %s   %s fit error %.2f m   age %u", scene, last_pitch_manual_ ? "manual" : "kp",
+                  last_reproj_m_, static_cast<unsigned>(last_pitch_age_));
+    else
+      ImGui::Text("pitch %s   not calibrated", scene);
+  }
+  if (last_pitch_valid_) {
     if (last_pc_valid_) ImGui::Text("territory A %.0f%%", last_territory_ * 100.f);
     if (last_poss_team_ != 0) ImGui::Text("possession %s #%u", last_poss_team_ == 1 ? "A" : "B", last_poss_track_);
     else if (last_ball_ok_) ImGui::TextUnformatted("ball seen, no holder");
@@ -663,6 +808,99 @@ void App::draw_control() {
       if (ImGui::SmallButton("B")) send(2);
       ImGui::PopID();
     }
+    if (ImGui::CollapsingHeader("Pitch calibration", ImGuiTreeNodeFlags_DefaultOpen)) {
+      auto push = [&](const UiCommand& cmd) {
+        if (!pipe_->commands().try_push(cmd)) {
+          pending_ = cmd;
+          pending_cmd_ = true;
+          pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
+        }
+      };
+      auto store = [&] {
+        ++cfg.version;
+        pipe_->config().store(cfg);
+      };
+      ImGui::Checkbox("reprojection view", &debug_reproj_);
+      ImGui::SameLine();
+      ImGui::TextDisabled("magenta = H^-1 lines, yellow = raw keypoints");
+      ImGui::Text("%s   last fit: %s",
+                  last_pitch_valid_ ? (last_pitch_manual_ ? "manual" : "keypoints") : "not calibrated",
+                  fit_reject_name(static_cast<FitReject>(last_pitch_reject_ < kFitRejectCount ? last_pitch_reject_ : 0)));
+      int kp = cfg.kp_interval;
+      if (ImGui::SliderInt("keypoint interval", &kp, 1, 16)) {
+        cfg.kp_interval = static_cast<std::uint8_t>(kp);
+        store();
+      }
+      if (ImGui::SliderFloat("fit max error m", &cfg.h_max_rms_m, 0.3f, 4.f)) store();
+      ImGui::SameLine();
+      ImGui::Text("now %.2f", last_reproj_m_);
+      if (ImGui::SliderFloat("fit jump m", &cfg.h_jump_m, 0.5f, 10.f)) store();
+      if (ImGui::SliderFloat("fit smoothing", &cfg.h_smooth, 0.05f, 1.f)) store();
+      int hold = cfg.h_holdover;
+      if (ImGui::SliderInt("holdover frames", &hold, 5, 250)) {
+        cfg.h_holdover = static_cast<std::uint16_t>(hold);
+        store();
+      }
+      ImGui::SameLine();
+      ImGui::Text("age %u", static_cast<unsigned>(last_pitch_age_));
+      if (ImGui::SliderFloat("motion max cost", &cfg.gmc_max_cost, 4.f, 40.f)) store();
+      ImGui::SameLine();
+      ImGui::Text("now %.1f%s", last_gmc_cost_, last_gmc_ok_ ? "" : " (lost)");
+      int gm = cfg.green_margin;
+      if (ImGui::SliderInt("green margin", &gm, 2, 30)) {
+        cfg.green_margin = static_cast<std::uint8_t>(gm);
+        store();
+      }
+      int li = cfg.line_interval;
+      if (ImGui::SliderInt("line refit interval", &li, 1, 8)) {
+        cfg.line_interval = static_cast<std::uint8_t>(li);
+        store();
+      }
+      if (ImGui::SliderFloat("line search px", &cfg.line_search_px, 4.f, 40.f)) store();
+      if (ImGui::SliderFloat("line contrast", &cfg.line_contrast, 5.f, 60.f)) store();
+      if (ImGui::SliderFloat("line min support", &cfg.line_min_support, 0.05f, 0.9f)) store();
+      ImGui::SameLine();
+      ImGui::Text("now %.2f", last_line_support_);
+
+      ImGui::Separator();
+      ImGui::TextWrapped("Manual: pick a landmark, click it on the frame. 4 or more fit. Pause first.");
+      ImGui::Combo("landmark", &calib_pick_, kPitchLandmarkName, kPitchLandmarks);
+      if (ImGui::Button("clear calibration")) {
+        UiCommand cmd;
+        cmd.type = CmdType::ResetHomography;
+        push(cmd);
+        for (bool& a : sent_anchor_) a = false;
+      }
+      if (have_frame_ && video_srv_ && last_w_ > 0) {
+        const float tw = ImGui::GetContentRegionAvail().x;
+        const float th = tw * static_cast<float>(last_h_) / static_cast<float>(last_w_);
+        const ImVec2 o = ImGui::GetCursorScreenPos();
+        ImGui::Image(reinterpret_cast<ImTextureID>(video_srv_.Get()), ImVec2(tw, th));
+        const float k = static_cast<float>(last_w_) / tw;
+        if (ImGui::IsItemClicked()) {
+          const ImVec2 m = ImGui::GetMousePos();
+          UiCommand cmd;
+          cmd.type = CmdType::SetAnchor;
+          cmd.u8a = static_cast<std::uint8_t>(calib_pick_);
+          cmd.f[0] = (m.x - o.x) * k;
+          cmd.f[1] = (m.y - o.y) * k;
+          push(cmd);
+          sent_anchor_[calib_pick_] = true;
+          sent_ax_[calib_pick_] = cmd.f[0];
+          sent_ay_[calib_pick_] = cmd.f[1];
+          calib_pick_ = (calib_pick_ + 1) % kPitchLandmarks;
+        }
+        auto* wdl = ImGui::GetWindowDrawList();
+        for (int i = 0; i < kPitchLandmarks; ++i) {
+          if (!sent_anchor_[i]) continue;
+          const ImVec2 p(o.x + sent_ax_[i] / k, o.y + sent_ay_[i] / k);
+          char id[4];
+          std::snprintf(id, sizeof(id), "%d", i);
+          wdl->AddCircle(p, 4.f, IM_COL32(0, 255, 255, 255), 0, 2.f);
+          wdl->AddText(ImVec2(p.x + 5, p.y - 14), IM_COL32(0, 255, 255, 255), id);
+        }
+      }
+    }
     ImGui::Text("dir %d   command warns %llu", pipe_->attack_dir.load(),
                 static_cast<unsigned long long>(pipe_->command_warns.load()));
     if (pending_cmd_) ImGui::TextUnformatted("command queue full; will retry");
@@ -697,6 +935,7 @@ int App::run() {
   opt_out_power_throttling();
   begin_present_mmcss();
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
+  if (!args_.pitch_dump_path.empty()) pitch_dump_ = std::fopen(args_.pitch_dump_path.c_str(), "w");
   if (!create_gpu(gpu_)) return 1;
   if (!compile_pass(gpu_.device.Get(), false, copy_pass_)) return 1;
   if (!compile_pass(gpu_.device.Get(), true, premul_pass_)) return 1;
@@ -805,6 +1044,7 @@ int App::run() {
     }
     if (pipe_) pipe_->join();
   if (sink_) sink_->write_csv(args_.telemetry_path);
+  if (pitch_dump_) std::fclose(pitch_dump_);
   if (pipe_) pipe_->write_spadl("spadl.csv");
   if (source_) source_->close();
   pipe_.reset();

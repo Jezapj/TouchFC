@@ -6,7 +6,10 @@
 #include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
 #include "touchfc/homography.hpp"
+#include "touchfc/image_gmc.hpp"
+#include "touchfc/pitch_calib.hpp"
 #include "touchfc/kalman.hpp"
+#include "touchfc/line_fit.hpp"
 #include "touchfc/mailbox.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
@@ -766,4 +769,307 @@ TEST_CASE("possession closes a spell and spadl uses the spec columns") {
   REQUIRE(std::strstr(kSpadlHeader, "type_id") != nullptr);
   REQUIRE(std::strstr(row, ",21,1,0") != nullptr);
   REQUIRE(std::strstr(row, "52.50,34.00") != nullptr);
+}
+
+namespace {
+
+// Pitch metres -> 1920x1080 image, a broadcast-like perspective.
+constexpr float kP[9] = {12.f, 0.f, 960.f, 0.f, -12.f, 540.f, 0.0005f, 0.004f, 1.f};
+
+void project(const float* P, float X, float Y, float& x, float& y) {
+  const float w = P[6] * X + P[7] * Y + P[8];
+  x = (P[0] * X + P[1] * Y + P[2]) / w;
+  y = (P[3] * X + P[4] * Y + P[5]) / w;
+}
+
+// Landmarks visible under P, as keypoint pairs.
+int visible_landmarks(const float* P, float* sx, float* sy, float* dx, float* dy) {
+  int n = 0;
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    float X, Y, x, y;
+    pitch_landmark_m(i, X, Y);
+    project(P, X, Y, x, y);
+    if (x < 0 || y < 0 || x >= 1920 || y >= 1080) continue;
+    sx[n] = x;
+    sy[n] = y;
+    dx[n] = X;
+    dy[n] = Y;
+    ++n;
+  }
+  return n;
+}
+
+}  // namespace
+
+TEST_CASE("synthetic homography round-trips all 32 landmarks within 1 cm") {
+  float sx[32], sy[32], dx[32], dy[32];
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    pitch_landmark_m(i, dx[i], dy[i]);
+    project(kP, dx[i], dy[i], sx[i], sy[i]);
+  }
+  Homography H;
+  REQUIRE(fit_homography(sx, sy, dx, dy, kPitchLandmarks, H));
+  Homography inv;
+  REQUIRE(invert3(H.h, inv.h));
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    float X, Y, x, y;
+    REQUIRE(apply_homography(H, sx[i], sy[i], X, Y));
+    REQUIRE(std::hypot(X - dx[i], Y - dy[i]) < 0.01f);
+    REQUIRE(apply_homography(inv, dx[i], dy[i], x, y));
+    REQUIRE(std::hypot(x - sx[i], y - sy[i]) < 0.1f);
+  }
+}
+
+TEST_CASE("landmarks are real pitch markings") {
+  float x, y;
+  pitch_landmark_m(9, x, y);  // left penalty-area corner, top
+  REQUIRE(std::abs(x - -36.f) < 1e-4f);
+  REQUIRE(std::abs(y - 20.16f) < 1e-4f);
+  pitch_landmark_m(21, x, y);  // right penalty spot
+  REQUIRE(std::abs(x - 41.5f) < 1e-4f);
+  pitch_landmark_m(31, x, y);
+  REQUIRE(std::abs(x - 9.15f) < 1e-4f);
+}
+
+TEST_CASE("projection guard rejects points above the horizon") {
+  Homography H;
+  const float h[9] = {1, 0, 0, 0, 1, 0, 0, -0.01f, 1};
+  for (int i = 0; i < 9; ++i) H.h[i] = h[i];
+  float X, Y;
+  REQUIRE(apply_homography(H, 10.f, 50.f, X, Y));
+  REQUIRE_FALSE(apply_homography(H, 10.f, 100.f, X, Y));
+  REQUIRE_FALSE(apply_homography(H, 10.f, 200.f, X, Y));
+  REQUIRE(on_pitch(55.f, 0.f, 3.f));
+  REQUIRE_FALSE(on_pitch(56.f, 0.f, 3.f));
+}
+
+TEST_CASE("pitch calib validates, holds jumps and smooths fits") {
+  float sx[32], sy[32], dx[32], dy[32];
+  const int n = visible_landmarks(kP, sx, sy, dx, dy);
+  REQUIRE(n >= 8);
+  Homography fit;
+  REQUIRE(fit_homography_ransac(sx, sy, dx, dy, n, 2.f, fit));
+  PitchCalibParams p;
+  PitchCalib c;
+  const float head = 200.f;
+
+  Homography bad = fit;
+  bad.rms_m = 2.f;
+  REQUIRE(c.offer(bad, sx, sy, dx, dy, n, 1920, 1080, head, p) == FitReject::Rms);
+  REQUIRE_FALSE(c.valid());
+  REQUIRE(c.offer(fit, sx, sy, dx, dy, n, 1920, 1080, head, p) == FitReject::None);
+  REQUIRE(c.valid());
+
+  // Mirrored ids flip the determinant.
+  float mx[32];
+  for (int i = 0; i < n; ++i) mx[i] = -dx[i];
+  Homography mirror;
+  REQUIRE(fit_homography(sx, sy, mx, dy, n, mirror));
+  REQUIRE(c.offer(mirror, sx, sy, mx, dy, n, 1920, 1080, head, p) == FitReject::Orient);
+
+  // All inliers in one quadrant.
+  float qx[6], qy[6], qX[6], qY[6];
+  for (int i = 0; i < 6; ++i) {
+    qx[i] = 100.f + 120.f * i;
+    qy[i] = 300.f + 30.f * (i % 3);
+    apply_homography(fit, qx[i], qy[i], qX[i], qY[i]);
+  }
+  REQUIRE(c.offer(fit, qx, qy, qX, qY, 6, 1920, 1080, head, p) == FitReject::Spread);
+
+  // A 1 m shift is blended by `smooth`.
+  float X0, Y0, X1, Y1;
+  apply_homography(c.current(), 960.f, 800.f, X0, Y0);
+  float sdx[32];
+  for (int i = 0; i < n; ++i) sdx[i] = dx[i] + 1.f;
+  Homography near_fit;
+  REQUIRE(fit_homography(sx, sy, sdx, dy, n, near_fit));
+  REQUIRE(c.offer(near_fit, sx, sy, sdx, dy, n, 1920, 1080, head, p) == FitReject::None);
+  apply_homography(c.current(), 960.f, 800.f, X1, Y1);
+  REQUIRE(std::abs(X1 - X0 - p.smooth) < 0.02f);
+  REQUIRE(std::abs(Y1 - Y0) < 0.02f);
+
+  // A 6 m jump waits for a second fit that agrees.
+  apply_homography(c.current(), 960.f, 800.f, X0, Y0);
+  for (int i = 0; i < n; ++i) sdx[i] = dx[i] + 6.f;
+  Homography far_fit;
+  REQUIRE(fit_homography(sx, sy, sdx, dy, n, far_fit));
+  float Xf, Yf;
+  apply_homography(far_fit, 960.f, 800.f, Xf, Yf);
+  REQUIRE(c.offer(far_fit, sx, sy, sdx, dy, n, 1920, 1080, head, p) == FitReject::Jump);
+  apply_homography(c.current(), 960.f, 800.f, X1, Y1);
+  REQUIRE(std::abs(X1 - X0) < 0.01f);
+  REQUIRE(c.offer(far_fit, sx, sy, sdx, dy, n, 1920, 1080, head, p) == FitReject::None);
+  apply_homography(c.current(), 960.f, 800.f, X1, Y1);
+  REQUIRE(std::abs(X1 - Xf) < 0.01f);
+
+  // Camera pans 10 px right: the same pitch point is 10 px further right.
+  const float G[9] = {1, 0, 10, 0, 1, 0, 0, 0, 1};
+  apply_homography(c.current(), 960.f, 800.f, X0, Y0);
+  c.predict(G, true, p);
+  apply_homography(c.current(), 970.f, 800.f, X1, Y1);
+  REQUIRE(std::abs(X1 - X0) < 0.01f);
+  REQUIRE(std::abs(Y1 - Y0) < 0.01f);
+
+  // Holdover cap, manual has none, a cut ends both.
+  const float I[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  for (int i = 1; i < p.holdover; ++i) c.predict(I, true, p);
+  REQUIRE(c.valid());
+  c.predict(I, true, p);
+  REQUIRE_FALSE(c.valid());
+  c.set_manual(fit);
+  for (int i = 0; i < 2 * p.holdover; ++i) c.predict(I, true, p);
+  REQUIRE(c.valid());
+  c.predict(I, false, p);
+  REQUIRE_FALSE(c.valid());
+}
+
+namespace {
+
+std::uint8_t grass_g(float x, float y) {
+  const float v = 110.f + 25.f * std::sin(x / 53.f) + 20.f * std::sin(y / 41.f + x / 97.f) +
+                  15.f * std::sin((x - y) / 131.f);
+  return static_cast<std::uint8_t>(v);
+}
+
+// grass_g moved so a point p lands at s * (p - c) + c + d.
+void grass_frame(std::vector<std::uint8_t>& px, float s, float dx, float dy) {
+  const float cx = 960.f, cy = 540.f;
+  for (int y = 0; y < 1080; ++y) {
+    for (int x = 0; x < 1920; ++x) {
+      const std::uint8_t g = grass_g(cx + (x - cx - dx) / s, cy + (y - cy - dy) / s);
+      std::uint8_t* p = px.data() + (static_cast<std::size_t>(y) * 1920 + x) * 4;
+      p[0] = static_cast<std::uint8_t>(g * 0.35f);
+      p[1] = g;
+      p[2] = static_cast<std::uint8_t>(g * 0.45f);
+      p[3] = 255;
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("image gmc recovers pan and zoom") {
+  std::vector<std::uint8_t> a(1920u * 1080u * 4u), b(a.size());
+  grass_frame(a, 1.f, 0.f, 0.f);
+  grass_frame(b, 1.01f, 37.f, -18.f);
+  static GmcImage ga, gb;
+  gmc_reduce_bgra(a.data(), 1920, 1080, 1920 * 4, ga);
+  gmc_reduce_bgra(b.data(), 1920, 1080, 1920 * 4, gb);
+  const GmcMotion m = estimate_gmc(ga, gb);
+  REQUIRE(m.ok);
+  REQUIRE(std::abs(m.tx - 37.f) < 4.f);
+  REQUIRE(std::abs(m.ty - -18.f) < 4.f);
+  REQUIRE(std::abs(m.s - 1.01f) < 0.004f);
+
+  const GmcMotion still = estimate_gmc(ga, ga);
+  REQUIRE(still.ok);
+  REQUIRE(std::abs(still.tx) < 1.f);
+  REQUIRE(std::abs(still.ty) < 1.f);
+
+  std::fill(b.begin(), b.end(), std::uint8_t{90});  // grey: no grass, a cut to the crowd
+  gmc_reduce_bgra(b.data(), 1920, 1080, 1920 * 4, gb);
+  REQUIRE_FALSE(estimate_gmc(ga, gb).ok);
+}
+
+namespace {
+
+// Distance in metres from a pitch point to the nearest marking line_fit models.
+float mark_distance(float X, float Y) {
+  float best = 1e9f;
+  for (const auto& s : detail::kMarkSegs) {
+    const float dx = s.x1 - s.x0, dy = s.y1 - s.y0;
+    float t = ((X - s.x0) * dx + (Y - s.y0) * dy) / (dx * dx + dy * dy);
+    t = t < 0.f ? 0.f : t > 1.f ? 1.f : t;
+    best = std::fmin(best, std::hypot(X - s.x0 - t * dx, Y - s.y0 - t * dy));
+  }
+  best = std::fmin(best, std::fabs(std::hypot(X, Y) - 9.15f));
+  for (const float cx : {-41.5f, 41.5f}) {
+    if (std::fabs(X) < 36.f) best = std::fmin(best, std::fabs(std::hypot(X - cx, Y) - 9.15f));
+  }
+  return best;
+}
+
+// Broadcast-like frame: grass with mowing stripes, 12 cm white lines through H.
+void painted_frame(std::vector<std::uint8_t>& px, const Homography& H) {
+  for (int y = 0; y < 1080; ++y) {
+    for (int x = 0; x < 1920; ++x) {
+      float X, Y;
+      std::uint8_t* p = px.data() + (static_cast<std::size_t>(y) * 1920 + x) * 4;
+      const bool on = apply_homography(H, x + 0.5f, y + 0.5f, X, Y);
+      const int stripe = on && (static_cast<int>(std::floor(X / 5.5f)) & 1) ? 12 : 0;
+      p[0] = static_cast<std::uint8_t>(40 + stripe / 2);
+      p[1] = static_cast<std::uint8_t>(120 + stripe);
+      p[2] = static_cast<std::uint8_t>(50 + stripe / 2);
+      p[3] = 255;
+      if (on && mark_distance(X, Y) < 0.06f) {
+        p[0] = 220;
+        p[1] = 225;
+        p[2] = 220;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+TEST_CASE("line fit scores, rejects and snaps to painted lines") {
+  // A camera on a third of the pitch: around the right penalty area.
+  constexpr float kQ[9] = {30.f, 0.f, -360.f, 0.f, -26.f, 560.f, 0.0002f, 0.006f, 1.f};
+  float sx[32], sy[32], dx[32], dy[32];
+  int n = 0;
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    pitch_landmark_m(i, dx[n], dy[n]);
+    project(kQ, dx[n], dy[n], sx[n], sy[n]);
+    ++n;
+  }
+  Homography truth;
+  REQUIRE(fit_homography(sx, sy, dx, dy, n, truth));
+  std::vector<std::uint8_t> px(1920u * 1080u * 4u);
+  painted_frame(px, truth);
+  LineFitParams p;
+
+  const LineFitStats good = line_support(px.data(), 1920, 1080, 1920 * 4, truth, p);
+  REQUIRE(good.in_view > 40);
+  REQUIRE(good.support > 0.8f);
+  REQUIRE(good.constrained);
+
+  // A fit 6 m and 4 m off: the shape is right, but nothing lies under it.
+  float ox[32], oy[32];
+  for (int i = 0; i < n; ++i) {
+    ox[i] = dx[i] + 6.f;
+    oy[i] = dy[i] + 4.f;
+  }
+  Homography wrong;
+  REQUIRE(fit_homography(sx, sy, ox, oy, n, wrong));
+  REQUIRE(line_support(px.data(), 1920, 1080, 1920 * 4, wrong, p).support < p.min_support);
+
+  // The prediction drifted (a 9 px pan and a 1% zoom the motion step missed):
+  // the line refit pulls it back within 15 cm across the visible area.
+  const float G[9] = {1.01f, 0.f, 9.f - 0.01f * 960.f, 0.f, 1.01f, -0.01f * 540.f, 0.f, 0.f, 1.f};
+  float Gi[9], drift[9];
+  REQUIRE(invert3(G, Gi));
+  detail::mul3(truth.h, Gi, drift);
+  Homography pred = truth;
+  for (int i = 0; i < 9; ++i) pred.h[i] = drift[i];
+  Homography refined;
+  LineFitStats st;
+  REQUIRE(line_refine(px.data(), 1920, 1080, 1920 * 4, pred, p, refined, st));
+  REQUIRE(st.support > 0.8f);
+  float worst_pred = 0.f, worst = 0.f;
+  for (const float y : {500.f, 800.f, 1050.f}) {
+    for (const float x : {100.f, 960.f, 1800.f}) {
+      float tX, tY, pX, pY, rX, rY;
+      if (!apply_homography(truth, x, y, tX, tY)) continue;
+      apply_homography(pred, x, y, pX, pY);
+      apply_homography(refined, x, y, rX, rY);
+      worst_pred = std::fmax(worst_pred, std::hypot(pX - tX, pY - tY));
+      worst = std::fmax(worst, std::hypot(rX - tX, rY - tY));
+    }
+  }
+  REQUIRE(worst_pred > 0.5f);
+  REQUIRE(worst < 0.15f);
+
+  // A plain grass frame: nothing to match, no refit.
+  painted_frame(px, Homography{});
+  REQUIRE_FALSE(line_refine(px.data(), 1920, 1080, 1920 * 4, truth, p, refined, st));
 }

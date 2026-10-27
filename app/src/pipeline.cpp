@@ -11,13 +11,15 @@
 #include "touchfc/frame_check.hpp"
 #include "touchfc/time.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 
 namespace touchfc {
 
-Pipeline::Pipeline(FramePool& pool) : pool_(pool) {}
+// SeqLock default-constructs to zero words; seed the in-class defaults.
+Pipeline::Pipeline(FramePool& pool) : pool_(pool) { config_.store(Config{}); }
 
 Pipeline::~Pipeline() { join(); }
 
@@ -181,10 +183,17 @@ void Pipeline::run_t2() {
     slot.kp_fresh = 0;
     slot.kp_n = 0;
     if (detector_) detector_->run(slot);
-    if (pitch_ && (slot.meta.id % 8u) == 1u) {
-      const Config cfg = config_.load();
-      const float kp_conf = cfg.conf_keypoint > 0.f ? cfg.conf_keypoint : 0.40f;
-      pitch_->run(slot, kp_conf);
+    const Config cfg = config_.load();
+    slot.scene = static_cast<std::uint8_t>(classify_scene_bgra(slot.bgra.get(), slot.meta.width,
+                                                               slot.meta.height, slot.stride, cfg.green_margin));
+    // Keypoints on every kp_interval-th wide frame. Close-ups and set-piece
+    // angles pause the pitch fit, so they are skipped.
+    if (pitch_ && slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
+      const std::uint32_t every = cfg.kp_interval ? cfg.kp_interval : 1u;
+      if (slot.meta.id % every == 0) {
+        const float kp_conf = cfg.conf_keypoint > 0.f ? cfg.conf_keypoint : 0.40f;
+        pitch_->run(slot, kp_conf);
+      }
     }
     slot.meta.t_inf_done = now_ns();
     note(1, slot.meta.id, Stage::Inference, begin, slot.meta.t_inf_done);
@@ -215,7 +224,7 @@ void Pipeline::update_possession(FrameSlot& slot) {
     best_score = slot.dets[i].score;
     ball = static_cast<int>(i);
   }
-  const bool have = ball >= 0 && slot.pitch_valid;
+  const bool have = ball >= 0 && slot.pitch_ok[static_cast<std::uint32_t>(ball)];
   float bx = 0, by = 0;
   if (have) {
     bx = slot.pitch_x[static_cast<std::uint32_t>(ball)];
@@ -226,7 +235,7 @@ void Pipeline::update_possession(FrameSlot& slot) {
   std::uint8_t team = 0;
   if (have) {
     for (std::uint32_t i = 0; i < slot.det_count; ++i) {
-      if (slot.dets[i].class_id == 3 || slot.det_team[i] == 0) continue;
+      if (slot.dets[i].class_id == 3 || slot.det_team[i] == 0 || !slot.pitch_ok[i]) continue;
       const float dx = slot.pitch_x[i] - bx;
       const float dy = slot.pitch_y[i] - by;
       const float d = dx * dx + dy * dy;
@@ -309,7 +318,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
     float px = 0, py = 0;
     bool have = false;
     for (std::uint32_t i = 0; i < slot.det_count; ++i) {
-      if (slot.dets[i].track_id != t.id || !slot.pitch_valid) continue;
+      if (slot.dets[i].track_id != t.id || !slot.pitch_ok[i]) continue;
       px = slot.pitch_x[i];
       py = slot.pitch_y[i];
       have = true;
@@ -335,7 +344,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
       if (slot.dets[i].track_id != t.id) continue;
       m.x = slot.pitch_x[i];
       m.y = slot.pitch_y[i];
-      have = slot.pitch_valid != 0;
+      have = slot.pitch_ok[i] != 0;
       break;
     }
     if (!have) {
@@ -375,7 +384,7 @@ void Pipeline::assign_teams(FrameSlot& slot) {
     int n = 0;
     for (std::uint32_t i = 0; i < slot.det_count && n < kPcMaxPlayers; ++i) {
       const auto id = slot.dets[i].track_id;
-      if (id == 0 || slot.dets[i].class_id == 3) continue;
+      if (id == 0 || slot.dets[i].class_id == 3 || !slot.pitch_ok[i]) continue;
       std::uint8_t team = 0;
       for (const auto& t : tracker_.tracks)
         if (t.id == id) team = t.team;
@@ -409,6 +418,136 @@ void Pipeline::assign_teams(FrameSlot& slot) {
   update_possession(slot);
 }
 
+void Pipeline::set_anchor(const UiCommand& command) {
+  if (command.u8a >= kPitchLandmarks) return;
+  anchor_set_[command.u8a] = command.u8b == 0;
+  anchor_x_[command.u8a] = command.f[0];
+  anchor_y_[command.u8a] = command.f[1];
+  float sx[32], sy[32], dx[32], dy[32];
+  int n = 0;
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    if (!anchor_set_[i]) continue;
+    sx[n] = anchor_x_[i];
+    sy[n] = anchor_y_[i];
+    pitch_landmark_m(i, dx[n], dy[n]);
+    ++n;
+  }
+  Homography H;
+  if (n >= 4 && fit_homography(sx, sy, dx, dy, n, H)) {
+    calib_.set_manual(H);
+    log_line("manual pitch fit: " + std::to_string(n) + " pts, error " + std::to_string(H.rms_m) + " m");
+  }
+}
+
+// Image GMC moves the last good fit. Fresh keypoints give a candidate that is
+// snapped to the painted lines and must sit on them; between keypoint runs the
+// painted lines alone keep the fit on the pitch.
+void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
+  const float W = static_cast<float>(slot.meta.width);
+  const float H = static_cast<float>(slot.meta.height);
+  PitchCalibParams params;
+  params.max_rms_m = cfg.h_max_rms_m;
+  params.jump_m = cfg.h_jump_m;
+  params.smooth = cfg.h_smooth;
+  params.holdover = cfg.h_holdover;
+  GmcParams gp;
+  gp.max_cost = cfg.gmc_max_cost;
+  LineFitParams lp;
+  lp.search_px = cfg.line_search_px;
+  lp.contrast = cfg.line_contrast;
+  lp.min_support = cfg.line_min_support;
+  lp.green_margin = cfg.green_margin;
+  const int iw = static_cast<int>(slot.meta.width), ih = static_cast<int>(slot.meta.height);
+  const int stride = static_cast<int>(slot.stride);
+  const bool wide = slot.scene == static_cast<std::uint8_t>(Scene::Wide);
+
+  GmcImage& cur = gmc_img_[gmc_cur_];
+  gmc_reduce_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride, cur, cfg.green_margin);
+  const GmcMotion motion = estimate_gmc(gmc_img_[gmc_cur_ ^ 1], cur, gp);
+  gmc_cur_ ^= 1;
+  float G[9];
+  gmc_matrix(motion, W, H, G);
+  calib_.predict(G, motion.ok, params);
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    if (!anchor_set_[i]) continue;
+    if (!motion.ok) {
+      anchor_set_[i] = false;
+      continue;
+    }
+    const float x = anchor_x_[i], y = anchor_y_[i];
+    anchor_x_[i] = G[0] * x + G[2];
+    anchor_y_[i] = G[4] * y + G[5];
+  }
+  slot.gmc_cost = motion.cost;
+  slot.gmc_ok = motion.ok ? 1 : 0;
+
+  bool offered = false;
+  if (wide && slot.kp_fresh && slot.kp_n >= 6) {
+    offered = true;
+    float sx[32], sy[32], dx[32], dy[32];
+    const int n = slot.kp_n;
+    for (int i = 0; i < n; ++i) {
+      sx[i] = slot.kp_x[static_cast<std::uint32_t>(i)];
+      sy[i] = slot.kp_y[static_cast<std::uint32_t>(i)];
+      pitch_landmark_m(slot.kp_id[static_cast<std::uint32_t>(i)], dx[i], dy[i]);
+    }
+    // Top 10% of player boxes: the horizon must sit above them.
+    float tops[kMaxDetections];
+    int nt = 0;
+    for (std::uint32_t i = 0; i < slot.det_count; ++i)
+      if (slot.dets[i].class_id <= 1) tops[nt++] = slot.dets[i].y;
+    float head_y = -1.f;
+    if (nt > 0) {
+      std::nth_element(tops, tops + nt / 10, tops + nt);
+      head_y = tops[nt / 10];
+    }
+    Homography fitted;
+    fit_homography_ransac(sx, sy, dx, dy, n, params.inlier_m, fitted);
+    Homography snapped;
+    LineFitStats ls;
+    if (fitted.valid && line_refine(slot.bgra.get(), iw, ih, stride, fitted, lp, snapped, ls)) fitted = snapped;
+    if (fitted.valid) ls = line_support(slot.bgra.get(), iw, ih, stride, fitted, lp);
+    line_support_ = ls.support;
+    last_reject_ = fitted.valid && ls.support < lp.min_support
+                       ? FitReject::Lines
+                       : calib_.offer(fitted, sx, sy, dx, dy, n, W, H, head_y, params);
+    if (pitch_logs_ < 6) {
+      ++pitch_logs_;
+      log_line("pitch fit: " + std::to_string(n) + " pts, error " + std::to_string(fitted.rms_m) +
+               " m, " + fit_reject_name(last_reject_));
+    }
+  }
+
+  const std::uint32_t every = cfg.line_interval ? cfg.line_interval : 1u;
+  if (!offered && wide && calib_.valid() && slot.meta.id % every == 0) {
+    Homography refined;
+    LineFitStats ls;
+    const bool ok = line_refine(slot.bgra.get(), iw, ih, stride, calib_.current(), lp, refined, ls);
+    line_support_ = ls.support;
+    if (ok && ls.support >= lp.min_support) calib_.track(refined, W, H, params);
+  }
+
+  const Homography& h = calib_.current();
+  slot.line_support = line_support_;
+  slot.pitch_valid = calib_.valid() ? 1 : 0;
+  slot.reproj_m = h.rms_m;
+  slot.pitch_age = static_cast<std::uint16_t>(calib_.age() > 65535 ? 65535 : calib_.age());
+  slot.pitch_reject = static_cast<std::uint8_t>(last_reject_);
+  slot.pitch_manual = calib_.manual() ? 1 : 0;
+  for (int k = 0; k < 9; ++k) slot.pitch_h[static_cast<std::uint32_t>(k)] = h.h[k];
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    const float fx = slot.dets[i].x + 0.5f * slot.dets[i].w;
+    const float fy = slot.dets[i].y + slot.dets[i].h;
+    bool ok = slot.pitch_valid && apply_homography(h, fx, fy, slot.pitch_x[i], slot.pitch_y[i]);
+    ok = ok && on_pitch(slot.pitch_x[i], slot.pitch_y[i], 3.f);
+    slot.pitch_ok[i] = ok ? 1 : 0;
+    if (!ok) {
+      slot.pitch_x[i] = 0;
+      slot.pitch_y[i] = 0;
+    }
+  }
+}
+
 void Pipeline::run_t3() {
   if (pin_) pin_current_thread_to_one_ccd();
   set_pipeline_thread();
@@ -420,6 +559,11 @@ void Pipeline::run_t3() {
       } else if (command.type == CmdType::SetTeamSeed && (command.u8a == 1 || command.u8a == 2)) {
         seed_req_id_ = command.u16a;
         seed_req_team_ = command.u8a;
+      } else if (command.type == CmdType::SetAnchor) {
+        set_anchor(command);
+      } else if (command.type == CmdType::ResetHomography) {
+        calib_.reset();
+        for (bool& a : anchor_set_) a = false;
       }
     }
     std::uint32_t index = 0;
@@ -467,54 +611,7 @@ void Pipeline::run_t3() {
       gmc_py_[gmc_n_] = slot.dets[i].y + 0.5f * slot.dets[i].h;
       ++gmc_n_;
     }
-    slot.scene = static_cast<std::uint8_t>(
-        classify_scene_bgra(slot.bgra.get(), slot.meta.width, slot.meta.height, slot.stride));
-    if (pitch_) {
-      if (slot.kp_fresh && slot.kp_n >= 6) {
-        float sx[32], sy[32], dx[32], dy[32];
-        const int n = slot.kp_n;
-        for (int i = 0; i < n; ++i) {
-          sx[i] = slot.kp_x[static_cast<std::uint32_t>(i)];
-          sy[i] = slot.kp_y[static_cast<std::uint32_t>(i)];
-          pitch_landmark_m(slot.kp_id[static_cast<std::uint32_t>(i)], dx[i], dy[i]);
-        }
-        Homography fitted;
-        if (fit_homography_ransac(sx, sy, dx, dy, n, 2.f, fitted) && fitted.rms_m <= 2.5f) {
-          pitch_h_ = fitted;
-          pitch_from_kp_ = true;
-          pan_x_ = 0.f;
-          pan_y_ = 0.f;
-          if (pitch_logs_ < 3) {
-            ++pitch_logs_;
-            log_line("pitch fit: " + std::to_string(n) + " pts, error " +
-                     std::to_string(fitted.rms_m) + " m");
-          }
-        }
-      } else if (pitch_from_kp_ && last_gmc_.confidence >= 0.5f) {
-        pan_x_ += last_gmc_.dx;
-        pan_y_ += last_gmc_.dy;
-      }
-    } else if (!pitch_h_.valid || slot.scene == static_cast<std::uint8_t>(Scene::Wide)) {
-      const float W = static_cast<float>(slot.meta.width);
-      const float H = static_cast<float>(slot.meta.height);
-      const float sx[5] = {0.12f * W, 0.88f * W, 0.30f * W, 0.70f * W, 0.50f * W};
-      const float sy[5] = {0.90f * H, 0.90f * H, 0.48f * H, 0.48f * H, 0.66f * H};
-      const float dx[5] = {-52.5f, 52.5f, -52.5f, 52.5f, 0.f};
-      const float dy[5] = {-34.f, -34.f, 34.f, 34.f, 0.f};
-      fit_homography(sx, sy, dx, dy, 5, pitch_h_);
-    }
-    slot.pitch_valid = pitch_h_.valid ? 1 : 0;
-    slot.reproj_m = pitch_h_.rms_m;
-    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
-      const float fx = slot.dets[i].x + 0.5f * slot.dets[i].w - pan_x_;
-      const float fy = slot.dets[i].y + slot.dets[i].h - pan_y_;
-      if (!pitch_h_.valid) {
-        slot.pitch_x[i] = 0;
-        slot.pitch_y[i] = 0;
-        continue;
-      }
-      apply_homography(pitch_h_, fx, fy, slot.pitch_x[i], slot.pitch_y[i]);
-    }
+    update_pitch(slot, cfg);
     assign_teams(slot);
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;

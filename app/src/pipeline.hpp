@@ -7,6 +7,9 @@
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/gmc.hpp"
 #include "touchfc/homography.hpp"
+#include "touchfc/image_gmc.hpp"
+#include "touchfc/line_fit.hpp"
+#include "touchfc/pitch_calib.hpp"
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/possession.hpp"
 #include "touchfc/scene.hpp"
@@ -119,10 +122,17 @@ class Pipeline {
   float gmc_py_[64]{};
   std::uint16_t gmc_id_[64]{};
   std::uint32_t gmc_n_ = 0;
-  Homography pitch_h_{};
-  bool pitch_from_kp_ = false;
-  float pan_x_ = 0.f;
-  float pan_y_ = 0.f;
+  void update_pitch(FrameSlot& slot, const Config& cfg);
+  void set_anchor(const UiCommand& command);
+  PitchCalib calib_{};
+  GmcImage gmc_img_[2]{};
+  int gmc_cur_ = 0;
+  FitReject last_reject_ = FitReject::None;
+  float line_support_ = 0.f;
+  // Manual calibration clicks, moved with the camera until the next cut.
+  bool anchor_set_[32]{};
+  float anchor_x_[32]{};
+  float anchor_y_[32]{};
   int pitch_logs_ = 0;
   Lab seed_[2]{};
   bool seed_ok_[2]{};

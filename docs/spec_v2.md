@@ -135,7 +135,7 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M5 | SIMD pitch control on a 2 m grid, also runnable on StatsBomb 360 alone | **Done.** 53×34 Spearman time-to-intercept, AVX2 over each row. A 360 frame is just positions and a team bit; no video. The minimap waits for team labels (M6) before painting it. |
 | M6 | Team histogram, label UI, lineup import, session save/load | **Done** without lineup import or session save/load. A control-window click sets team A or B from the torso colour; other tracks follow the nearer colour. A new id within 8 m and the same colour keeps the team for 2 s. |
 | M7 | Ball, possession, then pass/shot only if recall allows, SPADL export | **Done** for the ball and possession. COCO class 32 is kept as the ball. A player within 1.5 m holds it; a change closes a spell. Pass and shot are not emitted. `spadl.csv` uses the SPADL columns, with type_id 21 for a possession spell. |
-| M9 | Minimap and homography fix, reprojection debug view | Section 11.1. |
+| M9 | Minimap and homography fix, reprojection debug view | **Code done, visual check pending.** Image GMC, fit validation and smoothing, metric landmark table, manual calibration, clipped minimap. The done-when check needs a real broadcast clip with `--keypoints` (`pitch.mp4` is a collage of two dataset images). Section 11.1, `review_gate.md` M9. |
 | M10 | Config v2, tuning panel, profiles | Section 11.2. |
 | M11 | Play-state gate (in play / dead) | Section 11.3. |
 | M12 | Match setup: scorebug OCR or manual entry, pre-match stats (ESPN), lineups, kit colours | Section 11.4. |

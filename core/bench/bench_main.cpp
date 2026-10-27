@@ -1,5 +1,8 @@
 #include "touchfc/arena.hpp"
 #include "touchfc/cpu.hpp"
+#include "touchfc/image_gmc.hpp"
+#include "touchfc/line_fit.hpp"
+#include "touchfc/pitch_landmarks.hpp"
 #include "touchfc/preprocess.hpp"
 #include "touchfc/seqlock.hpp"
 #include "touchfc/spsc_ring.hpp"
@@ -289,6 +292,78 @@ static void BM_PreprocessAvx2(benchmark::State& state) {
 }
 BENCHMARK(BM_PreprocessAvx2)->MinTime(0.3);
 #endif
+// Image GMC runs on T3 every frame: reduce a 1920x1080 BGRA frame, then search.
+static void BM_ImageGmc(benchmark::State& state) {
+  std::vector<std::uint8_t> a(1920u * 1080u * 4u), b(a.size());
+  for (std::size_t y = 0; y < 1080; ++y)
+    for (std::size_t x = 0; x < 1920; ++x) {
+      std::uint8_t* p = a.data() + (y * 1920 + x) * 4;
+      const auto g = static_cast<std::uint8_t>(110 + ((x / 7 + y / 5) * 37) % 60);
+      p[0] = static_cast<std::uint8_t>(g / 3);
+      p[1] = g;
+      p[2] = static_cast<std::uint8_t>(g / 2);
+      std::uint8_t* q = b.data() + (y * 1920 + (x + 13) % 1920) * 4;
+      q[0] = p[0];
+      q[1] = p[1];
+      q[2] = p[2];
+    }
+  static GmcImage ga, gb;
+  gmc_reduce_bgra(a.data(), 1920, 1080, 1920 * 4, ga);
+  for (auto _ : state) {
+    gmc_reduce_bgra(b.data(), 1920, 1080, 1920 * 4, gb);
+    benchmark::DoNotOptimize(estimate_gmc(ga, gb));
+  }
+}
+BENCHMARK(BM_ImageGmc)->Unit(benchmark::kMicrosecond)->MinTime(0.3);
+
+
+// Line refit on T3 every line_interval wide frames: 1920x1080, a third of the
+// pitch around the right box, prediction off by a 9 px pan.
+static void BM_LineRefine(benchmark::State& state) {
+  const float P[9] = {30.f, 0.f, -360.f, 0.f, -26.f, 560.f, 0.0002f, 0.006f, 1.f};
+  std::vector<std::uint8_t> px(1920u * 1080u * 4u);
+  for (std::size_t i = 0; i < px.size(); i += 4) {
+    px[i] = 40;
+    px[i + 1] = 120;
+    px[i + 2] = 50;
+  }
+  float sx[32], sy[32], dx[32], dy[32];
+  for (int i = 0; i < kPitchLandmarks; ++i) {
+    pitch_landmark_m(i, dx[i], dy[i]);
+    const float w = P[6] * dx[i] + P[7] * dy[i] + P[8];
+    sx[i] = (P[0] * dx[i] + P[1] * dy[i] + P[2]) / w;
+    sy[i] = (P[3] * dx[i] + P[4] * dy[i] + P[5]) / w;
+  }
+  Homography truth, inv;
+  fit_homography(sx, sy, dx, dy, kPitchLandmarks, truth);
+  invert3(truth.h, inv.h);
+  // Paint the markings as 3 px dots every 5 cm.
+  detail::for_each_mark_sample([&](float X, float Y, float tX, float tY, int) {
+    for (int k = 0; k < 20; ++k) {
+      float x, y;
+      if (!apply_homography(inv, X + 0.05f * k * tX, Y + 0.05f * k * tY, x, y)) continue;
+      for (int oy = -1; oy <= 1; ++oy)
+        for (int ox = -1; ox <= 1; ++ox) {
+          const int xi = static_cast<int>(x) + ox, yi = static_cast<int>(y) + oy;
+          if (xi < 0 || yi < 0 || xi >= 1920 || yi >= 1080) continue;
+          std::uint8_t* p = px.data() + (static_cast<std::size_t>(yi) * 1920 + xi) * 4;
+          p[0] = p[1] = p[2] = 225;
+        }
+    }
+  });
+  const float G[9] = {1, 0, 9, 0, 1, 0, 0, 0, 1};
+  float Gi[9];
+  invert3(G, Gi);
+  Homography pred = truth;
+  detail::mul3(truth.h, Gi, pred.h);
+  LineFitParams p;
+  for (auto _ : state) {
+    Homography out;
+    LineFitStats st;
+    benchmark::DoNotOptimize(line_refine(px.data(), 1920, 1080, 1920 * 4, pred, p, out, st));
+  }
+}
+BENCHMARK(BM_LineRefine)->Unit(benchmark::kMicrosecond)->MinTime(0.3);
 
 int main(int argc, char** argv) {
   std::fprintf(stderr, "touchfc bench  clock=steady_clock\n");

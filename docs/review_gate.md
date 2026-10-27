@@ -94,6 +94,28 @@ Hot-path status:
 - `OrtDetector::run` reuses pre-sized `input_tensor_` and `output_buffer_`. ORT's own `Run` is the only path that could allocate internally, which is outside this process's control; the Session is created once in `prepare`.
 - `FrameSlot` grew from ~24 B of metadata plus a BGRA buffer to also carry `std::array<Detection, 128>` (3 KiB). The slot is 16 x per pool, so this adds ~48 KiB on top of pixel memory.
 
+## M9 state
+
+`touchfc_tests`: 421 assertions in 40 cases, Release, MSVC 19.50, all green. `touchfc.exe --selftest --seconds 3` exits 0. `BM_ImageGmc` 0.86 ms per 1080p frame ([bench](bench/README.md)).
+
+| What | Where | Notes |
+|---|---|---|
+| Landmark table | [`pitch_landmarks.hpp`](../core/include/touchfc/pitch_landmarks.hpp) | Order checked against Roboflow's `SoccerPitchConfiguration` vertex list. Positions are now the real IFAB markings (16.5 m box, 40.32 m wide, 9.15 m circle) instead of Roboflow's not-to-scale template squeezed onto 105 x 68, which put the box corners up to 1.1 m off and made the centre circle an ellipse. Test: a synthetic `H` maps all 32 landmarks round-trip within 1 cm. |
+| Projection guard | [`homography.hpp`](../core/include/touchfc/homography.hpp) | Fits are unit-norm with `w > 0` on the fitted points; `apply_homography` returns false at or above the horizon. Detections more than 3 m off the pitch get `pitch_ok = 0` and are skipped by possession, team inheritance and pitch control. |
+| Image GMC | [`image_gmc.hpp`](../core/include/touchfc/image_gmc.hpp) | Grass and line pixels only, so players and the scorebug do not pull the match. Scale + translation. Test: recovers a 1% zoom and a (37, -18) px pan; a grey frame is rejected. Player-centroid pan is gone from the homography path (the tracker still uses it). |
+| Fit validation and smoothing | [`pitch_calib.hpp`](../core/include/touchfc/pitch_calib.hpp) | Rejects on error, < 4 inliers, one quadrant, determinant flip, horizon below the top 10% of player boxes, bottom centre > 10 m off. Blends four image-space corners by `h_smooth`; a jump over `h_jump_m` waits for a second agreeing fit. Holdover cap `h_holdover`; a lost GMC lock (cut) invalidates. Each rule has a test. |
+| Keypoint cadence | `pipeline.cpp` T2 | Scene is classified on T2 now; keypoints every `kp_interval` wide frames (default 4), every 8th otherwise. |
+| No model, no positions | `pipeline.cpp`, `present.cpp` | Five-point template deleted. Without `--keypoints` the minimap says "not calibrated" until 4+ landmarks are clicked on the frame thumbnail in the control window (`SetAnchor`; `ResetHomography` clears). Anchors move with the GMC and are dropped on a cut. |
+| Minimap | `present.cpp` | 105:68, scales with the window, `PushClipRect`, pitch markings drawn. |
+| Reprojection view | `present.cpp` | Control-window toggle: magenta pitch lines and landmark crosses through `H^-1`, yellow raw keypoints with ids. A yellow id sitting on the matching magenta cross is the id-order check. |
+| Config | `types.hpp` | `h_max_rms_m`, `h_jump_m`, `h_smooth`, `gmc_max_cost`, `h_holdover`, `kp_interval`, `minimap_dead_mode` (64 B). Sliders with live values in the control window's "Pitch calibration" section until M10's Tuning tab. |
+
+Found on the way: `SeqLock<Config>` default-constructs to zero words and nothing stored a `Config` at start, so every in-class default (`show_boxes`, `conf_player`, ...) read as 0 until a UI change. `Pipeline` now stores `Config{}` in its constructor.
+
+Not verified:
+- **The done-when check.** `pitch.mp4` is a collage of two annotated dataset images, so the fit is correctly rejected (horizon below the far touchline). Needs a real broadcast clip with `--keypoints`, the reprojection view on, through an attack and a pan.
+- `minimap_dead_mode` is a field only; it acts once M11 has a play state.
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.

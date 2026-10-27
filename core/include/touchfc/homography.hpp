@@ -6,17 +6,30 @@
 namespace touchfc {
 
 // Image pixels -> pitch metres. Row-major 3x3. Invalid until a fit succeeds.
+// Fits are scaled to unit norm with w > 0 on the fitted points, so w <= 0 is
+// at or above the horizon.
 struct Homography {
   float h[9]{};
   bool valid = false;
   float rms_m = 0.f;
 };
 
-inline void apply_homography(const Homography& H, float x, float y, float& X, float& Y) noexcept {
+// False (and X = Y = 0) when the point is at or above the horizon.
+inline bool apply_homography(const Homography& H, float x, float y, float& X, float& Y) noexcept {
   const float w = H.h[6] * x + H.h[7] * y + H.h[8];
-  const float inv = std::fabs(w) > 1e-8f ? 1.f / w : 0.f;
+  if (w <= 1e-9f) {
+    X = 0.f;
+    Y = 0.f;
+    return false;
+  }
+  const float inv = 1.f / w;
   X = (H.h[0] * x + H.h[1] * y + H.h[2]) * inv;
   Y = (H.h[3] * x + H.h[4] * y + H.h[5]) * inv;
+  return true;
+}
+
+inline bool on_pitch(float X, float Y, float margin_m) noexcept {
+  return std::fabs(X) <= 52.5f + margin_m && std::fabs(Y) <= 34.f + margin_m;
 }
 
 namespace detail {
@@ -58,7 +71,37 @@ inline bool solve8(float A[8][8], float b[8], float x[8]) noexcept {
   return true;
 }
 
+inline float det3(const float* m) noexcept {
+  return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+         m[2] * (m[3] * m[7] - m[4] * m[6]);
+}
+
+// Unit Frobenius norm, sign chosen so w > 0 at (x, y).
+inline void normalise(float* m, float x, float y) noexcept {
+  float n = 0.f;
+  for (int i = 0; i < 9; ++i) n += m[i] * m[i];
+  n = n > 0.f ? 1.f / std::sqrt(n) : 1.f;
+  if (m[6] * x + m[7] * y + m[8] < 0.f) n = -n;
+  for (int i = 0; i < 9; ++i) m[i] *= n;
+}
+
 }  // namespace detail
+
+inline bool invert3(const float* m, float* out) noexcept {
+  const float d = detail::det3(m);
+  if (std::fabs(d) < 1e-20f) return false;
+  const float i = 1.f / d;
+  out[0] = (m[4] * m[8] - m[5] * m[7]) * i;
+  out[1] = (m[2] * m[7] - m[1] * m[8]) * i;
+  out[2] = (m[1] * m[5] - m[2] * m[4]) * i;
+  out[3] = (m[5] * m[6] - m[3] * m[8]) * i;
+  out[4] = (m[0] * m[8] - m[2] * m[6]) * i;
+  out[5] = (m[2] * m[3] - m[0] * m[5]) * i;
+  out[6] = (m[3] * m[7] - m[4] * m[6]) * i;
+  out[7] = (m[1] * m[6] - m[0] * m[7]) * i;
+  out[8] = (m[0] * m[4] - m[1] * m[3]) * i;
+  return true;
+}
 
 // Least-squares homography, Hartley-normalised. Needs at least 4 pairs.
 inline bool fit_homography(const float* sx, const float* sy, const float* dx, const float* dy, int n,
@@ -108,6 +151,7 @@ inline bool fit_homography(const float* sx, const float* sy, const float* dx, co
   float tmp[9];
   detail::mul3(Hn, Tsrc, tmp);
   detail::mul3(invDst, tmp, out.h);
+  detail::normalise(out.h, smx, smy);
   float err = 0;
   for (int i = 0; i < n; ++i) {
     float X, Y;

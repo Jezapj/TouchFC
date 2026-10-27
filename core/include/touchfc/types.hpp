@@ -132,9 +132,23 @@ struct Config {
   std::uint8_t ball_tiling = 0;
   std::uint32_t layers = 0xffffffffu;
   float shot_speed_mps = 8.f;
-  float pad0 = 0.f;
-  std::uint32_t pad1 = 0;
+  float h_max_rms_m = 1.5f;     // reject a pitch fit above this error
+  float h_jump_m = 3.f;         // a fit this far from the prediction waits one more fit
+  float h_smooth = 0.4f;        // weight of a new fit against the prediction
+  float gmc_max_cost = 18.f;    // image motion worse than this is a cut
+  std::uint16_t h_holdover = 50;  // frames a fit lives on camera motion alone
+  std::uint8_t kp_interval = 4;   // keypoint model every Nth wide frame
+  std::uint8_t minimap_dead_mode = 0;  // MinimapDeadMode, used from M11
+  std::uint8_t green_margin = 8;   // grass: green over red and blue by this much
+  std::uint8_t line_interval = 2;  // line refit every Nth wide frame
+  std::uint16_t pad0 = 0;
+  float line_search_px = 12.f;     // line search +- px, at 1920 wide
+  float line_contrast = 18.f;      // painted line over grass, grey levels
+  float line_min_support = 0.35f;  // share of in-view markings on painted lines
+  float pad1 = 0.f;
 };
+
+enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };
 
 static_assert(std::is_trivially_copyable_v<Config>);
 static_assert(sizeof(Config) % 8 == 0, "SeqLock payload must be a multiple of 8");

@@ -13,6 +13,7 @@ struct AppArgs {
   double seconds = 0;
   bool pin = false;
   std::string telemetry_path = "telemetry.csv";
+  std::string pitch_dump_path;  // per-frame homography CSV, for offline checks
 };
 
 int run_app(const AppArgs& args);
