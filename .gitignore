@@ -11,3 +11,7 @@ telemetry.csv
 CMakeUserPresets.json
 docs/bench/last_run.csv
 docs/bench/presentmon.csv
+
+# phase 2 runtime output
+cache/
+spadl.csv
