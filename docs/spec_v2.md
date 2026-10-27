@@ -138,7 +138,7 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M9 | Minimap and homography fix, reprojection debug view | Section 11.1. |
 | M10 | Config v2, tuning panel, profiles | Section 11.2. |
 | M11 | Play-state gate (in play / dead) | Section 11.3. |
-| M12 | Match setup: scorebug OCR or manual entry, stats API, lineups, kit colours | Section 11.4. |
+| M12 | Match setup: scorebug OCR or manual entry, pre-match stats (ESPN), lineups, kit colours | Section 11.4. |
 | M13 | Pass / shot events, team stats accumulators | Section 11.5. |
 | M14 | Stats overlay, ball-avoid flip, on-ball player card | Section 11.6. |
 | M15 | Mini replay of key passes and shots | Section 11.7. |
@@ -249,22 +249,28 @@ At start, the app identifies the two teams so it can fetch lineups and kit colou
 - OCR on T7 with `Windows.Media.Ocr` (C++/WinRT, already in the build, offline, no new dependency). Once a second until confident, then once every 10 s for score and clock.
 - Parse `([A-Z]{2,4})\s*(\d+)\s*[-:]?\s*(\d+)\s*([A-Z]{2,4})` (also accept an en dash). Left code is home, right is away: `ARS 1 EVE 0` is Arsenal at home to Everton. Also parse a `mm:ss` clock into `match_ms`.
 - Confident = the same codes in 3 consecutive reads. A score change is logged as a goal event.
-- Map codes to teams with `data/team_codes.json` (code to provider team id and name, per league). Ambiguous or unknown codes go to the user.
+- Map codes to teams by the provider's team `abbreviation` first, then `data/team_codes.json` (code to provider team id and name, per league) as an override for codes the broadcaster uses differently. Ambiguous or unknown codes go to the user.
 
-**Manual (fallback and override).** Control window: home and away search boxes backed by the provider's team search, a date (today by default) and a confirm button. Manual always wins over OCR.
+**Manual (fallback and override).** Control window: home and away search boxes over the provider's cached team list for the league, a date (today by default) and a confirm button. Manual always wins over OCR.
 
-**Stats provider.** Interface `StatsProvider` on T7, so the source can change:
-- `ApiFootballProvider` (default; api-sports.io v3, key in `TOUCHFC_API_FOOTBALL_KEY`, sent as a header). Fixture by date and team, `fixtures/lineups`, `fixtures/statistics`, `fixtures/players` (ratings), `teams` search. Lineups are usually posted 20 to 40 minutes before kick-off. Check endpoint and field names against the live docs when implementing.
-- `FileProvider` reading `lineup.csv` (spec v1 16.3) and an optional stats JSON, for offline replay and tests.
+**Stats provider.** Pre-match context only. Live match stats are never fetched; they come from vision (11.5). Interface `StatsProvider` on T7, so the source can change:
+- `EspnProvider` (default; ESPN's unofficial public JSON API, no key). Undocumented, so field names and URLs can change: probe the live endpoints when implementing, and parse tolerantly (a missing field is an empty value, never an error). Fetches:
+  - Fixture by date and teams (league scoreboard), and the league team list (names, abbreviations, colours).
+  - Last 5 results per team (form), from the team schedule.
+  - Pre-match player stats per squad: whatever the league exposes (appearances, goals, assists at least). Depth varies by league.
+  - Injuries and suspensions where the league has them. Soccer coverage is patchy; missing data falls back to manual entry in the control window.
+  - Lineups from the event summary once posted (usually 20 to 40 minutes before kick-off).
+- `FileProvider` reading `lineup.csv` (spec v1 16.3) and an optional pre-match JSON, for offline replay and tests.
 - HTTP with WinHTTP (no new dependency). JSON with nlohmann-json (add to `vcpkg.json` / FetchContent).
-- Every response is cached under `cache/`, keyed by fixture and endpoint. A replay of a past match uses the cache and costs no quota. The free tier is about 100 requests a day, so the budget is 1 fixture lookup, 1 lineup, then live statistics and player ratings no more often than every 3 minutes (configurable), stopping at full time.
+- Every response is cached under `cache/`, keyed by fixture and endpoint. A replay of a past match uses the cache and needs no network. Budget: fixture, team list, form and squad stats once at setup; lineup polled every 2 minutes (configurable) from 60 minutes before kick-off until it appears, then never again. Nothing is fetched during play.
+- ESPN's terms do not cover redistribution or commercial use. Fine for personal use; revisit before shipping.
 
 **What setup gives the pipeline.**
-- `MatchInfo`: names, codes, starting XI and bench, shirt numbers, formation.
-- **Kit colours.** If the lineup response carries team colours, seed the team A/B colour centres from them so team assignment works without the M6 click. The click still overrides.
-- Lineup confirmation in the control window (XI per side, formation). Substitutions from the provider update the lineup.
+- `MatchInfo`: names, codes, starting XI and bench, shirt numbers, formation, last-5 form, unavailable players, and per-player pre-match stats for the on-ball card. Built once on T7 before `Pipeline::start` (or swapped in whole by pointer), so T1 to T3 never see a growing container.
+- **Kit colours.** Seed the team A/B colour centres from the provider's team colours so team assignment works without the M6 click. These are club colours, not the kit worn that day, so the seed is rejected if no player cluster lies within `kit_seed_max_dist` of it. The click still overrides.
+- Lineup confirmation in the control window (XI per side, formation). Substitutions are entered in the control window (no live polling).
 
-Done when: on a replay with a visible scorebug the teams are identified without input; with a key the lineup and colours load and are cached; without a key or network the manual / file path works and nothing blocks T1 to T3.
+Done when: on a replay with a visible scorebug the teams are identified without input; with network the fixture, form, squad stats and lineup load and are cached; without network the manual / file path works and nothing blocks T1 to T3.
 
 ### 11.5 M13: events and team stats
 
@@ -275,21 +281,27 @@ Builds on M7 possession. Online, on T3, only while `InPlay`.
 - **Shot**: ball in flight toward the goal mouth (projected line crosses the goal line between the posts plus a margin) faster than `shot_speed_mps`, starting inside a shooting zone (default 35 m from goal). Outcome is unknown unless the score changes (goal) or play goes dead.
 - **Key pass**: a completed pass followed by a shot by the same team within 5 s, or a completed pass into the penalty area.
 - `TeamStats` per team: passes attempted, completed, completion %, possession % (in-play time with that team in possession over in-play time with any possession), shots, key passes. Per-track counters for the same, used by the on-ball card.
+- **TFC rating** (vision rating) per track, updated on T3 at each event. Built on expected threat (xT): a 12x8 grid of how likely possession in each zone leads to a goal (Karun Singh's published values, a `constexpr` table in `core/`, mirrored for the attacking direction).
+  - Completed pass: `rating_pass_k * (xT(end) - xT(start))`, times `rating_press_mult` when an opponent was within `rating_press_m` of the passer at release. Backward passes can score below zero; floor each pass at `-rating_pass_floor` so safe recycling is not punished hard.
+  - Incomplete pass: `-rating_loss_k * xT(start)` plus `-rating_loss_base`. The interceptor gets `+rating_int`.
+  - Shot: `+rating_shot`; goal (score change attributed to the last shot) `+rating_goal`.
+  - Shown as `rating_base` (default 6.0) plus the sum, clamped to 0 to 10. All weights are `Config` fields with sliders.
+  - xT is not xG: it values ball progression, not shot quality. The non-goal "no real-time xG from vision" stands.
 - Events go into the preallocated event log (spec v1 12.1) and the SPADL export: pass = type 0, shot = type 11, with result.
-- **Validation**: after replaying a match that has an API cache, write our team stats beside the provider's `fixtures/statistics` (passes, pass %, possession, shots) to a CSV in `docs/bench/`. Report the error honestly; vision pass counts will be low because of camera cuts and replays.
+- **Validation**: after replaying a match that has a provider cache, write our team stats beside the provider's post-match team stats (passes, pass %, possession, shots, whatever the ESPN summary carries) to a CSV in `docs/bench/`. Report the error honestly; vision pass counts will be low because of camera cuts and replays.
 
-Done when: tests cover pass, interception, out-of-play and shot on synthetic possession timelines, and the validation CSV exists for at least one match.
+Done when: tests cover pass, interception, out-of-play and shot on synthetic possession timelines, the rating changes by the expected amount for a forward pass, a backward pass, an incomplete pass and an interception, and the validation CSV exists for at least one match.
 
 ### 11.6 M14: stats overlay
 
 On the overlay (and the replay view), three ImGui panels drawn on the present thread from `OverlayState`:
 
-1. **Team stats panel**: team codes and score (from `MatchInfo`), possession %, passes, completion %, shots. Labelled as a vision estimate, to keep the non-goal of broadcast accuracy honest. Optional line with provider live stats when available.
+1. **Team stats panel**: team codes and score (from `MatchInfo`), possession %, passes, completion %, shots. Labelled as a vision estimate, to keep the non-goal of broadcast accuracy honest. Before kick-off and at half time, the panel can show each team's last-5 form and unavailable players from `MatchInfo`.
 2. **On-ball card**: the player in possession. Tiers:
-   - Always: team colour, track id, time on the ball this spell.
-   - If the track has a label (manual label, label inheritance, or a lineup pick in the control window): name, shirt number, our per-player counters (passes, completion), and the provider's live rating if it has one.
+   - Always: team colour, track id, time on the ball this spell, TFC rating (it lives on the track, so it works before the track is labelled).
+   - If the track has a label (manual label, label inheritance, or a lineup pick in the control window): name, shirt number, our per-player counters (passes, completion), and one line of pre-match season stats from `MatchInfo`.
    - Stretch (cut first): jersey-number OCR on the torso crop of medium shots with `Windows.Media.Ocr` on T7, matched to the lineup, to label tracks automatically. Expect low recall.
-   - "Rating" means the provider's rating. A homemade score from vision events is not shown as a rating; at most as "involvement".
+   - The rating is always labelled "TFC" so it is not mistaken for an official player rating. It resets with the track: a lost and re-acquired player starts again unless label inheritance carries the track over.
 3. **Minimap** (M9).
 
 **Ball-avoid flip.** Each panel has a preferred side. If the ball's screen box (or the on-ball player's box) intersects the panel rectangle grown by the flip margin for more than 150 ms, the panel moves to the mirrored side. It stays there for at least the flip hold time (default 2 s) before it may return, and slides rather than jumps. The scorebug ROI is also an obstacle. The side can be forced in the tuning panel.
@@ -308,5 +320,6 @@ Done when: a shot on a replay clip produces a mini replay within 2 s of the end 
 
 ### 11.8 Open items for the user
 
-- Stats provider: API-Football is assumed (free tier, lineups, ratings). A key is needed for live use in M12; without one, the file provider and manual entry still work.
+- Stats provider: decided. ESPN's unofficial API, pre-match only; live stats and the rating come from vision (11.4, 11.5). No key needed.
+- Injuries: ESPN soccer coverage is patchy. Check it for the leagues you watch; if it is empty, use manual entry.
 - `minimap_dead_mode` defaults to `Freeze`. Switch to `Hide` if that reads better on screen.
