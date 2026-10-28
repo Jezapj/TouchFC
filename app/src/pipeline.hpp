@@ -13,6 +13,7 @@
 #include "touchfc/play_state.hpp"
 #include "touchfc/events.hpp"
 #include "touchfc/match_info.hpp"
+#include "touchfc/mini_replay.hpp"
 #include "touchfc/scorebug.hpp"
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/possession.hpp"
@@ -73,6 +74,13 @@ class Pipeline {
   OcrCrop& ocr_crop(std::uint32_t i) noexcept { return crops_[i & 1]; }
   TripleBuffer<MatchInfo>& match_t3() noexcept { return match_t3_; }
   TripleBuffer<MatchInfo>& match_ui() noexcept { return match_ui_; }
+  // M15: T3 writes the ring and posts requests; T7 fills clips; present plays.
+  const ThumbRing& thumb_ring() const noexcept { return thumb_ring_; }
+  BlockingSpsc<ClipReq, 8>& clip_requests() noexcept { return clip_req_; }
+  ClipBuffer& clip(int i) noexcept { return clips_[i & 1]; }
+  std::atomic<std::int64_t> thumb_ns{0};          // EMA of the thumbnail cost on T3
+  std::atomic<bool> replay_over_budget{false};    // set once; the mini replay stays off
+  void write_thumb(const FrameSlot& slot);         // present thread only
   // After join(): the final vision stats.
   const TeamStats& team_stats() const noexcept { return events_.team_stats(); }
 
@@ -103,6 +111,7 @@ class Pipeline {
   void drain_ring(BlockingSpsc<std::uint32_t, kDepth>& ring);
   void assign_teams(FrameSlot& slot, const Config& cfg);
   void update_possession(FrameSlot& slot);
+  void request_clip(float t_s, const Event* e, std::uint8_t kind) noexcept;
 
   FramePool& pool_;
   FrameSource* source_ = nullptr;
@@ -201,6 +210,15 @@ class Pipeline {
   Event poss_events_[kMaxEvents]{};
   int poss_n_ = 0;
   std::int64_t poss_t0_ = 0;
+  ThumbScaler thumb_scaler_{};
+  ThumbRing thumb_ring_{};
+  ClipBuffer clips_[2]{};
+  BlockingSpsc<ClipReq, 8> clip_req_{};
+  float last_thumb_t_ = -1e9f;
+  TimeNs budget_t_ = 0;
+  std::uint64_t budget_frames_ = 0;
+  std::uint64_t budget_late_ = 0;
+  std::uint64_t frames_ = 0;
 };
 
 }  // namespace touchfc

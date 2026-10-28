@@ -267,6 +267,46 @@ void Services::handle(const ServiceCmd& c) {
   }
 }
 
+// M15: wait until the ring holds t + 1.5 s, then copy the window into a free
+// clip (or over one that has not started playing). Present plays it.
+void Services::serve_clips() {
+  ClipReq r;
+  while (clip_wait_n_ < 4 && pipe_.clip_requests().try_pop(r)) {
+    clip_wait_[clip_wait_n_++] = r;
+    log_line("mini replay requested at " + std::to_string(r.t_s) + " s");
+  }
+  const ThumbRing& ring = pipe_.thumb_ring();
+  while (clip_wait_n_ > 0 && ring.last_t() >= clip_wait_[0].t_s + kClipAfterS) {
+    r = clip_wait_[0];
+    for (int k = 1; k < clip_wait_n_; ++k) clip_wait_[k - 1] = clip_wait_[k];
+    --clip_wait_n_;
+    ClipBuffer* dst = nullptr;
+    for (const ClipState from : {ClipState::Free, ClipState::Ready})
+      for (int i = 0; i < 2 && !dst; ++i) {
+        ClipState s = from;
+        if (pipe_.clip(i).state.compare_exchange_strong(s, ClipState::Filling)) dst = &pipe_.clip(i);
+      }
+    if (!dst) {
+      log_line("mini replay skipped: both clips busy");
+      continue;
+    }
+    bool dead_before = false;
+    const int n = copy_clip(ring, r, *dst, dead_before);
+    // Playback is by timestamp, so a low present rate is fine; only a window
+    // the ring barely covers (gap, pause, startup) is skipped.
+    const float span = n > 1 ? dst->meta[n - 1].t_s - dst->meta[0].t_s : 0.f;
+    if ((dead_before && r.kind != 2) || n < 4 || span < 2.5f) {
+      log_line(dead_before ? "mini replay skipped: a cut or replay inside the window"
+                           : "mini replay skipped: the ring does not cover the window");
+      dst->state.store(ClipState::Free, std::memory_order_release);
+      continue;
+    }
+    log_line("mini replay ready: " + std::to_string(n) + " frames, " + std::to_string(span) + " s");
+    dst->seq = ++clip_seq_;
+    dst->state.store(ClipState::Ready, std::memory_order_release);
+  }
+}
+
 void Services::run() {
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   {
@@ -299,6 +339,7 @@ void Services::run() {
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    serve_clips();
     if (m_.event_id && !m_.lineup_ok && now_s() - last_poll_s_ >= 120) fetch_summary(false);
     if (dirty_) publish();
   }

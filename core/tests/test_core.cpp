@@ -1,3 +1,5 @@
+#include "touchfc/mini_replay.hpp"
+#include "touchfc/panel_flip.hpp"
 #include "touchfc/arena.hpp"
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/config_json.hpp"
@@ -1426,4 +1428,88 @@ TEST_CASE("spadl export types and results for M13 events") {
   e.type = EventType::Interception;
   format_spadl_row(row, 256, e, 1);
   REQUIRE(std::strstr(row, ",10,1,0") != nullptr);
+}
+
+TEST_CASE("thumbnail box filter averages each box") {
+  const int w = 1280, h = 720;
+  std::vector<std::uint8_t> src(static_cast<std::size_t>(w) * h * 4);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      std::uint8_t* p = &src[(static_cast<std::size_t>(y) * w + x) * 4];
+      p[0] = static_cast<std::uint8_t>((x & 1) ? 200 : 100);  // columns alternate
+      p[1] = 77;
+      p[2] = static_cast<std::uint8_t>(y < h / 2 ? 0 : 250);
+      p[3] = 0;
+    }
+  auto sc = std::make_unique<ThumbScaler>();
+  REQUIRE(sc->prepare(w, h));
+  REQUIRE_FALSE(ThumbScaler().prepare(320, 180));
+  std::vector<std::uint8_t> dst(kThumbBytes);
+  sc->run(src.data(), static_cast<std::size_t>(w) * 4, dst.data());
+  const std::uint8_t* top = &dst[(10 * kThumbW + 100) * 4];
+  const std::uint8_t* bot = &dst[(260 * kThumbW + 100) * 4];
+  REQUIRE(std::abs(top[0] - 150) <= 34);  // 2 or 3 columns: 133..167
+  REQUIRE(top[1] == 77);
+  REQUIRE(top[2] == 0);
+  REQUIRE(bot[2] == 250);
+  REQUIRE(top[3] == 255);
+}
+
+TEST_CASE("thumb ring keeps the last 150 frames and a clip copies its window") {
+  auto ring = std::make_unique<ThumbRing>();
+  ring->allocate();
+  for (int k = 0; k < 200; ++k) {
+    ThumbMeta m;
+    m.t_s = 0.04f * k;
+    m.dead = k == 120 ? 1 : 0;
+    std::uint8_t* px = ring->begin_write(m);
+    px[0] = static_cast<std::uint8_t>(k);
+    ring->end_write();
+  }
+  ThumbMeta m;
+  REQUIRE_FALSE(ring->read(10, m, nullptr));  // overwritten
+  REQUIRE(ring->read(199, m, nullptr));
+  REQUIRE(std::fabs(m.t_s - 7.96f) < 1e-3f);
+  auto clip = std::make_unique<ClipBuffer>();
+  clip->allocate();
+  ClipReq r;
+  r.t_s = 6.f;  // window 2.0 .. 7.5
+  bool dead_before = false;
+  const int n = copy_clip(*ring, r, *clip, dead_before);
+  REQUIRE(n >= 136);
+  REQUIRE(n <= 139);
+  REQUIRE(clip->meta[0].t_s >= 2.f - 1e-3f);
+  REQUIRE(clip->meta[n - 1].t_s <= 7.5f + 1e-3f);
+  REQUIRE(clip->frame(0)[0] == static_cast<std::uint8_t>(clip->meta[0].t_s / 0.04f + 0.5f));
+  REQUIRE(dead_before);  // frame 120 (4.8 s) was dead, before the event
+  r.t_s = 4.0f;  // the dead frame (4.8 s) is now after the event
+  copy_clip(*ring, r, *clip, dead_before);
+  REQUIRE_FALSE(dead_before);
+}
+
+TEST_CASE("panel flip: moves after react time, holds, then goes home") {
+  PanelFlip f;
+  const bool home_hit[2] = {true, false};
+  const bool clear[2] = {false, false};
+  const bool both[2] = {true, true};
+  std::int64_t t = 0;
+  for (; t < 100; t += 20) f.update(home_hit, t, 2000, 150, 0.02f);
+  REQUIRE(f.side() == 0);  // a pass across the panel is not enough
+  for (; t < 200; t += 20) f.update(home_hit, t, 2000, 150, 0.02f);
+  REQUIRE(f.side() == 1);
+  REQUIRE(f.pos() < 1.f);  // slides
+  const std::int64_t moved = t - 20;
+  // Ball crosses to the mirror side right away: held there.
+  const bool mirror_hit[2] = {false, true};
+  for (; t < moved + 1900; t += 20) f.update(mirror_hit, t, 2000, 150, 0.02f);
+  REQUIRE(f.side() == 1);
+  REQUIRE(f.pos() == 1.f);
+  // After the hold, home is clear: back home.
+  for (; t < moved + 2400; t += 20) f.update(clear, t, 2000, 150, 0.02f);
+  REQUIRE(f.side() == 0);
+  // Both sides covered: stay.
+  for (int k = 0; k < 200; ++k, t += 20) f.update(both, t, 2000, 150, 0.02f);
+  REQUIRE(f.side() == 0);
+  f.force(1);
+  REQUIRE(f.pos() == 1.f);
 }

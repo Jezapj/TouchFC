@@ -14,7 +14,8 @@ struct AppArgs {
   bool pin = false;
   std::string telemetry_path = "telemetry.csv";
   std::string pitch_dump_path;
-  std::string match_spec;  // league:YYYYMMDD:home_id:away_id, as if confirmed in the Match tab  // per-frame homography CSV, for offline checks
+  std::string match_spec;  // league:YYYYMMDD:home_id:away_id, as if confirmed in the Match tab
+  int mini_replay = -1;  // 0 or 1 over the profile, for before/after telemetry
 };
 
 int run_app(const AppArgs& args);

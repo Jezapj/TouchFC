@@ -9,6 +9,8 @@
 
 #include "touchfc/config_json.hpp"
 #include "touchfc/homography.hpp"
+#include "touchfc/mini_replay.hpp"
+#include "touchfc/panel_flip.hpp"
 #include "touchfc/pitch_calib.hpp"
 #include "touchfc/pitch_landmarks.hpp"
 #include "touchfc/play_state.hpp"
@@ -192,6 +194,38 @@ class App {
   std::array<float, 32> last_kp_x_{};
   std::array<float, 32> last_kp_y_{};
   bool debug_reproj_ = false;
+  // M14 panels. Sizes are last frame's, for the flip test.
+  void layout_panels(float ox, float oy, float scale, float cw, float ch);
+  void draw_stats_panel();
+  void draw_card();
+  void draw_replay();
+  PanelFlip flip_stats_, flip_card_, flip_map_;
+  ImVec2 stats_sz_{300.f, 120.f};
+  ImVec2 card_sz_{220.f, 90.f};
+  ImVec2 stats_pos_{}, card_pos_{}, map_pos_{}, replay_pos_{};
+  float hud_h_ = 0.f;
+  TimeNs flip_t_ = 0;
+  TimeNs dead_since_ = 0;
+  float last_poss_spell_s_ = 0.f;
+  std::uint16_t last_holder_passes_ = 0, last_holder_passes_ok_ = 0, last_holder_shots_ = 0;
+  struct TrackLabel {
+    std::uint16_t track = 0;
+    std::uint8_t team = 0;  // 1 A (home), 2 B
+    std::uint8_t idx = 0;   // squad index
+  };
+  TrackLabel labels_[32]{};
+  const TrackLabel* label_of(std::uint16_t track) const {
+    for (const auto& l : labels_)
+      if (l.track == track && track != 0) return &l;
+    return nullptr;
+  }
+  // M15 playback.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> replay_tex_;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> replay_srv_;
+  int replay_clip_ = -1;
+  int replay_frame_ = -1;
+  TimeNs replay_t0_ = 0;
+  ImVec2 replay_sz_{};
   MatchInfo match_{};
   int league_idx_ = 0;
   char date_buf_[9] = "";
@@ -410,6 +444,7 @@ void App::remember(const FrameSlot& slot) {
   last_green_frac_ = slot.green_frac;
   last_view_angle_ = slot.view_angle_deg;
   last_height_frac_ = slot.player_height_frac;
+  if (slot.play_dead && !last_play_dead_) dead_since_ = now_ns();
   last_play_dead_ = slot.play_dead;
   last_play_reasons_ = slot.play_reasons;
   if (!slot.play_dead) {
@@ -466,9 +501,14 @@ void App::remember(const FrameSlot& slot) {
   for (int k = 0; k < 4; ++k) last_bug_roi_[k] = slot.bug_roi[k];
   last_team_stats_ = slot.team_stats;
   last_holder_rating_ = slot.holder_rating;
+  last_poss_spell_s_ = slot.poss_spell_s;
+  last_holder_passes_ = slot.holder_passes;
+  last_holder_passes_ok_ = slot.holder_passes_ok;
+  last_holder_shots_ = slot.holder_shots;
   have_frame_ = true;
   const TimeNs now = now_ns();
   if (pipe_) pipe_->note_present(slot.meta.id, slot.meta.t_capture, now);
+  if (pipe_) pipe_->write_thumb(slot);  // after the latency stamp
 }
 
 void App::imgui_begin(Binding& binding) {
@@ -649,6 +689,7 @@ void App::draw_view() {
         dl->AddText(ImVec2(p.x + 6, p.y + 2), IM_COL32(255, 230, 0, 255), id);
       }
     }
+    layout_panels(ox, oy, scale, cw, ch);
     if (pipe_) minimap_dead_mode_ = pipe_->config().load().minimap_dead_mode;
     const bool dead = last_play_dead_ != 0;
     if (!(dead && minimap_dead_mode_ == static_cast<std::uint8_t>(MinimapDeadMode::Hide))) {
@@ -659,7 +700,7 @@ void App::draw_view() {
       const float iw = mw - 2.f * pad;
       const float ih = iw * 68.f / 105.f;
       const float mh = ih + 2.f * pad;
-      const float mx = 16.f, my = ch - mh - 16.f;
+      const float mx = map_pos_.x, my = map_pos_.y;
       const float ix = mx + pad, iy = my + pad;
       dl->PushClipRect(ImVec2(mx, my), ImVec2(mx + mw, my + mh), true);
       dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
@@ -700,16 +741,11 @@ void App::draw_view() {
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
   if (pipe_)
     if (const MatchInfo* m = pipe_->match_ui().try_read()) match_ = *m;
-  if (match_.teams_ok)
-    ImGui::Text("%s %d - %d %s", match_.team[0].code, match_.team[0].score < 0 ? 0 : match_.team[0].score,
-                match_.team[1].score < 0 ? 0 : match_.team[1].score, match_.team[1].code);
-  {
-    const TeamStats& ts = last_team_stats_;
-    ImGui::TextDisabled("vision estimate");
-    for (int t = 0; t < 2; ++t)
-      ImGui::Text("%s  poss %.0f%%  passes %u/%u (%.0f%%)  shots %u  key %u",
-                  match_.teams_ok ? match_.team[t].code : (t == 0 ? "A" : "B"), ts.poss_pct(t), ts.passes_ok[t],
-                  ts.passes[t], ts.pass_pct(t), ts.shots[t], ts.key_passes[t]);
+  if (pipe_) {
+    if (pipe_->replay_over_budget.load(std::memory_order_relaxed))
+      ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "mini replay paused: over the frame budget");
+    else if (pipe_->config().load().mini_replay)
+      ImGui::Text("mini replay %.2f ms/frame", static_cast<double>(pipe_->thumb_ns.load()) / 1.0e6);
   }
   if (last_play_dead_) {
     char why[64] = "";
@@ -743,12 +779,18 @@ void App::draw_view() {
                 static_cast<unsigned long long>(pipe_->late_frames.load()), pool_->free_approx());
   }
   if (gpu_.warp) ImGui::TextUnformatted("WARP software device");
+  hud_h_ = ImGui::GetWindowSize().y;
   if (last_flags_ & kFlagBlack) ImGui::TextUnformatted("BLACK FRAME (DRM or an empty source)");
   if (overlay) {
     ImGui::TextUnformatted(affinity_ok_ ? "excluded from capture" : "display affinity failed");
     ImGui::TextUnformatted("click-through overlay");
   }
   ImGui::End();
+  if (have_frame_) {
+    draw_stats_panel();
+    draw_card();
+    draw_replay();
+  }
   imgui_end(imgui_target);
 
   if (overlay && view_rtv_ && offscreen_srv_) {
@@ -758,6 +800,273 @@ void App::draw_view() {
     draw_fullscreen(gpu_.context.Get(), premul_pass_, offscreen_srv_.Get(), full);
   }
   view_swap_->Present(1, 0);
+}
+
+namespace {
+constexpr ImGuiWindowFlags kPanelFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+                                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings;
+
+ImU32 team_color(const MatchInfo& m, int t) {
+  if (m.teams_ok && m.team[t].has_color) {
+    const std::uint32_t c = m.team[t].color;
+    return IM_COL32((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff, 255);
+  }
+  return t == 0 ? IM_COL32(40, 140, 255, 255) : IM_COL32(255, 70, 70, 255);
+}
+}  // namespace
+
+// M14: each panel has a home side and flips to the mirror when the ball, the
+// on-ball player or the scorebug sits on it. Top: stats (home right) with the
+// mini replay under it. Bottom: minimap (home left), on-ball card (home right,
+// stacked above the minimap when both share a side).
+void App::layout_panels(float ox, float oy, float scale, float cw, float ch) {
+  const Config cfg = pipe_ ? pipe_->config().load() : Config{};
+  const TimeNs now = now_ns();
+  const float dt = flip_t_ ? static_cast<float>(now - flip_t_) * 1e-9f : 0.f;
+  flip_t_ = now;
+  const float m = 16.f;
+  const float mw = std::clamp(cw * 0.22f, 160.f, 420.f);
+  const float mh = (mw - 16.f) * 68.f / 105.f + 16.f;
+  replay_sz_ = ImVec2(std::clamp(cw * 0.2f, 240.f, 480.f), 0.f);
+  replay_sz_.y = replay_sz_.x * 9.f / 16.f;
+  const bool replay_on = replay_clip_ >= 0;
+  const ImVec2 top(std::max(stats_sz_.x, replay_on ? replay_sz_.x + 16.f : 0.f),
+                   stats_sz_.y + (replay_on ? replay_sz_.y + 40.f : 0.f));
+
+  PanelRect obs[3];
+  int no = 0;
+  auto add = [&](float x, float y, float w, float h) {
+    obs[no++] = {ox + x * scale, oy + y * scale, ox + (x + w) * scale, oy + (y + h) * scale};
+  };
+  int ball = -1;
+  for (std::uint32_t i = 0; i < last_det_count_; ++i)
+    if (last_dets_[i].class_id == 3 && (ball < 0 || last_dets_[i].score > last_dets_[ball].score))
+      ball = static_cast<int>(i);
+  if (ball >= 0) add(last_dets_[ball].x, last_dets_[ball].y, last_dets_[ball].w, last_dets_[ball].h);
+  for (std::uint32_t i = 0; i < last_det_count_ && last_poss_track_; ++i)
+    if (last_dets_[i].track_id == last_poss_track_) {
+      add(last_dets_[i].x, last_dets_[i].y, last_dets_[i].w, last_dets_[i].h);
+      break;
+    }
+  if (last_bug_roi_[2] > 0) add(last_bug_roi_[0], last_bug_roi_[1], last_bug_roi_[2], last_bug_roi_[3]);
+  auto hit = [&](const PanelRect& r) {
+    for (int k = 0; k < no; ++k)
+      if (r.hits(obs[k], cfg.flip_margin_px)) return true;
+    return false;
+  };
+
+  // left: 1 places the panel on the left edge.
+  auto top_rect = [&](int left) {
+    const float x = left ? m : cw - m - top.x;
+    const float y = left ? 8.f + hud_h_ + 8.f : m;
+    return PanelRect{x, y, x + top.x, y + top.y};
+  };
+  auto map_rect = [&](int left) {
+    const float x = left ? m : cw - m - mw;
+    return PanelRect{x, ch - m - mh, x + mw, ch - m};
+  };
+  const int map_left = flip_map_.side() == 0 ? 1 : 0;
+  auto card_rect = [&](int left) {
+    const float x = left ? m : cw - m - card_sz_.x;
+    const float y1 = ch - m - (left == map_left ? mh + 8.f : 0.f);
+    return PanelRect{x, y1 - card_sz_.y, x + card_sz_.x, y1};
+  };
+
+  // home_left: the panel's home is the left edge. Side 0 = home.
+  auto step = [&](PanelFlip& f, int home_left, auto rect, bool active) {
+    if (cfg.panel_side == static_cast<std::uint8_t>(PanelSide::Left)) return f.force(home_left ? 0 : 1);
+    if (cfg.panel_side == static_cast<std::uint8_t>(PanelSide::Right)) return f.force(home_left ? 1 : 0);
+    const bool h[2] = {active && hit(rect(home_left)), active && hit(rect(1 - home_left))};
+    f.update(h, now / 1000000, cfg.flip_hold_ms, cfg.flip_react_ms, dt);
+  };
+  step(flip_stats_, 0, top_rect, true);
+  step(flip_map_, 1, map_rect, true);
+  step(flip_card_, 0, card_rect, last_poss_track_ != 0);
+
+  auto place = [](const PanelFlip& f, int home_left, auto rect) {
+    const PanelRect a = rect(home_left), b = rect(1 - home_left);
+    const float t = f.pos();
+    return ImVec2(a.x0 + (b.x0 - a.x0) * t, a.y0 + (b.y0 - a.y0) * t);
+  };
+  stats_pos_ = place(flip_stats_, 0, top_rect);
+  replay_pos_ = ImVec2(stats_pos_.x, stats_pos_.y + stats_sz_.y + 6.f);
+  map_pos_ = place(flip_map_, 1, map_rect);
+  card_pos_ = place(flip_card_, 0, card_rect);
+}
+
+void App::draw_stats_panel() {
+  const TeamStats& ts = last_team_stats_;
+  ImGui::SetNextWindowPos(stats_pos_, ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.6f);
+  ImGui::Begin("Stats", nullptr, kPanelFlags);
+  const char* code[2] = {match_.teams_ok ? match_.team[0].code : "A", match_.teams_ok ? match_.team[1].code : "B"};
+  if (match_.teams_ok) {
+    ImGui::Text("%s %d - %d %s", code[0], std::max<int>(0, match_.team[0].score), std::max<int>(0, match_.team[1].score),
+                code[1]);
+    if (match_.clock_ms >= 0) {
+      ImGui::SameLine();
+      ImGui::TextDisabled("  %d'", match_.clock_ms / 60000 + 1);
+    }
+  }
+  ImGui::TextDisabled("vision estimate");
+  if (ImGui::BeginTable("stats", 3, ImGuiTableFlags_SizingFixedFit)) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    for (int t = 0; t < 2; ++t) {
+      ImGui::TableNextColumn();
+      ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(team_color(match_, t)), "%s", code[t]);
+    }
+    auto row = [&](const char* name, auto fmt) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(name);
+      for (int t = 0; t < 2; ++t) {
+        ImGui::TableNextColumn();
+        fmt(t);
+      }
+    };
+    row("possession", [&](int t) { ImGui::Text("%.0f%%", ts.poss_pct(t)); });
+    row("passes", [&](int t) { ImGui::Text("%u/%u", ts.passes_ok[t], ts.passes[t]); });
+    row("completion", [&](int t) { ImGui::Text("%.0f%%", ts.pass_pct(t)); });
+    row("shots", [&](int t) { ImGui::Text("%u", ts.shots[t]); });
+    row("key passes", [&](int t) { ImGui::Text("%u", ts.key_passes[t]); });
+    ImGui::EndTable();
+  }
+  // Before kick-off and in a long break (half time): form and absentees.
+  const bool idle = ts.poss_s[0] + ts.poss_s[1] < 1.f || (last_play_dead_ && now_ns() - dead_since_ > 30000000000LL);
+  if (idle && match_.teams_ok) {
+    ImGui::Separator();
+    for (int t = 0; t < 2; ++t) {
+      const TeamInfo& team = match_.team[t];
+      char out[96] = "";
+      int n = 0;
+      for (int i = 0; i < team.n && n < 3; ++i) {
+        if (!team.squad[i].out) continue;
+        std::strncat(out, n ? ", " : "", sizeof(out) - std::strlen(out) - 1);
+        std::strncat(out, team.squad[i].name, sizeof(out) - std::strlen(out) - 1);
+        ++n;
+      }
+      ImGui::Text("%s  form %s", code[t], team.form[0] ? team.form : "-");
+      if (n) ImGui::TextColored(ImVec4(1.f, 0.45f, 0.45f, 1.f), "   out: %s", out);
+    }
+  }
+  stats_sz_ = ImGui::GetWindowSize();
+  ImGui::End();
+}
+
+void App::draw_card() {
+  if (last_poss_track_ == 0 || (last_poss_team_ != 1 && last_poss_team_ != 2)) return;
+  const int t = last_poss_team_ - 1;
+  ImGui::SetNextWindowPos(card_pos_, ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.6f);
+  ImGui::Begin("On ball", nullptr, kPanelFlags);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const float sz = ImGui::GetTextLineHeight();
+  ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + sz, p.y + sz), team_color(match_, t), 2.f);
+  ImGui::Dummy(ImVec2(sz, sz));
+  ImGui::SameLine();
+  const TrackLabel* lb = label_of(last_poss_track_);
+  const PlayerInfo* pl = lb && lb->team == last_poss_team_ ? &match_.team[t].squad[lb->idx] : nullptr;
+  if (pl)
+    ImGui::Text("%u %s", pl->jersey, pl->name);
+  else
+    ImGui::Text("#%u %s", last_poss_track_, match_.teams_ok ? match_.team[t].code : (t == 0 ? "A" : "B"));
+  ImGui::Text("on the ball %.1f s", last_poss_spell_s_);
+  ImGui::Text("TFC %.1f", (pipe_ ? pipe_->config().load().rating_base : 6.f) + last_holder_rating_);
+  if (pl) {
+    ImGui::Text("passes %u/%u   shots %u", last_holder_passes_ok_, last_holder_passes_, last_holder_shots_);
+    ImGui::TextDisabled("season: %u apps  %u G  %u A", pl->apps, pl->goals, pl->assists);
+  }
+  card_sz_ = ImGui::GetWindowSize();
+  ImGui::End();
+}
+
+// M15: play the oldest ready clip at half speed, twice, then fade. A newer
+// clip takes over once the current one has played through once.
+void App::draw_replay() {
+  if (!pipe_) return;
+  constexpr float kFadeS = 0.5f;
+  const bool on = pipe_->config().load().mini_replay != 0;
+  const TimeNs now = now_ns();
+  int next = -1;
+  for (int i = 0; i < 2; ++i)
+    if (i != replay_clip_ && pipe_->clip(i).state.load(std::memory_order_acquire) == ClipState::Ready &&
+        (next < 0 || pipe_->clip(i).seq < pipe_->clip(next).seq))
+      next = i;
+  auto length = [&](const ClipBuffer& c) {
+    return std::max(0.5f, 2.f * (c.meta[c.n - 1].t_s - c.meta[0].t_s));
+  };
+  if (replay_clip_ >= 0) {
+    ClipBuffer& c = pipe_->clip(replay_clip_);
+    const float loops = static_cast<float>(now - replay_t0_) * 1e-9f / length(c);
+    if (!on || (next >= 0 && loops >= 1.f) || loops * length(c) >= 2.f * length(c) + kFadeS) {
+      c.state.store(ClipState::Free, std::memory_order_release);
+      replay_clip_ = -1;
+    }
+  }
+  if (on && replay_clip_ < 0 && next >= 0) {
+    ClipState s = ClipState::Ready;
+    if (pipe_->clip(next).state.compare_exchange_strong(s, ClipState::Playing)) {
+      replay_clip_ = next;
+      replay_t0_ = now;
+      replay_frame_ = -1;
+    }
+  }
+  if (replay_clip_ < 0) return;
+  const ClipBuffer& c = pipe_->clip(replay_clip_);
+  const float len = length(c);
+  const float el = static_cast<float>(now - replay_t0_) * 1e-9f;
+  const float alpha = el < 2.f * len ? 1.f : std::max(0.f, 1.f - (el - 2.f * len) / kFadeS);
+  const float t = c.meta[0].t_s + (el < 2.f * len ? std::fmod(el, len) : len) * 0.5f;
+  int k = 0;
+  while (k + 1 < c.n && c.meta[k + 1].t_s <= t) ++k;
+
+  if (!replay_tex_) {
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = kThumbW;
+    desc.Height = kThumbH;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(gpu_.device->CreateTexture2D(&desc, nullptr, replay_tex_.GetAddressOf()))) return;
+    gpu_.device->CreateShaderResourceView(replay_tex_.Get(), nullptr, replay_srv_.GetAddressOf());
+  }
+  if (k != replay_frame_) {
+    gpu_.context->UpdateSubresource(replay_tex_.Get(), 0, nullptr, c.frame(k), kThumbW * 4, 0);
+    replay_frame_ = k;
+  }
+
+  ImGui::SetNextWindowPos(replay_pos_, ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.6f * alpha);
+  ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+  ImGui::Begin("Mini replay", nullptr, kPanelFlags);
+  const char* what = c.req.kind == 1 ? "shot" : c.req.kind == 0 ? "key pass" : "replay";
+  ImGui::Text("%s   x0.5", what);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::Image(static_cast<ImTextureID>(reinterpret_cast<std::uintptr_t>(replay_srv_.Get())), replay_sz_,
+               ImVec2(0, 0), ImVec2(1, 1), ImVec4(1, 1, 1, alpha), ImVec4(0, 0, 0, 0));
+  const ThumbMeta& fm = c.meta[k];
+  Homography inv;
+  if (c.req.kind != 2 && fm.pitch_valid && fm.src_w && invert3(fm.h, inv.h)) {
+    const float sx = replay_sz_.x / fm.src_w, sy = replay_sz_.y / fm.src_h;
+    float ax, ay, bx, by;
+    if (apply_homography(inv, c.req.sx, c.req.sy, ax, ay) && apply_homography(inv, c.req.ex, c.req.ey, bx, by)) {
+      auto* dl = ImGui::GetWindowDrawList();
+      dl->PushClipRect(p, ImVec2(p.x + replay_sz_.x, p.y + replay_sz_.y), true);
+      const ImU32 col = (team_color(match_, c.req.team == 2 ? 1 : 0) & 0x00FFFFFFu) |
+                        (static_cast<ImU32>(alpha * 230.f) << 24);
+      const ImVec2 a(p.x + ax * sx, p.y + ay * sy), b(p.x + bx * sx, p.y + by * sy);
+      dl->AddLine(a, b, col, 2.5f);
+      dl->AddCircleFilled(b, 4.f, col);
+      dl->PopClipRect();
+    }
+  }
+  ImGui::End();
+  ImGui::PopStyleVar();
 }
 
 void App::refresh_windows() {
@@ -894,6 +1203,11 @@ void App::load_last_profile() {
   if (in >> name && name.size() < sizeof(profile_name_)) {
     std::snprintf(profile_name_, sizeof(profile_name_), "%s", name.c_str());
     profile_msg_ = load_profile(profile_name_) ? "loaded " + name : "could not load " + name;
+  }
+  if (args_.mini_replay >= 0 && pipe_) {
+    Config c = pipe_->config().load();
+    c.mini_replay = args_.mini_replay ? 1 : 0;
+    pipe_->config().store(c);
   }
 }
 
@@ -1148,6 +1462,38 @@ void App::draw_match() {
     }
     ImGui::PopID();
   }
+  ImGui::SeparatorText("On-ball player");
+  if (last_poss_track_ == 0 || (last_poss_team_ != 1 && last_poss_team_ != 2)) {
+    ImGui::TextDisabled("nobody on the ball");
+    return;
+  }
+  const TeamInfo& team = match_.team[last_poss_team_ - 1];
+  const TrackLabel* cur = label_of(last_poss_track_);
+  char preview[48] = "unlabelled";
+  if (cur) std::snprintf(preview, sizeof(preview), "%u %s", team.squad[cur->idx].jersey, team.squad[cur->idx].name);
+  ImGui::Text("#%u (%s)", last_poss_track_, team.code[0] ? team.code : (last_poss_team_ == 1 ? "A" : "B"));
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(220.f);
+  if (ImGui::BeginCombo("##label", preview)) {
+    for (int i = 0; i < team.n; ++i) {
+      char item[48];
+      std::snprintf(item, sizeof(item), "%u %s", team.squad[i].jersey, team.squad[i].name);
+      if (ImGui::Selectable(item, cur && cur->idx == i)) {
+        TrackLabel* slot = nullptr;
+        for (auto& l : labels_)
+          if (l.track == last_poss_track_ || (!slot && l.track == 0)) slot = &l;
+        if (!slot) slot = &labels_[last_poss_track_ % 32];
+        *slot = {last_poss_track_, last_poss_team_, static_cast<std::uint8_t>(i)};
+      }
+    }
+    ImGui::EndCombo();
+  }
+  if (cur) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton("clear label"))
+      for (auto& l : labels_)
+        if (l.track == last_poss_track_) l = {};
+  }
 }
 
 // M13 validation: our team stats beside the provider's post-match numbers.
@@ -1278,6 +1624,12 @@ void App::draw_control() {
           pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
         }
       };
+      if (ImGui::Button("mini replay: last 5 s")) {
+        UiCommand c;
+        c.type = CmdType::TestReplay;
+        push(c);
+      }
+      ImGui::SameLine();
       ImGui::Checkbox("reprojection view", &debug_reproj_);
       ImGui::SameLine();
       ImGui::TextDisabled("magenta = H^-1 lines, yellow = raw keypoints");

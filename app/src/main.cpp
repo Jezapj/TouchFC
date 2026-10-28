@@ -8,14 +8,15 @@ namespace {
 
 void print_usage() {
   std::fputs(
-      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away]\n"
+      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away] [--mini-replay 0|1]\n"
       "  --selftest   synthetic 50 fps clip (default)\n"
       "  --replay     pace a video file through the same pipeline\n"
       "  --overlay    pick a window and draw a click-through capture overlay\n"
       "  --model      YOLOv8 ONNX model; without this a deterministic stub paints boxes\n"
       "  --keypoints  pitch-keypoint ONNX; without it the minimap needs a manual calibration\n"
       "  --seconds    exit after N seconds (useful for a smoke run)\n"
-      "  --pin        pin pipeline threads to one L3 cache\n",
+      "  --pin        pin pipeline threads to one L3 cache\n"
+      "  --mini-replay  0 or 1, over the profile (before/after telemetry)\n",
       stderr);
 }
 
@@ -46,6 +47,8 @@ int main(int argc, char** argv) {
       args.keypoints_path = argv[++i];
     } else if (a == "--match" && i + 1 < argc) {
       args.match_spec = argv[++i];
+    } else if (a == "--mini-replay" && i + 1 < argc) {
+      args.mini_replay = std::atoi(argv[++i]);
     } else if (a == "--pitch-dump" && i + 1 < argc) {
       args.pitch_dump_path = argv[++i];
     } else if (a == "--telemetry" && i + 1 < argc) {

@@ -104,7 +104,8 @@ enum class CmdType : std::uint8_t {
   ResetTracker,
   ResetHomography,
   ApplyAttackDir,
-  SetScorebugRoi  // f[0..3] = x, y, w, h in frame pixels; w = 0 back to auto
+  SetScorebugRoi,  // f[0..3] = x, y, w, h in frame pixels; w = 0 back to auto
+  TestReplay       // mini replay of the last 5.5 s
 };
 
 struct UiCommand {
@@ -179,6 +180,7 @@ struct Config {
   std::uint16_t live_enter_ms = 700;
   std::uint16_t flip_hold_ms = 2000;
   std::uint16_t roi_frames = 75;     // wide frames to find the scorebug
+  std::uint16_t flip_react_ms = 150;  // a panel hit this long moves
   std::uint8_t det_interval = 1;
   std::uint8_t show_boxes = 1;
   std::uint8_t attack_dir = 1;
@@ -191,7 +193,8 @@ struct Config {
   std::uint8_t panel_side = 0;         // PanelSide
   std::uint8_t mini_replay = 1;
   std::uint8_t ball_off_on = 0;      // a lofted ball projects past the lines, so off by default
-  std::uint8_t pad[6]{};
+  std::uint8_t replay_budget_pct = 5;  // mini replay pauses above this % late/dropped; 0 never
+  std::uint8_t pad[3]{};
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };

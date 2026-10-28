@@ -179,6 +179,27 @@ Tests drive passes, an interception, out of play, a shot gathered by the keeper,
 
 Not verified: the validation CSV for a real match. It needs a broadcast replay with `--keypoints --match ...` through enough play for passes to register; expect low pass counts (cuts, replays, ball misses).
 
+## M14 state
+
+| What | Where | Notes |
+|---|---|---|
+| Stats panel | `present.cpp` `draw_stats_panel` | Codes, score and clock from `MatchInfo`; possession, passes, completion, shots, key passes per team in team colours; "vision estimate". Before any in-play time, or after 30 s of dead ball (half time): last-5 form and up to three unavailable players per team. Moved out of the HUD. |
+| On-ball card | `draw_card` | Team colour, track id, time on the ball this spell, TFC rating. With a label (Match tab > On-ball player, a lineup pick for the current holder): shirt number and name, our passes / completion / shots, one season line. Labels are by track id, so a re-acquired track starts unlabelled and its rating starts again. Jersey-number OCR is cut (11.6 stretch). |
+| Ball-avoid flip | [`panel_flip.hpp`](../core/include/touchfc/panel_flip.hpp), `layout_panels` | Stats top (home right) with the mini replay under it; minimap bottom (home left); card bottom (home right, stacked above the minimap when they share a side). Obstacles: ball box, on-ball player box, scorebug ROI, grown by `flip_margin_px`. A hit for `flip_react_ms` (150) moves the panel if the mirror is clear; it holds for `flip_hold_ms` (2 s), then goes home once home has been clear for the react time. Slides over 0.25 s. `panel_side` forces Left / Right. Test drives react, slide, hold, return and the both-sides-covered case. |
+
+Not verified here: the done-when on a broadcast replay (panels never cover the ball longer than the hold, no flicker). The test clips run but I cannot watch the panels; the state machine is covered by the test.
+
+## M15 state
+
+| What | Where | Notes |
+|---|---|---|
+| Thumbnail ring | [`mini_replay.hpp`](../core/include/touchfc/mini_replay.hpp) | 480x270 AVX2 box filter (1.2 ms at 1080p, 0.63 ms at 720p) into a 150-entry ring (6 s at 25 fps; every second frame above 30 fps). Per-entry sequence: the reader drops a frame the writer reached during the copy, so the writer never waits. Written on the present thread, not T3 (see `docs/bench/README.md`: on T3 it doubled the track stage's p99). |
+| Clip capture | `pipeline.cpp` `request_clip`, `services.cpp` `serve_clips` | T3 posts a request for every shot and every key pass (SPSC, drops when full). T7 waits until the ring reaches t + 1.5 s, copies t - 4 s to t + 1.5 s (12 ms) into a free clip, or over one that has not started playing. Skipped when a pre-event frame was a dead ball (a cut or a broadcast replay inside the build-up; no replay classifier exists, so the whole dead state stands in for it), or when the frames cover under 2.5 s of the window (playback is by timestamp, so a 3 fps present rate still plays). |
+| Playback | `present.cpp` `draw_replay` | Oldest ready clip, half speed, two loops, 0.5 s fade; a newer clip takes over after one full play. Pass / shot line drawn from the event's pitch positions through each frame's stored homography. Main tab button "mini replay: last 5 s" plays the last window for a check. |
+| Budget | `write_thumb`, HUD | HUD shows ms per thumbnail. If drops plus late frames exceed `replay_budget_pct` (5%, Tuning > Overlay; 0 never) over a 10 s window, the mini replay pauses for the next window and the HUD says so; it resumes once a window is back under. `--mini-replay 0|1` overrides the profile. |
+
+Telemetry before and after: `docs/bench/README.md` (selftest; no added p99 on T1 to T3). Not verified: a shot on a broadcast replay producing a clip within 2 s (the test clips have no shots); the copy (12 ms) and T7's 50 ms poll put it far inside the limit. The playback window has not been watched here.
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.

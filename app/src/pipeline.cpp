@@ -35,6 +35,10 @@ void Pipeline::start(FrameSource& source, HdrSink& sink, Detector& detector, boo
   t1_done_.store(false, std::memory_order_relaxed);
   t2_done_.store(false, std::memory_order_relaxed);
   t3_done_.store(false, std::memory_order_relaxed);
+  // M15 buffers: ~78 MB ring, two ~73 MB clips. Allocated here, before the threads.
+  thumb_ring_.allocate();
+  for (auto& c : clips_) c.allocate();
+  thumb_scaler_.prepare(static_cast<int>(pool_.width()), static_cast<int>(pool_.height()));
   t1_ = std::thread([this] { run_t1(); });
   t2_ = std::thread([this] { run_t2(); });
   t3_ = std::thread([this] { run_t3(); });
@@ -59,6 +63,9 @@ void Pipeline::join() {
   if (t2_.joinable()) t2_.join();
   if (t3_.joinable()) t3_.join();
   if (t6_.joinable()) t6_.join();
+  if (thumb_ring_.written())
+    log_line("mini replay: " + std::to_string(thumb_ring_.written()) + " thumbnails, " +
+             std::to_string(static_cast<double>(thumb_ns.load()) / 1.0e6) + " ms each");
   drain_ring(to_infer_);
   drain_ring(to_track_);
   drain_ring(to_present_);
@@ -304,17 +311,28 @@ void Pipeline::update_possession(FrameSlot& slot) {
     const float dt = last_event_t_s_ >= 0.f ? play_t_s_ - last_event_t_s_ : 0.f;
     last_event_t_s_ = play_t_s_;
     Event evs[4];
+    const int key_before = events_.team_stats().key_passes[0] + events_.team_stats().key_passes[1];
     const int n = events_.step(f, dt, evs, ep);
-    for (int k = 0; k < n; ++k) log_event(evs[k]);
+    const bool key = events_.team_stats().key_passes[0] + events_.team_stats().key_passes[1] != key_before;
+    for (int k = 0; k < n; ++k) {
+      log_event(evs[k]);
+      if (evs[k].type == EventType::Shot) request_clip(play_t_s_, &evs[k], 1);
+      else if (key && evs[k].type == EventType::Pass && evs[k].result == EventResult::Success)
+        request_clip(play_t_s_, &evs[k], 0);
+    }
   }
   slot.team_stats = events_.team_stats();
   const TrackStats* hs = slot.poss_track ? events_.track(slot.poss_track) : nullptr;
   slot.holder_rating = hs ? hs->rating : 0.f;
+  slot.holder_passes = hs ? hs->passes : 0;
+  slot.holder_passes_ok = hs ? hs->passes_ok : 0;
+  slot.holder_shots = hs ? hs->shots : 0;
   slot.ball_ok = have ? 1 : 0;
   slot.ball_x = bx;
   slot.ball_y = by;
   slot.poss_team = poss_.held ? poss_.team : 0;
   slot.poss_track = poss_.held ? poss_.track : 0;
+  slot.poss_spell_s = poss_.held ? static_cast<float>(last_track_t_ns_ - poss_.start_ns) * 1e-9f : 0.f;
 }
 
 void Pipeline::write_spadl(const char* path) const {
@@ -472,6 +490,61 @@ void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
       if (t.id == id) slot.det_team[i] = t.class_id == 3 ? 0 : t.team;
   }
   update_possession(slot);
+}
+
+// M15: a thumbnail per presented frame (every second one above 30 fps) into
+// the ring. Runs on the present thread, the ring's only writer, so T1 to T3 do
+// not pay for it. Pauses the mini replay for the next 10 s window when more
+// than replay_budget_pct of frames were late or dropped (0: never).
+void Pipeline::write_thumb(const FrameSlot& slot) {
+  const Config cfg = config_.load();
+  ++frames_;
+  const TimeNs now = now_ns();
+  if (budget_t_ == 0) budget_t_ = now;
+  if (!cfg.replay_budget_pct) replay_over_budget.store(false, std::memory_order_relaxed);
+  if (now - budget_t_ >= 10000000000LL) {
+    const std::uint64_t late = drops.load(std::memory_order_relaxed) + late_frames.load(std::memory_order_relaxed);
+    const std::uint64_t df = frames_ - budget_frames_;
+    const bool over = cfg.mini_replay && cfg.replay_budget_pct && df > 0 &&
+                      (late - budget_late_) * 100 > df * cfg.replay_budget_pct;
+    if (replay_over_budget.exchange(over, std::memory_order_relaxed) != over)
+      log_line(over ? "mini replay paused: over the frame budget" : "mini replay resumed");
+    budget_t_ = now;
+    budget_frames_ = frames_;
+    budget_late_ = late;
+  }
+  if (!cfg.mini_replay || replay_over_budget.load(std::memory_order_relaxed) || !thumb_scaler_.ready() ||
+      !thumb_ring_.allocated() || slot.play_t_s - last_thumb_t_ < 0.038f)
+    return;
+  last_thumb_t_ = slot.play_t_s;
+  ThumbMeta m;
+  m.t_s = slot.play_t_s;
+  m.src_w = static_cast<std::uint16_t>(slot.meta.width);
+  m.src_h = static_cast<std::uint16_t>(slot.meta.height);
+  m.pitch_valid = slot.pitch_valid;
+  m.dead = slot.play_dead;
+  for (int k = 0; k < 9; ++k) m.h[k] = slot.pitch_h[static_cast<std::size_t>(k)];
+  thumb_scaler_.run(slot.bgra.get(), slot.stride, thumb_ring_.begin_write(m));
+  thumb_ring_.end_write();
+  const std::int64_t dt = now_ns() - now;
+  const std::int64_t ema = thumb_ns.load(std::memory_order_relaxed);
+  thumb_ns.store(ema == 0 ? dt : ema + (dt - ema) / 16, std::memory_order_relaxed);
+}
+
+void Pipeline::request_clip(float t_s, const Event* e, std::uint8_t kind) noexcept {
+  const Config cfg = config_.load();
+  if (!cfg.mini_replay || replay_over_budget.load(std::memory_order_relaxed)) return;
+  ClipReq r;
+  r.t_s = t_s;
+  r.kind = kind;
+  if (e) {
+    r.sx = e->sx;
+    r.sy = e->sy;
+    r.ex = e->ex;
+    r.ey = e->ey;
+    r.team = e->team;
+  }
+  clip_req_.try_push(r);  // full: the clip is skipped
 }
 
 void Pipeline::set_anchor(const UiCommand& command) {
@@ -660,6 +733,7 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
   const std::int64_t t_gate = live_ ? now : slot.meta.pts_ns;
   if (t_gate0_ < 0) t_gate0_ = t_gate;
   play_t_s_ = static_cast<float>(t_gate - t_gate0_) * 1e-9f;
+  slot.play_t_s = play_t_s_;
   if (play_.update(t_gate, avail, dead, cfg.dead_enter_ms, cfg.live_enter_ms)) {
     play_dead_ = play_.state() == PlayState::Dead;
     if (poss_t0_ == 0) poss_t0_ = now;
@@ -673,7 +747,10 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
       ep.rating_loss_base = cfg.rating_loss_base;
       ep.rating_shot = cfg.rating_shot;
       const int n = events_.stop(play_t_s_, evs, ep);
-      for (int k = 0; k < n; ++k) log_event(evs[k]);
+      for (int k = 0; k < n; ++k) {
+        log_event(evs[k]);
+        if (evs[k].type == EventType::Shot) request_clip(play_t_s_, &evs[k], 1);  // shot ending in a dead ball
+      }
       last_event_t_s_ = -1.f;
       dead_start_ns_ = now;
     } else {
@@ -805,6 +882,8 @@ void Pipeline::run_t3() {
       } else if (command.type == CmdType::SetScorebugRoi) {
         for (int k = 0; k < 4; ++k) manual_roi_[k] = static_cast<std::int32_t>(command.f[k]);
         if (manual_roi_[2] <= 0) roi_finder_.reset();
+      } else if (command.type == CmdType::TestReplay) {
+        request_clip(play_t_s_ - kClipAfterS, nullptr, 2);
       } else if (command.type == CmdType::SetAnchor) {
         set_anchor(command);
       } else if (command.type == CmdType::ResetHomography) {

@@ -73,3 +73,24 @@ Under 5% of the 20 ms budget at 50 fps. If T3 p99 needs it, the reduce (strided 
 | `BM_LineRefine` | 0.10 ms (0.15 ms wall while a replay shared the CPU) |
 
 It runs on T3 every `line_interval` wide frames (default 2), and once per keypoint run to snap and score the keypoint fit.
+
+
+## Mini replay (M15)
+
+`BM_ThumbScale`: BGRA box filter to 480x270 (rows summed in 16-bit AVX2 lanes, columns as packed 64-bit adds). `BM_ClipCopy`: a 5.5 s window (138 thumbnails, ~71 MB) copied out of the ring.
+
+| Benchmark | Time per call |
+|---|---|
+| `BM_ThumbScale` 1920x1080 | 1.2 ms |
+| `BM_ThumbScale` 1280x720 | 0.63 ms |
+| `BM_ClipCopy` | 12 ms |
+
+The thumbnail first ran on T3 and doubled the track stage on the frames it stored (selftest, 1280x720, 20 s: p50 0.54 -> 1.0 ms, p99 1.1 -> 2.3 ms). It now runs on the present thread, after the latency stamp, which already holds the frame for upload. Telemetry, `--selftest --seconds 20`, three runs each, `--mini-replay 1` vs `0` (~500 thumbnails per run at 0.7-0.8 ms):
+
+| Stage p99 (ms) | on | off |
+|---|---|---|
+| preprocess (T1) | 1.07 / 1.14 / 1.16 | 1.14 / 1.47 / 1.42 |
+| inference (T2, stub) | 0.15 / 0.16 / 0.17 | 0.17 / 0.17 / 0.23 |
+| track (T3) | 1.08 / 1.15 / 1.17 | 1.09 / 1.06 / 1.09 |
+
+No added p99 on T1 to T3. Present latency in the selftest is set by its pacing and moves 10-50 ms between runs either way, so it is not compared. The clip copy runs on T7, which polls every 50 ms, so a clip is ready well inside 2 s of its window's end. Memory: ring 78 MB plus two clips of 73 MB, allocated in `Pipeline::start`.

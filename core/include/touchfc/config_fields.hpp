@@ -106,8 +106,10 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(panel_side, Overlay, "panel side (auto/left/right)", 0, 2),
     TOUCHFC_CFG(flip_margin_px, Overlay, "flip margin px", 0.f, 200.f),
     TOUCHFC_CFG(flip_hold_ms, Overlay, "flip hold ms", 100, 10000),
+    TOUCHFC_CFG(flip_react_ms, Overlay, "flip react ms", 0, 2000),
     TOUCHFC_CFG(minimap_dead_mode, Overlay, "dead ball minimap (freeze/hide)", 0, 1),
     TOUCHFC_CFG(mini_replay, Overlay, "mini replay", 0, 1),
+    TOUCHFC_CFG(replay_budget_pct, Overlay, "mini replay budget % (0 off)", 0, 100),
 
     TOUCHFC_CFG(version, Hidden, "version", 0, 0),
     TOUCHFC_CFG(layers, Hidden, "layers", 0, 0),

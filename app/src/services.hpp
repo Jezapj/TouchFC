@@ -2,6 +2,7 @@
 
 #include "touchfc/espn.hpp"
 #include "touchfc/match_info.hpp"
+#include "touchfc/mini_replay.hpp"
 #include "touchfc/scorebug.hpp"
 
 #include <atomic>
@@ -53,6 +54,7 @@ class Services {
   void fetch_summary(bool fresh);
   void on_read(const char* text);
   void publish();
+  void serve_clips();
   void status(const std::string& s);
 
   Pipeline& pipe_;
@@ -69,6 +71,9 @@ class Services {
   nlohmann::json overrides_;
   ScorebugVote vote_;
   std::string last_unparsed_;
+  ClipReq clip_wait_[4]{};  // requests waiting for t + 1.5 s to reach the ring
+  int clip_wait_n_ = 0;
+  std::uint64_t clip_seq_ = 0;
 };
 
 }  // namespace touchfc

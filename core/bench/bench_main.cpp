@@ -1,3 +1,4 @@
+#include "touchfc/mini_replay.hpp"
 #include "touchfc/arena.hpp"
 #include "touchfc/cpu.hpp"
 #include "touchfc/image_gmc.hpp"
@@ -364,6 +365,40 @@ static void BM_LineRefine(benchmark::State& state) {
   }
 }
 BENCHMARK(BM_LineRefine)->Unit(benchmark::kMicrosecond)->MinTime(0.3);
+
+// M15 thumbnail on T3: 1920x1080 BGRA -> 480x270 box filter.
+static void BM_ThumbScale(benchmark::State& state) {
+  const int w = static_cast<int>(state.range(0)), h = static_cast<int>(state.range(1));
+  std::vector<std::uint8_t> src(static_cast<std::size_t>(w) * h * 4);
+  for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::uint8_t>(i * 2654435761u >> 24);
+  auto sc = std::make_unique<ThumbScaler>();
+  sc->prepare(w, h);
+  std::vector<std::uint8_t> dst(kThumbBytes);
+  for (auto _ : state) {
+    sc->run(src.data(), static_cast<std::size_t>(w) * 4, dst.data());
+    benchmark::DoNotOptimize(dst.data());
+  }
+}
+BENCHMARK(BM_ThumbScale)->Args({1920, 1080})->Args({1280, 720})->Unit(benchmark::kMicrosecond)->MinTime(0.3);
+
+// M15 clip copy on T7: a 5.5 s window (138 thumbnails, ~71 MB) out of the ring.
+static void BM_ClipCopy(benchmark::State& state) {
+  auto ring = std::make_unique<ThumbRing>();
+  ring->allocate();
+  for (int k = 0; k < kThumbRing; ++k) {
+    ThumbMeta m;
+    m.t_s = 0.04f * k;
+    std::memset(ring->begin_write(m), k, kThumbBytes);
+    ring->end_write();
+  }
+  auto clip = std::make_unique<ClipBuffer>();
+  clip->allocate();
+  ClipReq r;
+  r.t_s = 0.04f * (kThumbRing - 1) - kClipAfterS;
+  bool dead = false;
+  for (auto _ : state) benchmark::DoNotOptimize(copy_clip(*ring, r, *clip, dead));
+}
+BENCHMARK(BM_ClipCopy)->Unit(benchmark::kMillisecond)->MinTime(0.3);
 
 int main(int argc, char** argv) {
   std::fprintf(stderr, "touchfc bench  clock=steady_clock\n");
