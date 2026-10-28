@@ -260,6 +260,56 @@ void Pipeline::update_possession(FrameSlot& slot) {
   const float dist = track != 0 ? std::sqrt(best_d) : 99.f;
   const PossOut out = step_possession(poss_, have, bx, by, track, team, dist, limit, last_track_t_ns_, poss_t0_);
   if (out.emitted) log_event(out.event);
+
+  // M13 events. The holder must be within poss_dist_m; pressure is the
+  // nearest opponent to the holder.
+  if (!play_dead_) {
+    EventParams ep;
+    ep.pass_min_dist_m = cfg.pass_min_dist_m;
+    ep.ball_flight_min_mps = cfg.ball_flight_min_mps;
+    ep.shot_speed_mps = cfg.shot_speed_mps;
+    ep.shot_zone_m = cfg.shot_zone_m;
+    ep.key_pass_window_s = cfg.key_pass_window_s;
+    ep.attack_dir = attack_dir.load(std::memory_order_relaxed);
+    ep.rating_pass_k = cfg.rating_pass_k;
+    ep.rating_press_mult = cfg.rating_press_mult;
+    ep.rating_press_m = cfg.rating_press_m;
+    ep.rating_pass_floor = cfg.rating_pass_floor;
+    ep.rating_loss_k = cfg.rating_loss_k;
+    ep.rating_loss_base = cfg.rating_loss_base;
+    ep.rating_int = cfg.rating_int;
+    ep.rating_shot = cfg.rating_shot;
+    ep.rating_goal = cfg.rating_goal;
+    EventFrame f;
+    f.t_s = play_t_s_;
+    f.ball = have;
+    f.bx = bx;
+    f.by = by;
+    f.poss_dist_m = limit;
+    f.nearest_m = track != 0 ? std::sqrt(best_d) : 99.f;
+    if (f.nearest_m <= limit) {
+      f.holder = track;
+      f.team = team;
+      float hx = 0.f, hy = 0.f;
+      for (std::uint32_t i = 0; i < slot.det_count; ++i)
+        if (slot.dets[i].track_id == track) {
+          hx = slot.pitch_x[i];
+          hy = slot.pitch_y[i];
+        }
+      for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+        if (!slot.pitch_ok[i] || slot.det_team[i] == 0 || slot.det_team[i] == team) continue;
+        f.opp_dist_m = std::fmin(f.opp_dist_m, std::hypot(slot.pitch_x[i] - hx, slot.pitch_y[i] - hy));
+      }
+    }
+    const float dt = last_event_t_s_ >= 0.f ? play_t_s_ - last_event_t_s_ : 0.f;
+    last_event_t_s_ = play_t_s_;
+    Event evs[4];
+    const int n = events_.step(f, dt, evs, ep);
+    for (int k = 0; k < n; ++k) log_event(evs[k]);
+  }
+  slot.team_stats = events_.team_stats();
+  const TrackStats* hs = slot.poss_track ? events_.track(slot.poss_track) : nullptr;
+  slot.holder_rating = hs ? hs->rating : 0.f;
   slot.ball_ok = have ? 1 : 0;
   slot.ball_x = bx;
   slot.ball_y = by;
@@ -593,7 +643,9 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
     if (slot.player_height_frac > cfg.player_height_max_frac) dead |= kSigSize;
   }
 
-  if (slot.pitch_valid && ball >= 0) {
+  // A ball in the air projects through the ground plane past its real spot,
+  // so this signal fires on high balls; opt-in.
+  if (cfg.ball_off_on && slot.pitch_valid && ball >= 0) {
     const Detection& b = slot.dets[static_cast<std::uint32_t>(ball)];
     float X, Y;
     if (apply_homography(calib_.current(), b.x + 0.5f * b.w, b.y + b.h, X, Y)) {
@@ -606,10 +658,23 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
   // time) and on the track clock live. Event times stay on the track clock.
   const std::int64_t now = last_track_t_ns_;
   const std::int64_t t_gate = live_ ? now : slot.meta.pts_ns;
+  if (t_gate0_ < 0) t_gate0_ = t_gate;
+  play_t_s_ = static_cast<float>(t_gate - t_gate0_) * 1e-9f;
   if (play_.update(t_gate, avail, dead, cfg.dead_enter_ms, cfg.live_enter_ms)) {
     play_dead_ = play_.state() == PlayState::Dead;
     if (poss_t0_ == 0) poss_t0_ = now;
     if (play_dead_) {
+      // A kicked ball that goes dead is an incomplete pass, or a shot.
+      Event evs[4];
+      EventParams ep;
+      ep.pass_min_dist_m = cfg.pass_min_dist_m;
+      ep.attack_dir = attack_dir.load(std::memory_order_relaxed);
+      ep.rating_loss_k = cfg.rating_loss_k;
+      ep.rating_loss_base = cfg.rating_loss_base;
+      ep.rating_shot = cfg.rating_shot;
+      const int n = events_.stop(play_t_s_, evs, ep);
+      for (int k = 0; k < n; ++k) log_event(evs[k]);
+      last_event_t_s_ = -1.f;
       dead_start_ns_ = now;
     } else {
       Event e{};
@@ -625,6 +690,107 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
   slot.play_reasons = play_.reasons();
 }
 
+// Provider kit colours seed team A (home) and B (away) when no click seed is
+// set, but only when each sits near a cluster of tracked players: the listed
+// colour is the club colour, not necessarily the kit worn today.
+void Pipeline::seed_kits(const Config& cfg) {
+  if (seed_ok_[0] || seed_ok_[1]) return;
+  Lab best[2];
+  for (int s = 0; s < 2; ++s) {
+    const TeamInfo& t = match_.team[s];
+    if (!t.has_color) return;
+    int best_n = 0;
+    for (const std::uint32_t c : {t.color, t.alt_color}) {
+      if (c == 0) continue;
+      const Lab lab = rgb_to_lab(static_cast<std::uint8_t>(c >> 16), static_cast<std::uint8_t>(c >> 8),
+                                 static_cast<std::uint8_t>(c));
+      int n = 0;
+      for (const auto& tr : tracker_.tracks)
+        if (tr.id != 0 && tr.class_id <= 1 && tr.hits > 1 && lab_dist(tr.lab, lab) <= cfg.kit_seed_max_dist) ++n;
+      if (n > best_n) {
+        best_n = n;
+        best[s] = lab;
+      }
+    }
+    if (best_n < 3) return;
+  }
+  if (lab_dist(best[0], best[1]) <= cfg.kit_seed_max_dist) return;  // too alike to split the teams
+  seed_[0] = best[0];
+  seed_[1] = best[1];
+  seed_ok_[0] = seed_ok_[1] = true;
+  log_line("team colours seeded from the provider");
+}
+
+// M12 on T3: find the scorebug, hand crops to T7 for OCR (1 Hz until the
+// teams are known, then every 10 s), read MatchInfo back, log goals, seed kits.
+void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
+  if (const MatchInfo* m = match_t3_.try_read()) {
+    match_ = *m;
+    for (int s = 0; s < 2; ++s) {
+      const std::int16_t sc = match_.team[s].score;
+      if (last_score_[s] >= 0 && sc > last_score_[s]) {
+        Event e{};
+        e.type = EventType::Goal;
+        e.status = EventStatus::Confirmed;
+        e.team = static_cast<std::uint8_t>(s + 1);
+        e.match_ms_start = e.match_ms_end = static_cast<std::int32_t>(play_t_s_ * 1000.f);
+        // The scoring team's last shot within 15 s becomes a goal in the log.
+        for (int k = poss_n_ - 1; k >= 0; --k) {
+          Event& sh = poss_events_[k];
+          if (e.match_ms_end - sh.match_ms_end > 15000) break;
+          if (sh.type == EventType::Shot && sh.team == e.team) {
+            sh.result = EventResult::Goal;
+            break;
+          }
+        }
+        log_event(e);
+        EventParams ep;
+        ep.rating_goal = cfg.rating_goal;
+        events_.goal(play_t_s_, ep);
+      }
+      if (sc >= 0) last_score_[s] = sc;
+    }
+  }
+  seed_kits(cfg);
+
+  const int W = static_cast<int>(slot.meta.width), H = static_cast<int>(slot.meta.height);
+  const std::int32_t* roi = manual_roi_;
+  if (manual_roi_[2] <= 0) {
+    if (!roi_finder_.done() && slot.scene == static_cast<std::uint8_t>(Scene::Wide))
+      roi_finder_.add(slot.bgra.get(), W, H, static_cast<int>(slot.stride), cfg.roi_frames, cfg.roi_stable_max,
+                      cfg.roi_contrast_min);
+    roi = roi_finder_.done() ? roi_finder_.roi() : nullptr;
+    if (roi && !roi_logged_) {
+      roi_logged_ = true;
+      log_line("scorebug at " + std::to_string(roi[0]) + "," + std::to_string(roi[1]) + " " +
+               std::to_string(roi[2]) + "x" + std::to_string(roi[3]));
+    }
+  }
+  for (int k = 0; k < 4; ++k) slot.bug_roi[k] = static_cast<std::int16_t>(roi ? roi[k] : 0);
+  if (!roi || roi[2] <= 0 || roi[3] <= 0) return;
+
+  const TimeNs now = last_track_t_ns_;
+  const TimeNs every = match_.teams_ok ? 10000000000LL : 1000000000LL;
+  if (now - last_ocr_ns_ < every) return;
+  for (std::uint32_t i = 0; i < 2; ++i) {
+    OcrCrop& c = crops_[i];
+    if (c.busy.load(std::memory_order_acquire)) continue;
+    const int x0 = std::clamp(static_cast<int>(roi[0]), 0, W - 1);
+    const int y0 = std::clamp(static_cast<int>(roi[1]), 0, H - 1);
+    c.w = std::min({static_cast<int>(roi[2]), W - x0, OcrCrop::kMaxW});
+    c.h = std::min({static_cast<int>(roi[3]), H - y0, OcrCrop::kMaxH});
+    for (int k = 0; k < 4; ++k) c.roi[k] = roi[k];
+    for (int y = 0; y < c.h; ++y)
+      std::memcpy(c.px.get() + static_cast<std::size_t>(y) * static_cast<std::size_t>(c.w) * 4,
+                  slot.bgra.get() + static_cast<std::size_t>(y0 + y) * slot.stride + static_cast<std::size_t>(x0) * 4,
+                  static_cast<std::size_t>(c.w) * 4);
+    c.busy.store(true, std::memory_order_release);
+    if (!ocr_req_.try_push(i)) c.busy.store(false, std::memory_order_release);
+    last_ocr_ns_ = now;
+    break;
+  }
+}
+
 void Pipeline::run_t3() {
   if (pin_) pin_current_thread_to_one_ccd();
   set_pipeline_thread();
@@ -636,6 +802,9 @@ void Pipeline::run_t3() {
       } else if (command.type == CmdType::SetTeamSeed && (command.u8a == 1 || command.u8a == 2)) {
         seed_req_id_ = command.u16a;
         seed_req_team_ = command.u8a;
+      } else if (command.type == CmdType::SetScorebugRoi) {
+        for (int k = 0; k < 4; ++k) manual_roi_[k] = static_cast<std::int32_t>(command.f[k]);
+        if (manual_roi_[2] <= 0) roi_finder_.reset();
       } else if (command.type == CmdType::SetAnchor) {
         set_anchor(command);
       } else if (command.type == CmdType::ResetHomography) {
@@ -690,6 +859,7 @@ void Pipeline::run_t3() {
     }
     update_pitch(slot, cfg);
     update_play(slot, cfg);
+    update_match(slot, cfg);
     assign_teams(slot, cfg);
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;

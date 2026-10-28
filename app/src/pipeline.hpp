@@ -11,6 +11,9 @@
 #include "touchfc/line_fit.hpp"
 #include "touchfc/pitch_calib.hpp"
 #include "touchfc/play_state.hpp"
+#include "touchfc/events.hpp"
+#include "touchfc/match_info.hpp"
+#include "touchfc/scorebug.hpp"
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/possession.hpp"
 #include "touchfc/scene.hpp"
@@ -28,6 +31,18 @@
 #include <thread>
 
 namespace touchfc {
+
+// A scorebug crop handed from T3 to T7 for OCR. T3 fills it only when not
+// busy; T7 clears busy when done. Preallocated.
+struct OcrCrop {
+  static constexpr int kMaxW = 960;
+  static constexpr int kMaxH = 240;
+  std::atomic<bool> busy{false};
+  int w = 0;
+  int h = 0;
+  std::int32_t roi[4]{};
+  std::unique_ptr<std::uint8_t[]> px{new std::uint8_t[kMaxW * kMaxH * 4]};
+};
 
 // T1 preprocess, T2 inference (pass-through in M1), T3 track/overlay, T6 telemetry.
 // The present/UI thread is the caller, not owned here.
@@ -54,6 +69,12 @@ class Pipeline {
   TripleBuffer<OverlayState>& overlay() noexcept { return overlay_; }
   TripleBuffer<UiSnapshot>& ui() noexcept { return ui_; }
   BlockingSpsc<UiCommand, 64>& commands() noexcept { return commands_; }
+  BlockingSpsc<std::uint32_t, 4>& ocr_requests() noexcept { return ocr_req_; }
+  OcrCrop& ocr_crop(std::uint32_t i) noexcept { return crops_[i & 1]; }
+  TripleBuffer<MatchInfo>& match_t3() noexcept { return match_t3_; }
+  TripleBuffer<MatchInfo>& match_ui() noexcept { return match_ui_; }
+  // After join(): the final vision stats.
+  const TeamStats& team_stats() const noexcept { return events_.team_stats(); }
 
   void note_present(FrameId frame, TimeNs capture, TimeNs present) noexcept {
     note(3, frame, Stage::Present, capture, present);
@@ -125,6 +146,22 @@ class Pipeline {
   std::uint32_t gmc_n_ = 0;
   void update_pitch(FrameSlot& slot, const Config& cfg);
   void update_play(FrameSlot& slot, const Config& cfg);
+  void update_match(FrameSlot& slot, const Config& cfg);
+  void seed_kits(const Config& cfg);
+  OcrCrop crops_[2]{};
+  BlockingSpsc<std::uint32_t, 4> ocr_req_{};
+  TripleBuffer<MatchInfo> match_t3_{};
+  TripleBuffer<MatchInfo> match_ui_{};
+  MatchInfo match_{};
+  ScorebugRoiFinder roi_finder_{};
+  bool roi_logged_ = false;
+  std::int32_t manual_roi_[4]{};
+  TimeNs last_ocr_ns_ = 0;
+  std::int16_t last_score_[2] = {-1, -1};
+  EventDetector events_{};
+  float play_t_s_ = 0.f;
+  float last_event_t_s_ = -1.f;
+  std::int64_t t_gate0_ = -1;
   void log_event(const Event& e) noexcept;
   PlayGate play_{};
   bool play_dead_ = false;

@@ -3,6 +3,7 @@
 #include "d3d_util.hpp"
 #include "log.hpp"
 #include "pipeline.hpp"
+#include "services.hpp"
 #include "threads_win.hpp"
 #include "win_time.hpp"
 
@@ -25,6 +26,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -100,7 +102,12 @@ struct ListedWindow {
 
 class App {
  public:
-  explicit App(const AppArgs& args) : args_(args) {}
+  explicit App(const AppArgs& args) : args_(args) {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_s(&tm, &t);
+    std::strftime(date_buf_, sizeof(date_buf_), "%Y%m%d", &tm);
+  }
   int run();
 
   void on_view_resize() { view_dirty_ = true; }
@@ -117,6 +124,9 @@ class App {
   void draw_view();
   void draw_control();
   void draw_tuning(Config& cfg);
+  void draw_match();
+  void write_validation();
+  void start_services();
   bool live_value(const char* key, char* buf, int n) const;
   bool load_profile(const char* name);
   void load_last_profile();
@@ -182,6 +192,20 @@ class App {
   std::array<float, 32> last_kp_x_{};
   std::array<float, 32> last_kp_y_{};
   bool debug_reproj_ = false;
+  MatchInfo match_{};
+  int league_idx_ = 0;
+  char date_buf_[9] = "";
+  char team_filter_[2][32]{};
+  std::uint32_t pick_id_[2]{};
+  int sub_off_[2] = {-1, -1};
+  int sub_on_[2] = {-1, -1};
+  bool roi_drag_ = false;
+  bool roi_manual_ = false;
+  bool dragging_ = false;
+  ImVec2 drag_a_{};
+  std::int16_t last_bug_roi_[4]{};
+  TeamStats last_team_stats_{};
+  float last_holder_rating_ = 0.f;
   char profile_name_[48] = "default";
   std::string profile_msg_;
   float last_green_frac_ = 0.f;
@@ -234,6 +258,7 @@ class App {
   std::unique_ptr<Detector> detector_;
   std::unique_ptr<PitchModel> pitch_;
   std::unique_ptr<Pipeline> pipe_;
+  std::unique_ptr<Services> services_;
 };
 
 App* g_app = nullptr;
@@ -438,6 +463,9 @@ void App::remember(const FrameSlot& slot) {
   last_ball_y_ = slot.ball_y;
   last_poss_team_ = slot.poss_team;
   last_poss_track_ = slot.poss_track;
+  for (int k = 0; k < 4; ++k) last_bug_roi_[k] = slot.bug_roi[k];
+  last_team_stats_ = slot.team_stats;
+  last_holder_rating_ = slot.holder_rating;
   have_frame_ = true;
   const TimeNs now = now_ns();
   if (pipe_) pipe_->note_present(slot.meta.id, slot.meta.t_capture, now);
@@ -670,6 +698,19 @@ void App::draw_view() {
   const double p99 = pipe_ ? static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6 : 0;
   ImGui::Text("capture-to-present-call  p50 %.2f ms   p99 %.2f ms", p50, p99);
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
+  if (pipe_)
+    if (const MatchInfo* m = pipe_->match_ui().try_read()) match_ = *m;
+  if (match_.teams_ok)
+    ImGui::Text("%s %d - %d %s", match_.team[0].code, match_.team[0].score < 0 ? 0 : match_.team[0].score,
+                match_.team[1].score < 0 ? 0 : match_.team[1].score, match_.team[1].code);
+  {
+    const TeamStats& ts = last_team_stats_;
+    ImGui::TextDisabled("vision estimate");
+    for (int t = 0; t < 2; ++t)
+      ImGui::Text("%s  poss %.0f%%  passes %u/%u (%.0f%%)  shots %u  key %u",
+                  match_.teams_ok ? match_.team[t].code : (t == 0 ? "A" : "B"), ts.poss_pct(t), ts.passes_ok[t],
+                  ts.passes[t], ts.pass_pct(t), ts.shots[t], ts.key_passes[t]);
+  }
   if (last_play_dead_) {
     char why[64] = "";
     for (int k = 0; k < kPlaySignals; ++k)
@@ -689,7 +730,9 @@ void App::draw_view() {
   }
   if (last_pitch_valid_) {
     if (last_pc_valid_) ImGui::Text("territory A %.0f%%", last_territory_ * 100.f);
-    if (last_poss_team_ != 0) ImGui::Text("possession %s #%u", last_poss_team_ == 1 ? "A" : "B", last_poss_track_);
+    if (last_poss_team_ != 0)
+      ImGui::Text("possession %s #%u   TFC %.1f", last_poss_team_ == 1 ? "A" : "B", last_poss_track_,
+                  (pipe_ ? pipe_->config().load().rating_base : 6.f) + last_holder_rating_);
     else if (last_ball_ok_) ImGui::TextUnformatted("ball seen, no holder");
   }
   if (pipe_) {
@@ -772,10 +815,12 @@ bool App::start_overlay_capture() {
   sink_ = std::make_unique<HdrSink>();
   detector_ = make_detector();
   if (!detector_) return false;
+  services_.reset();
   pipe_.reset();
   pitch_ = make_pitch();
   pipe_ = std::make_unique<Pipeline>(*pool_);
   pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
+  start_services();
   load_last_profile();
   status_ = std::string("capturing: ") + detector_->label();
   ShowWindow(view_hwnd_, SW_SHOWNOACTIVATE);
@@ -914,6 +959,242 @@ void App::draw_tuning(Config& cfg) {
   }
 }
 
+namespace {
+constexpr const char* kLeagues[] = {"eng.1", "esp.1", "uefa.champions", "ger.1", "ita.1", "fra.1", "usa.1"};
+
+bool contains_ci(const std::string& hay, const char* needle) {
+  if (!needle[0]) return true;
+  const std::size_t n = std::strlen(needle);
+  for (std::size_t i = 0; i + n <= hay.size(); ++i) {
+    std::size_t k = 0;
+    while (k < n && std::tolower(static_cast<unsigned char>(hay[i + k])) ==
+                        std::tolower(static_cast<unsigned char>(needle[k])))
+      ++k;
+    if (k == n) return true;
+  }
+  return false;
+}
+}  // namespace
+
+// Match tab: manual setup (always wins over the scorebug), the scorebug box,
+// what the provider gave, and manual substitutions.
+void App::draw_match() {
+  if (!services_ || !pipe_) return;
+  ImGui::TextWrapped("%s", match_.status);
+  ImGui::SetNextItemWidth(160.f);
+  if (ImGui::Combo("league", &league_idx_, kLeagues, IM_ARRAYSIZE(kLeagues))) {
+    ServiceCmd c;
+    c.kind = ServiceCmd::Kind::SetLeague;
+    std::snprintf(c.league, sizeof(c.league), "%s", kLeagues[league_idx_]);
+    std::snprintf(c.date, sizeof(c.date), "%s", date_buf_);
+    services_->post(c);
+  }
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(90.f);
+  ImGui::InputText("date YYYYMMDD", date_buf_, sizeof(date_buf_), ImGuiInputTextFlags_CharsDecimal);
+  const auto teams = services_->teams();
+  for (int s = 0; s < 2; ++s) {
+    ImGui::PushID(s);
+    ImGui::SetNextItemWidth(110.f);
+    ImGui::InputTextWithHint("##f", "search", team_filter_[s], sizeof(team_filter_[s]));
+    ImGui::SameLine();
+    const char* cur = "pick";
+    for (const auto& t : teams)
+      if (t.id == pick_id_[s]) cur = t.name.c_str();
+    ImGui::SetNextItemWidth(200.f);
+    if (ImGui::BeginCombo(s == 0 ? "home" : "away", cur)) {
+      for (const auto& t : teams) {
+        if (!contains_ci(t.name, team_filter_[s]) && !contains_ci(t.code, team_filter_[s])) continue;
+        if (ImGui::Selectable((t.code + "  " + t.name).c_str(), t.id == pick_id_[s])) pick_id_[s] = t.id;
+      }
+      ImGui::EndCombo();
+    }
+    ImGui::PopID();
+  }
+  if (ImGui::Button("confirm teams") && pick_id_[0] && pick_id_[1]) {
+    ServiceCmd c;
+    c.kind = ServiceCmd::Kind::SetTeams;
+    std::snprintf(c.date, sizeof(c.date), "%s", date_buf_);
+    c.home = pick_id_[0];
+    c.away = pick_id_[1];
+    services_->post(c);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("refresh lineup")) {
+    ServiceCmd c;
+    c.kind = ServiceCmd::Kind::Refresh;
+    services_->post(c);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("clear")) {
+    ServiceCmd c;
+    c.kind = ServiceCmd::Kind::ClearTeams;
+    services_->post(c);
+  }
+
+  ImGui::Separator();
+  if (last_bug_roi_[2] > 0)
+    ImGui::Text("scorebug at %d,%d %dx%d%s", last_bug_roi_[0], last_bug_roi_[1], last_bug_roi_[2], last_bug_roi_[3],
+                roi_manual_ ? " (manual)" : "");
+  else
+    ImGui::TextUnformatted("scorebug: searching wide frames");
+  ImGui::Checkbox("draw scorebug box on the frame", &roi_drag_);
+  ImGui::SameLine();
+  if (ImGui::Button("auto")) {
+    UiCommand cmd;
+    cmd.type = CmdType::SetScorebugRoi;
+    if (!pipe_->commands().try_push(cmd)) pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
+    roi_manual_ = false;
+  }
+  if (roi_drag_ && have_frame_ && video_srv_ && last_w_ > 0) {
+    const float tw = ImGui::GetContentRegionAvail().x;
+    const float th = tw * static_cast<float>(last_h_) / static_cast<float>(last_w_);
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    ImGui::Image(reinterpret_cast<ImTextureID>(video_srv_.Get()), ImVec2(tw, th));
+    const float k = static_cast<float>(last_w_) / tw;
+    if (ImGui::IsItemClicked()) {
+      drag_a_ = ImGui::GetMousePos();
+      dragging_ = true;
+    }
+    auto* wdl = ImGui::GetWindowDrawList();
+    if (dragging_) {
+      const ImVec2 b = ImGui::GetMousePos();
+      wdl->AddRect(drag_a_, b, IM_COL32(255, 200, 0, 255), 0.f, 0, 2.f);
+      if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        dragging_ = false;
+        UiCommand cmd;
+        cmd.type = CmdType::SetScorebugRoi;
+        cmd.f[0] = (std::min(drag_a_.x, b.x) - o.x) * k;
+        cmd.f[1] = (std::min(drag_a_.y, b.y) - o.y) * k;
+        cmd.f[2] = std::fabs(b.x - drag_a_.x) * k;
+        cmd.f[3] = std::fabs(b.y - drag_a_.y) * k;
+        if (cmd.f[2] > 8.f && cmd.f[3] > 4.f && pipe_->commands().try_push(cmd)) roi_manual_ = true;
+      }
+    } else if (last_bug_roi_[2] > 0) {
+      wdl->AddRect(ImVec2(o.x + last_bug_roi_[0] / k, o.y + last_bug_roi_[1] / k),
+                   ImVec2(o.x + (last_bug_roi_[0] + last_bug_roi_[2]) / k, o.y + (last_bug_roi_[1] + last_bug_roi_[3]) / k),
+                   IM_COL32(255, 200, 0, 255), 0.f, 0, 2.f);
+    }
+  }
+
+  ImGui::Separator();
+  if (!match_.teams_ok) return;
+  const TeamInfo& h = match_.team[0];
+  const TeamInfo& a = match_.team[1];
+  char clock[16] = "";
+  if (match_.clock_ms >= 0) std::snprintf(clock, sizeof(clock), "  %d:%02d", match_.clock_ms / 60000, (match_.clock_ms / 1000) % 60);
+  ImGui::Text("%s %d - %d %s%s", h.code, h.score < 0 ? 0 : h.score, a.score < 0 ? 0 : a.score, a.code, clock);
+  for (int s = 0; s < 2; ++s) {
+    const TeamInfo& t = match_.team[s];
+    ImGui::PushID(100 + s);
+    if (!ImGui::CollapsingHeader(t.name[0] ? t.name : "team", ImGuiTreeNodeFlags_DefaultOpen)) {
+      ImGui::PopID();
+      continue;
+    }
+    ImGui::Text("form %s   formation %s   %s", t.form[0] ? t.form : "-", t.formation[0] ? t.formation : "-",
+                match_.lineup_ok ? "lineup" : "squad (lineup not out)");
+    if (ImGui::BeginTable("squad", 6, ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_RowBg)) {
+      for (const char* c : {"#", "name", "pos", "apps", "G", "A"}) ImGui::TableSetupColumn(c);
+      ImGui::TableHeadersRow();
+      for (int i = 0; i < t.n; ++i) {
+        const PlayerInfo& p = t.squad[i];
+        if (match_.lineup_ok && !p.starter && p.subbed != 2) continue;
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", p.jersey);
+        ImGui::TableNextColumn();
+        const ImVec4 col = p.out ? ImVec4(1.f, 0.4f, 0.4f, 1.f) : p.subbed == 1 ? ImVec4(0.6f, 0.6f, 0.6f, 1.f)
+                                                                                : ImVec4(1.f, 1.f, 1.f, 1.f);
+        ImGui::TextColored(col, "%s%s%s", p.name, p.out ? " (out)" : "", p.subbed == 2 ? " (on)" : "");
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(p.pos);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", p.apps);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", p.goals);
+        ImGui::TableNextColumn();
+        ImGui::Text("%u", p.assists);
+      }
+      ImGui::EndTable();
+    }
+    if (match_.lineup_ok) {
+      // Substitution: someone on the pitch off, a bench player on.
+      auto pick = [&](const char* label, int& idx, bool on_pitch) {
+        const char* cur = idx >= 0 && idx < t.n ? t.squad[idx].name : "-";
+        ImGui::SetNextItemWidth(150.f);
+        if (ImGui::BeginCombo(label, cur)) {
+          for (int i = 0; i < t.n; ++i) {
+            const PlayerInfo& p = t.squad[i];
+            const bool playing = (p.starter && p.subbed != 1) || p.subbed == 2;
+            if (playing != on_pitch) continue;
+            if (ImGui::Selectable(p.name, idx == i)) idx = i;
+          }
+          ImGui::EndCombo();
+        }
+      };
+      pick("off", sub_off_[s], true);
+      ImGui::SameLine();
+      pick("on", sub_on_[s], false);
+      ImGui::SameLine();
+      if (ImGui::Button("sub") && sub_off_[s] >= 0 && sub_on_[s] >= 0) {
+        ServiceCmd c;
+        c.kind = ServiceCmd::Kind::Sub;
+        c.side = static_cast<std::uint8_t>(s);
+        c.off = static_cast<std::uint8_t>(sub_off_[s]);
+        c.on = static_cast<std::uint8_t>(sub_on_[s]);
+        services_->post(c);
+        sub_off_[s] = sub_on_[s] = -1;
+      }
+    }
+    ImGui::PopID();
+  }
+}
+
+// M13 validation: our team stats beside the provider's post-match numbers.
+void App::write_validation() {
+  if (!pipe_ || !match_.event_id || match_.team[0].post.passes < 0) return;
+  const TeamStats& ts = pipe_->team_stats();
+  if (ts.passes[0] + ts.passes[1] == 0) return;  // nothing counted (selftest, no pitch fit)
+  std::error_code ec;
+  std::filesystem::create_directories("docs/bench", ec);
+  const std::string path = "docs/bench/m13_validation_" + std::to_string(match_.event_id) + ".csv";
+  std::FILE* f = std::fopen(path.c_str(), "w");
+  if (!f) return;
+  std::fprintf(f, "team,metric,vision,provider\n");
+  for (int s = 0; s < 2; ++s) {
+    const TeamInfo& t = match_.team[s];
+    std::fprintf(f, "%s,passes,%u,%d\n", t.code, ts.passes[s], t.post.passes);
+    std::fprintf(f, "%s,pass_pct,%.1f,%.1f\n", t.code, ts.pass_pct(s),
+                 t.post.passes > 0 ? 100.0 * t.post.passes_ok / t.post.passes : -1.0);
+    std::fprintf(f, "%s,possession_pct,%.1f,%.1f\n", t.code, ts.poss_pct(s), t.post.possession_pct);
+    std::fprintf(f, "%s,shots,%u,%d\n", t.code, ts.shots[s], t.post.shots);
+  }
+  std::fclose(f);
+  log_line("validation written: " + path);
+}
+
+void App::start_services() {
+  services_ = std::make_unique<Services>(*pipe_);
+  services_->start();
+  if (args_.match_spec.empty()) return;
+  char league[16]{}, date[9]{};
+  unsigned home = 0, away = 0;
+  if (std::sscanf(args_.match_spec.c_str(), "%15[^:]:%8[0-9]:%u:%u", league, date, &home, &away) != 4) {
+    log_line("--match: expected league:YYYYMMDD:home_id:away_id");
+    return;
+  }
+  ServiceCmd c;
+  c.kind = ServiceCmd::Kind::SetLeague;
+  std::snprintf(c.league, sizeof(c.league), "%s", league);
+  std::snprintf(c.date, sizeof(c.date), "%s", date);
+  services_->post(c);
+  c.kind = ServiceCmd::Kind::SetTeams;
+  c.home = home;
+  c.away = away;
+  services_->post(c);
+  std::snprintf(date_buf_, sizeof(date_buf_), "%s", date);
+}
+
 void App::draw_control() {
   if (control_dirty_ && control_swap_) {
     control_rtv_.Reset();
@@ -936,6 +1217,10 @@ void App::draw_control() {
     if (ImGui::BeginTabBar("tabs")) {
       if (ImGui::BeginTabItem("Main")) {
         main_tab = true;
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Match")) {
+        draw_match();
         ImGui::EndTabItem();
       }
       if (ImGui::BeginTabItem("Tuning")) {
@@ -1125,6 +1410,7 @@ int App::run() {
       pitch_ = make_pitch();
       pipe_ = std::make_unique<Pipeline>(*pool_);
       pipe_->start(*source_, *sink_, *detector_, args_.pin, pitch_.get());
+      start_services();
       load_last_profile();
       if (!create_window(view_hwnd_, L"TouchFC", WS_OVERLAPPEDWINDOW, 0, 1280, 760, view_binding_)) return 1;
       if (!create_hwnd_swap(view_hwnd_, view_swap_, false)) return 1;
@@ -1186,11 +1472,14 @@ int App::run() {
       pipe_->release_presented(static_cast<std::uint32_t>(held_));
       held_ = -1;
     }
+    if (services_) services_->stop();
     if (pipe_) pipe_->join();
+    write_validation();
   if (sink_) sink_->write_csv(args_.telemetry_path);
   if (pitch_dump_) std::fclose(pitch_dump_);
   if (pipe_) pipe_->write_spadl("spadl.csv");
   if (source_) source_->close();
+  services_.reset();
   pipe_.reset();
   detector_.reset();
   sink_.reset();

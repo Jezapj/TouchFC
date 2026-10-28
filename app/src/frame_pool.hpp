@@ -1,6 +1,7 @@
 #pragma once
 
 #include "touchfc/detection.hpp"
+#include "touchfc/events.hpp"
 #include "touchfc/homography.hpp"
 #include "touchfc/slot_pool.hpp"
 #include "touchfc/types.hpp"
@@ -50,6 +51,9 @@ struct FrameSlot {
   std::uint8_t play_reasons = 0;  // PlaySignal bits behind the last Dead
   float view_angle_deg = 0.f;
   float player_height_frac = 0.f;
+  std::int16_t bug_roi[4]{};       // scorebug x, y, w, h; w = 0 not found
+  TeamStats team_stats{};          // vision estimate, M13
+  float holder_rating = 0.f;       // TFC rating contributions of poss_track
   std::uint8_t ball_ok = 0;
   std::uint8_t poss_team = 0;
   std::uint16_t poss_track = 0;

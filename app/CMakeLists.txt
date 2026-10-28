@@ -57,7 +57,10 @@ add_executable(touchfc
   src/replay_source.cpp
   src/wgc_source.cpp
   src/stub_detector.cpp
-  src/ort_detector.cpp)
+  src/ort_detector.cpp
+  src/http_win.cpp
+  src/ocr_win.cpp
+  src/services.cpp)
 target_include_directories(touchfc PRIVATE
   src
   ${TOUCHFC_CPPWINRT})
@@ -70,6 +73,7 @@ target_link_libraries(touchfc PRIVATE
   dwmapi
   dcomp
   windowsapp
+  winhttp
   avrt
   ole32
   uuid)
@@ -108,7 +112,9 @@ endif()
 # MSVC enables AVX2 for preprocess code paths at /arch:AVX2. The runtime still
 # falls back to scalar when the dispatcher is called with a non-mul-8 width.
 if(MSVC)
-  target_compile_options(touchfc PRIVATE /arch:AVX2)
+  target_compile_options(touchfc PRIVATE /arch:AVX2 /Zi)
+  # Release keeps a PDB so a crash offset maps to a function.
+  target_link_options(touchfc PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()
 touchfc_warnings(touchfc)
 set_target_properties(touchfc PROPERTIES CXX_STANDARD 20)

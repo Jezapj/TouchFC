@@ -11,11 +11,11 @@ namespace touchfc {
 
 // One row per Config field: the Tuning tab draws a slider per row, reset works
 // per group, and profiles save by key. Hidden rows are saved but not shown.
-enum class CfgGroup : std::uint8_t { Detection, Pitch, Teams, PlayState, Events, Overlay, Hidden, Count };
+enum class CfgGroup : std::uint8_t { Detection, Pitch, Teams, PlayState, Events, Rating, Match, Overlay, Hidden, Count };
 enum class CfgType : std::uint8_t { F32, U8, U16, U32 };
 
-inline constexpr const char* kCfgGroupName[] = {"Detection", "Pitch",   "Teams", "Play state",
-                                                "Events",    "Overlay", "Hidden"};
+inline constexpr const char* kCfgGroupName[] = {"Detection", "Pitch", "Teams",   "Play state", "Events",
+                                                "Rating",    "Match", "Overlay", "Hidden"};
 
 struct CfgField {
   const char* key;
@@ -73,6 +73,7 @@ inline constexpr CfgField kConfigFields[] = {
 
     TOUCHFC_CFG(view_angle_max_deg, PlayState, "view angle max deg", 5.f, 90.f),
     TOUCHFC_CFG(player_height_max_frac, PlayState, "player height max", 0.05f, 0.9f),
+    TOUCHFC_CFG(ball_off_on, PlayState, "ball off signal", 0, 1),
     TOUCHFC_CFG(dead_enter_ms, PlayState, "dead after ms", 50, 3000),
     TOUCHFC_CFG(live_enter_ms, PlayState, "live after ms", 50, 5000),
     TOUCHFC_CFG(scorebug_match_min, PlayState, "scorebug match min", 0.1f, 0.99f),
@@ -81,6 +82,24 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(pass_min_dist_m, Events, "pass min distance m", 1.f, 30.f),
     TOUCHFC_CFG(ball_flight_min_mps, Events, "ball flight min m/s", 1.f, 30.f),
     TOUCHFC_CFG(shot_speed_mps, Events, "shot speed m/s", 2.f, 40.f),
+    TOUCHFC_CFG(shot_zone_m, Events, "shot zone m", 10.f, 60.f),
+    TOUCHFC_CFG(key_pass_window_s, Events, "key pass window s", 1.f, 15.f),
+
+    TOUCHFC_CFG(rating_base, Rating, "base", 0.f, 10.f),
+    TOUCHFC_CFG(rating_pass_k, Rating, "pass: xT gain x", 0.f, 20.f),
+    TOUCHFC_CFG(rating_press_mult, Rating, "pass under pressure x", 1.f, 3.f),
+    TOUCHFC_CFG(rating_press_m, Rating, "pressure distance m", 0.5f, 6.f),
+    TOUCHFC_CFG(rating_pass_floor, Rating, "pass floor", 0.f, 0.5f),
+    TOUCHFC_CFG(rating_loss_k, Rating, "lost pass: xT x", 0.f, 20.f),
+    TOUCHFC_CFG(rating_loss_base, Rating, "lost pass: base", 0.f, 0.5f),
+    TOUCHFC_CFG(rating_int, Rating, "interception", 0.f, 1.f),
+    TOUCHFC_CFG(rating_shot, Rating, "shot", 0.f, 1.f),
+    TOUCHFC_CFG(rating_goal, Rating, "goal", 0.f, 3.f),
+
+    TOUCHFC_CFG(kit_seed_max_dist, Match, "kit colour seed distance", 5.f, 80.f),
+    TOUCHFC_CFG(roi_frames, Match, "scorebug search frames", 10, 500),
+    TOUCHFC_CFG(roi_stable_max, Match, "scorebug max change", 0.02f, 5.f),
+    TOUCHFC_CFG(roi_contrast_min, Match, "scorebug min detail", 2.f, 60.f),
 
     TOUCHFC_CFG(show_boxes, Overlay, "show boxes", 0, 1),
     TOUCHFC_CFG(delay_margin_ms, Overlay, "present margin ms", 0.f, 80.f),

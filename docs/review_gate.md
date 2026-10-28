@@ -143,6 +143,42 @@ Still hard-coded, by choice (internal, not a kit or pitch difference): tracker g
 
 Not verified: the done-when replay check on throw-ins, corners, a substitution and a broadcast replay. That needs broadcast footage; the test clips only cover a set-piece angle.
 
+## M12 state
+
+`touchfc_tests`: 647 assertions in 50 cases after M12 and M13, all green. `--selftest` exits 0. The Release app now writes a PDB (`/Zi /DEBUG`, no runtime cost) so a crash offset maps to a line.
+
+| What | Where | Notes |
+|---|---|---|
+| `MatchInfo` | [`match_info.hpp`](../core/include/touchfc/match_info.hpp) | POD: names, codes, colours, form, formation, squad (jersey, position, starter, out, season apps / goals / assists / shots), score, clock, scorebug ROI, provider post-match stats. T7 publishes it to two triple buffers (T3 and the UI; each has one reader). |
+| Scorebug | [`scorebug.hpp`](../core/include/touchfc/scorebug.hpp) | ROI finder: cells in the top 20% that are detailed and do not change (a burned-in graphic changes 0.00 per frame, a slow drone pan 0.25+, so `roi_stable_max` defaults to 0.2), bridged through stable cells across glyph gaps, largest wide cluster. Parser: `CODE n - n CODE`, en dash and `ARS1` forms, `mm:ss` clock. Confident after 3 identical reads. Tests for all three. |
+| OCR | [`ocr_win.cpp`](../app/src/ocr_win.cpp) | `Windows.Media.Ocr`, user-profile languages, crop upscaled 2 to 3x when small. T3 copies the ROI into one of two preallocated crops (no allocation) at 1 Hz until the teams are known, then every 10 s; T7 reads it. |
+| Provider | [`espn.hpp`](../core/include/touchfc/espn.hpp), [`services.cpp`](../app/src/services.cpp), [`http_win.cpp`](../app/src/http_win.cpp) | ESPN shapes checked against live responses (October 2026). Scoreboard (date, then a day either side) gives the fixture, colours and form; summary gives lineups, formation and post-match team stats; team roster gives season stats and injuries. WinHTTP, cached under `cache/espn/` (team list 7 days, scoreboard 10 min, rosters 12 h, summary polled every 2 min until the lineup is out, then kept). Parsers tested on hand-made fixtures in the live shapes. |
+| Code mapping | `services.cpp`, [`data/team_codes.json`](../data/team_codes.json) | Scorebug codes to provider ids: overrides file first, then the league's abbreviations. Unknown codes go to the user (status line). |
+| Match tab | `present.cpp` | League, date, home/away search over the team list, confirm (manual always wins), refresh lineup, clear; scorebug box shown and drawable on the frame, or back to auto; lineup tables with season stats, injured players in red; manual substitutions. |
+| Kit colours | `pipeline.cpp` `seed_kits` | Provider colour (or alternate) seeds team A (home) / B (away) only when each is within `kit_seed_max_dist` of at least 3 tracked players and the two differ. A click seed still wins. |
+| Goals | `pipeline.cpp` `update_match` | A score rise on the scorebug is logged as a `Goal` event and credits the last shot's TFC rating. |
+| `--match league:YYYYMMDD:home:away` | `present.cpp` | Same as confirming in the Match tab; for replays of past matches. |
+
+Checked end to end here:
+- `--match eng.1:20251025:363:366`: fixture CHE v SUN found, lineups loaded, rosters and summary cached (`cache/espn/`, gitignored).
+- A synthetic scorebug ("CHE 1 - 0 SUN 23:41", burned into a test clip with ffmpeg, kept out of the tree): ROI found at 64,16 400x96, OCR read, codes mapped, teams identified.
+
+Not verified: a real broadcast scorebug (fonts, gradients, transparency) and its kit colours. The Match tab has not been driven by hand here.
+
+## M13 state
+
+| What | Where | Notes |
+|---|---|---|
+| Events | [`events.hpp`](../core/include/touchfc/events.hpp) | Spells from the possession holder; ball speed smoothed over 3 to 5 samples. Pass = release, flight, next holder after `pass_min_dist_m`; same team completed, other team incomplete (plus an interception when taken in flight); a kicked ball that goes dead is incomplete. A fast ball toward a goal mouth from inside `shot_zone_m` is only a shot candidate until the flight ends: a team-mate receiving it makes it a pass (crosses, through balls), anything else makes it a shot. Key pass: completed pass into the area, or followed by a shot within `key_pass_window_s` (counted once). |
+| Team stats | same, HUD | Passes, completed, %, possession % (in-play time with possession), shots, key passes; labelled "vision estimate". |
+| TFC rating | same | Spec 11.5: xT from Karun Singh's published `open_xt_12x8_v1.json` (fetched, not recalled). Weights are `Config` fields (Tuning > Rating). The holder's rating shows on the HUD. |
+| Export | `possession.hpp` | SPADL type pass 0, interception 10, shot 11 with result (a shot succeeds only as a goal); outside the list: possession 21, dead ball 22, scorebug goal 23. |
+| Validation | `present.cpp` `write_validation` | On exit, when the provider has post-match stats and vision counted something: `docs/bench/m13_validation_<event>.csv` (vision beside provider for passes, pass %, possession, shots). |
+
+Tests drive passes, an interception, out of play, a shot gathered by the keeper, key passes, a goal credit and a short tap on synthetic timelines.
+
+Not verified: the validation CSV for a real match. It needs a broadcast replay with `--keypoints --match ...` through enough play for passes to register; expect low pass counts (cuts, replays, ball misses).
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.

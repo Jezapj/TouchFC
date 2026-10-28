@@ -60,7 +60,7 @@ struct FrameMeta {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::uint8_t flags = 0;
-  std::uint8_t pad[7]{};
+  std::uint8_t pad[1]{};
 };
 
 // Published by the track thread for the control window. The present thread
@@ -103,7 +103,8 @@ enum class CmdType : std::uint8_t {
   MarkReplay,
   ResetTracker,
   ResetHomography,
-  ApplyAttackDir
+  ApplyAttackDir,
+  SetScorebugRoi  // f[0..3] = x, y, w, h in frame pixels; w = 0 back to auto
 };
 
 struct UiCommand {
@@ -147,10 +148,27 @@ struct Config {
   float player_height_max_frac = 0.25f;  // median player box height / frame height
   float scorebug_match_min = 0.6f;
   // Events
-  float poss_dist_m = 1.5f;
+  float poss_dist_m = 2.5f;         // ball to feet; homography error is ~1 m mid-pitch
   float pass_min_dist_m = 5.f;
   float ball_flight_min_mps = 6.f;
   float shot_speed_mps = 8.f;
+  float shot_zone_m = 35.f;          // a shot starts this close to the goal
+  float key_pass_window_s = 5.f;     // completed pass then shot by the same team
+  // TFC rating (spec 11.5): xT-based, shown as rating_base + contributions
+  float rating_pass_k = 3.f;
+  float rating_press_mult = 1.25f;
+  float rating_press_m = 2.f;
+  float rating_pass_floor = 0.02f;
+  float rating_loss_k = 3.f;
+  float rating_loss_base = 0.05f;
+  float rating_int = 0.05f;
+  float rating_shot = 0.1f;
+  float rating_goal = 1.f;
+  float rating_base = 6.f;
+  // Match setup
+  float kit_seed_max_dist = 25.f;    // provider kit colour must be this close (Lab) to a player cluster
+  float roi_stable_max = 0.2f;       // scorebug cells change less than this per frame (graphics ~0, slow pans 0.25+)
+  float roi_contrast_min = 12.f;     // ... and have this much detail
   // Overlay
   float delay_margin_ms = 0.f;
   float flip_margin_px = 24.f;
@@ -160,6 +178,7 @@ struct Config {
   std::uint16_t dead_enter_ms = 400;
   std::uint16_t live_enter_ms = 700;
   std::uint16_t flip_hold_ms = 2000;
+  std::uint16_t roi_frames = 75;     // wide frames to find the scorebug
   std::uint8_t det_interval = 1;
   std::uint8_t show_boxes = 1;
   std::uint8_t attack_dir = 1;
@@ -171,7 +190,8 @@ struct Config {
   std::uint8_t minimap_dead_mode = 0;  // MinimapDeadMode
   std::uint8_t panel_side = 0;         // PanelSide
   std::uint8_t mini_replay = 1;
-  std::uint8_t pad[7]{};
+  std::uint8_t ball_off_on = 0;      // a lofted ball projects past the lines, so off by default
+  std::uint8_t pad[6]{};
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };

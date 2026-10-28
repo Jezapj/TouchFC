@@ -8,7 +8,7 @@ namespace {
 
 void print_usage() {
   std::fputs(
-      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv]\n"
+      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away]\n"
       "  --selftest   synthetic 50 fps clip (default)\n"
       "  --replay     pace a video file through the same pipeline\n"
       "  --overlay    pick a window and draw a click-through capture overlay\n"
@@ -44,6 +44,8 @@ int main(int argc, char** argv) {
       args.model_path = argv[++i];
     } else if (a == "--keypoints" && i + 1 < argc) {
       args.keypoints_path = argv[++i];
+    } else if (a == "--match" && i + 1 < argc) {
+      args.match_spec = argv[++i];
     } else if (a == "--pitch-dump" && i + 1 < argc) {
       args.pitch_dump_path = argv[++i];
     } else if (a == "--telemetry" && i + 1 < argc) {

@@ -3,6 +3,8 @@
 #include "touchfc/config_json.hpp"
 #include "touchfc/cpu.hpp"
 #include "touchfc/detection.hpp"
+#include "touchfc/espn.hpp"
+#include "touchfc/events.hpp"
 #include "touchfc/frame_check.hpp"
 #include "touchfc/gmc.hpp"
 #include "touchfc/hdr_sink.hpp"
@@ -20,6 +22,7 @@
 #include "touchfc/pitch_pose.hpp"
 #include "touchfc/play_state.hpp"
 #include "touchfc/preprocess.hpp"
+#include "touchfc/scorebug.hpp"
 #include "touchfc/seqlock.hpp"
 #include "touchfc/scene.hpp"
 #include "touchfc/slot_pool.hpp"
@@ -44,6 +47,7 @@
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#include <string>
 #include <vector>
 
 using namespace touchfc;
@@ -1177,4 +1181,249 @@ TEST_CASE("dead-ball records export as type 22") {
   char row[256];
   format_spadl_row(row, 256, e, 1);
   REQUIRE(std::strstr(row, ",22,1,0") != nullptr);
+}
+
+TEST_CASE("scorebug text parses codes, score and clock") {
+  ScorebugRead r;
+  REQUIRE(parse_scorebug("ARS 1 - 0 EVE", r));
+  REQUIRE(std::string(r.home) == "ARS");
+  REQUIRE(std::string(r.away) == "EVE");
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 0);
+  REQUIRE(r.clock_ms == -1);
+  REQUIRE(parse_scorebug("23:41 MCI 2\xE2\x80\x93" "1 LIV", r));  // en dash
+  REQUIRE(std::string(r.home) == "MCI");
+  REQUIRE(r.away_score == 1);
+  REQUIRE(r.clock_ms == (23 * 60 + 41) * 1000);
+  REQUIRE(parse_scorebug("BHA1 0NFO 90:00", r));
+  REQUIRE(std::string(r.away) == "NFO");
+  REQUIRE(r.clock_ms == 90 * 60000);
+  REQUIRE_FALSE(parse_scorebug("Premier League", r));
+  REQUIRE_FALSE(parse_scorebug("ARS 1", r));
+
+  ScorebugVote v;
+  REQUIRE(parse_scorebug("ARS 1 0 EVE", r));
+  REQUIRE_FALSE(v.add(r));
+  REQUIRE_FALSE(v.add(r));
+  REQUIRE(v.add(r));
+  REQUIRE(parse_scorebug("ARS 1 0 EUE", r));  // a misread restarts the count
+  REQUIRE_FALSE(v.add(r));
+}
+
+TEST_CASE("scorebug roi finder locks on a static graphic over a moving picture") {
+  const int W = 1280, H = 720;
+  std::vector<std::uint8_t> px(static_cast<std::size_t>(W) * H * 4);
+  static ScorebugRoiFinder f;
+  f.reset();
+  for (int k = 0; k < 40; ++k) {
+    for (int y = 0; y < H; ++y)
+      for (int x = 0; x < W; ++x) {
+        std::uint8_t* p = px.data() + (static_cast<std::size_t>(y) * W + x) * 4;
+        // Panning crowd/pitch texture.
+        const std::uint8_t v = static_cast<std::uint8_t>(((x + 7 * k) * 13 + y * 7) % 200);
+        p[0] = p[1] = p[2] = v;
+        // Scorebug: dark box with white text-like stripes at (64..320, 32..64).
+        if (x >= 64 && x < 320 && y >= 32 && y < 64) {
+          const bool glyph = ((x / 3) % 4 == 0) && y > 38 && y < 58;
+          p[0] = p[1] = p[2] = glyph ? 240 : 20;
+        }
+      }
+    f.add(px.data(), W, H, W * 4, 30, 0.2f, 12.f);
+  }
+  REQUIRE(f.done());
+  const int* r = f.roi();
+  REQUIRE(r[0] <= 64);
+  REQUIRE(r[1] <= 32);
+  REQUIRE(r[0] + r[2] >= 320);
+  REQUIRE(r[1] + r[3] >= 64);
+  REQUIRE(r[2] <= 320);
+}
+
+TEST_CASE("espn responses fill MatchInfo") {
+  const std::string teams = R"({"sports":[{"leagues":[{"teams":[
+    {"team":{"id":"363","abbreviation":"CHE","displayName":"Chelsea"}},
+    {"team":{"id":"366","abbreviation":"SUN","displayName":"Sunderland"}}]}]}]})";
+  const auto list = espn::parse_teams(teams);
+  REQUIRE(list.size() == 2);
+  REQUIRE(list[0].id == 363);
+  REQUIRE(list[1].code == "SUN");
+
+  const std::string sb = R"({"events":[{"id":"1","competitions":[{"competitors":[
+      {"homeAway":"home","team":{"id":"1"}},{"homeAway":"away","team":{"id":"2"}}]}]},
+    {"id":"740685","competitions":[{"competitors":[
+      {"homeAway":"away","form":"DDLWL","team":{"id":"366","abbreviation":"SUN","displayName":"Sunderland","color":"EB172B","alternateColor":"FFB6C1"}},
+      {"homeAway":"home","form":"DWWLD","team":{"id":"363","abbreviation":"CHE","displayName":"Chelsea","color":"144992"}}]}]}]})";
+  MatchInfo m{};
+  REQUIRE(espn::parse_scoreboard(sb, 366, 363, m));
+  REQUIRE(m.event_id == 740685);
+  REQUIRE(std::string(m.team[0].code) == "CHE");
+  REQUIRE(std::string(m.team[1].form) == "DDLWL");
+  REQUIRE(m.team[0].color == 0x144992u);
+  REQUIRE(m.team[1].alt_color == 0xFFB6C1u);
+  REQUIRE_FALSE(espn::parse_scoreboard(sb, 363, 999, m));
+
+  const std::string sum = R"({"rosters":[{"homeAway":"home","formation":"4-2-3-1","roster":[
+      {"starter":true,"jersey":"1","athlete":{"displayName":"Robert Sanchez"},"position":{"abbreviation":"G"}},
+      {"starter":false,"jersey":"12","athlete":{"displayName":"Sub Keeper"},"position":{"abbreviation":"G"}}]}],
+    "boxscore":{"teams":[{"team":{"id":"363"},"statistics":[
+      {"name":"possessionPct","displayValue":"68.4"},{"name":"totalPasses","displayValue":"629"},
+      {"name":"accuratePasses","displayValue":"567"},{"name":"totalShots","displayValue":"16"}]}]}})";
+  REQUIRE(espn::parse_summary(sum, m));
+  REQUIRE(m.lineup_ok == 1);
+  REQUIRE(std::string(m.team[0].formation) == "4-2-3-1");
+  REQUIRE(m.team[0].n == 2);
+  REQUIRE(m.team[0].squad[0].jersey == 1);
+  REQUIRE(m.team[0].squad[1].starter == 0);
+  REQUIRE(m.team[0].post.passes == 629);
+  REQUIRE(std::abs(m.team[0].post.possession_pct - 68.4f) < 0.01f);
+
+  const std::string roster = R"({"athletes":[
+      {"displayName":"Robert Sanchez","jersey":"1","injuries":[],"status":{"type":"active"},
+       "statistics":{"splits":{"categories":[{"stats":[{"abbreviation":"APP","value":6.0}]},
+                                             {"stats":[{"abbreviation":"G","value":0.0},{"abbreviation":"A","value":1.0}]}]}}},
+      {"displayName":"Not In Lineup","jersey":"9","injuries":[{"status":"Out"}]}]})";
+  REQUIRE(espn::parse_roster(roster, m.team[0]));
+  REQUIRE(m.team[0].squad[0].apps == 6);
+  REQUIRE(m.team[0].squad[0].assists == 1);
+  REQUIRE(m.team[0].squad[0].starter == 1);  // lineup flags kept
+  REQUIRE(m.team[0].n == 2);                 // lineup out: no extra entries
+
+  TeamInfo pre{};  // before lineups: the roster becomes the squad
+  REQUIRE(espn::parse_roster(roster, pre));
+  REQUIRE(pre.n == 2);
+  REQUIRE(pre.squad[1].out == 1);
+  REQUIRE_FALSE(espn::parse_summary("{bad", m));
+}
+
+namespace {
+// Feeds a ball path to the detector at 25 fps. holder(t) gives the holder.
+struct Sim {
+  EventDetector d;
+  EventParams p;
+  Event log[64];
+  int n = 0;
+  float t = 0.f;
+  void frame(float bx, float by, std::uint16_t holder, std::uint8_t team, float nearest = 0.5f) {
+    EventFrame f;
+    f.t_s = t;
+    f.ball = true;
+    f.bx = bx;
+    f.by = by;
+    f.holder = holder;
+    f.team = team;
+    f.nearest_m = holder ? 0.5f : nearest;
+    n += d.step(f, 0.04f, log + n, p);
+    t += 0.04f;
+  }
+  // Ball travels from a to b at speed v with nobody near it.
+  void fly(float ax, float ay, float bx, float by, float v) {
+    const float d = std::hypot(bx - ax, by - ay);
+    const int steps = static_cast<int>(d / (v * 0.04f));
+    for (int k = 1; k <= steps; ++k) {
+      const float a = static_cast<float>(k) / steps;
+      frame(ax + a * (bx - ax), ay + a * (by - ay), 0, 0, 5.f);
+    }
+  }
+};
+}  // namespace
+
+TEST_CASE("events: completed pass, interception, out of play, shot and key pass") {
+  Sim s;
+  for (int k = 0; k < 10; ++k) s.frame(0.f, 0.f, 7, 1);  // #7 (team A) on the ball
+  s.fly(0.f, 0.f, 20.f, 5.f, 15.f);
+  for (int k = 0; k < 10; ++k) s.frame(20.f, 5.f, 9, 1);  // #9 receives: completed
+  REQUIRE(s.n == 1);
+  REQUIRE(s.log[0].type == EventType::Pass);
+  REQUIRE(s.log[0].result == EventResult::Success);
+  REQUIRE(s.d.team_stats().passes_ok[0] == 1);
+  const float r9 = s.d.track(7)->rating;
+  REQUIRE(r9 > 0.f);  // forward pass gains xT
+
+  s.fly(20.f, 5.f, 10.f, -10.f, 15.f);
+  for (int k = 0; k < 5; ++k) s.frame(10.f, -10.f, 21, 2);  // team B takes it in flight
+  REQUIRE(s.n == 3);
+  REQUIRE(s.log[1].result == EventResult::Fail);
+  REQUIRE(s.log[2].type == EventType::Interception);
+  REQUIRE(s.d.track(9)->rating < 0.f);
+  REQUIRE(s.d.track(21)->rating > 0.f);
+
+  // Team B kicks it 15 m and the ball goes dead: incomplete.
+  s.fly(10.f, -10.f, -5.f, -30.f, 15.f);
+  s.n += s.d.stop(s.t, s.log + s.n, s.p);
+  REQUIRE(s.n == 4);
+  REQUIRE(s.log[3].result == EventResult::Fail);
+  REQUIRE(s.d.team_stats().passes[1] == 1);
+
+  // Team A: pass into the area toward +x (a key pass), then a shot.
+  for (int k = 0; k < 10; ++k) s.frame(20.f, 10.f, 7, 1);
+  s.fly(20.f, 10.f, 40.f, 5.f, 15.f);
+  for (int k = 0; k < 10; ++k) s.frame(40.f, 5.f, 9, 1);
+  REQUIRE(s.d.team_stats().key_passes[0] == 1);
+  s.fly(40.f, 5.f, 52.f, 0.5f, 20.f);
+  for (int k = 0; k < 3; ++k) s.frame(52.f, 0.5f, 1, 2);  // the keeper gathers it
+  REQUIRE(s.d.team_stats().shots[0] == 1);
+  REQUIRE(s.log[s.n - 1].type == EventType::Shot);
+  REQUIRE(s.d.team_stats().key_passes[0] == 1);  // that pass is not counted twice
+  const float before = s.d.track(9)->rating;
+  s.d.goal(s.t + 2.f, s.p);
+  REQUIRE(s.d.track(9)->rating > before + 0.9f);
+  REQUIRE(s.d.team_stats().poss_s[0] > 0.f);
+
+  // A short tap to a team-mate (under pass_min_dist_m) is not a pass.
+  const auto passes = s.d.team_stats().passes[0];
+  for (int k = 0; k < 5; ++k) s.frame(0.f, 0.f, 7, 1);
+  s.fly(0.f, 0.f, 3.f, 0.f, 10.f);
+  for (int k = 0; k < 5; ++k) s.frame(3.f, 0.f, 9, 1);
+  REQUIRE(s.d.team_stats().passes[0] == passes);
+}
+
+TEST_CASE("events: pass and shot when the flight is not detected") {
+  Sim s;
+  auto miss = [&](int k) {
+    for (int i = 0; i < k; ++i) {
+      EventFrame f;
+      f.t_s = s.t;
+      s.n += s.d.step(f, 0.04f, s.log + s.n, s.p);
+      s.t += 0.04f;
+    }
+  };
+  for (int k = 0; k < 10; ++k) s.frame(0.f, 0.f, 7, 1);
+  miss(5);  // a short miss at the feet keeps the holder: no release
+  for (int k = 0; k < 5; ++k) s.frame(0.5f, 0.f, 7, 1);
+  REQUIRE(s.n == 0);
+  REQUIRE(s.d.team_stats().poss_s[0] > 0.55f);
+  miss(15);  // the pass is not seen in flight
+  for (int k = 0; k < 10; ++k) s.frame(15.f, 4.f, 9, 1);
+  REQUIRE(s.n == 1);
+  REQUIRE(s.log[0].type == EventType::Pass);
+  REQUIRE(s.log[0].result == EventResult::Success);
+  // #9 shoots from 25 m, not seen in flight; the keeper (team B) holds it.
+  for (int k = 0; k < 10; ++k) s.frame(28.f, 2.f, 9, 1);
+  miss(15);
+  for (int k = 0; k < 5; ++k) s.frame(51.f, 1.f, 1, 2);
+  REQUIRE(s.d.team_stats().shots[0] == 1);
+  REQUIRE(s.d.team_stats().key_passes[0] == 1);
+  REQUIRE(s.d.team_stats().passes[0] == 1);  // not also an incomplete pass
+}
+
+TEST_CASE("xT is higher near the attacked goal and mirrors with direction") {
+  REQUIRE(xt_at(50.f, 0.f, 1) > 0.2f);
+  REQUIRE(xt_at(-50.f, 0.f, 1) < 0.02f);
+  REQUIRE(xt_at(-50.f, 0.f, -1) == xt_at(50.f, 0.f, 1));
+}
+
+TEST_CASE("spadl export types and results for M13 events") {
+  Event e{};
+  char row[256];
+  e.type = EventType::Pass;
+  e.result = EventResult::Success;
+  format_spadl_row(row, 256, e, 1);
+  REQUIRE(std::strstr(row, ",0,1,0") != nullptr);
+  e.type = EventType::Shot;
+  e.result = EventResult::Unknown;
+  format_spadl_row(row, 256, e, 1);
+  REQUIRE(std::strstr(row, ",11,0,0") != nullptr);
+  e.type = EventType::Interception;
+  format_spadl_row(row, 256, e, 1);
+  REQUIRE(std::strstr(row, ",10,1,0") != nullptr);
 }

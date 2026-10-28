@@ -1,0 +1,6 @@
+{
+  "_comment": "Scorebug code to provider team id, per league, for codes the broadcaster uses differently from ESPN abbreviations. Example: \"eng.1\": {\"NFO\": \"393\"}",
+  "eng.1": {},
+  "esp.1": {},
+  "uefa.champions": {}
+}

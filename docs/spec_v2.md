@@ -138,8 +138,8 @@ Estimates are one developer, full time, with an assistant. M0–M1b are in this 
 | M9 | Minimap and homography fix, reprojection debug view | **Code done, broadcast check pending.** Image GMC, line tracking and line-support validation, main-camera orientation rule, fit smoothing, metric landmark table, manual fallback, clipped minimap. Rejects the keypoint model's made-up fits on the amateur test clips; the done-when check needs a broadcast clip. `review_gate.md` M9. |
 | M10 | Config v2, tuning panel, profiles | **Done.** Field table drives the Tuning tab (live values, reset per group) and JSON profiles (byte-exact round trip, last used loads at start). `review_gate.md` M10. |
 | M11 | Play-state gate (in play / dead) | **Code done, broadcast check pending.** `PlayGate` with view angle, player size, scene and ball-off signals; scorebug waits on M12. Dead stops possession, pitch control and events; logged as type 22. `review_gate.md` M11. |
-| M12 | Match setup: scorebug OCR or manual entry, pre-match stats (ESPN), lineups, kit colours | Section 11.4. |
-| M13 | Pass / shot events, team stats accumulators | Section 11.5. |
+| M12 | Match setup: scorebug OCR or manual entry, pre-match stats (ESPN), lineups, kit colours | **Code done, broadcast check pending.** Scorebug ROI finder + Windows OCR + 3-read vote, ESPN fixture / lineups / season stats / injuries with a disk cache, Match tab, kit seeding, goals from the score, `--match`. Verified end to end on a synthetic scorebug and a live fixture. `review_gate.md` M12. |
+| M13 | Pass / shot events, team stats accumulators | **Code done, validation pending.** Pass, interception, out of play, shot (resolved at flight end), key pass, team stats, TFC rating (published xT grid), SPADL types. The validation CSV needs a broadcast replay. `review_gate.md` M13. |
 | M14 | Stats overlay, ball-avoid flip, on-ball player card | Section 11.6. |
 | M15 | Mini replay of key passes and shots | Section 11.7. |
 | M8 | PGO, `--pin` on versus off, final report. **Runs last, after M15.** | Before/after for every optimisation that was actually applied, including the ones that did not matter. |
