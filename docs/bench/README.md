@@ -51,7 +51,7 @@ Sleeping in `WakeSeq` costs about 1.7 us on this box. A short spin (64 pauses) i
 
 False sharing did **not** show the textbook result here. Separating the two atomics made the handoff slower, not faster. 100 000 round trips at 11–15 ms is about 110–150 ns each, which is the cache-to-cache cost on this CPU, and one line bouncing was cheaper than two. The padding is still in the ring, because other CPUs (and the adjacent-line prefetch the 128-byte column is there to show) do not behave like this one. The number is reported rather than adjusted.
 
-Profile-guided optimisation, SIMD preprocess and the tracker sweep are later milestones. They are not in this table.
+SIMD preprocess is below. PGO, LTCG, `--pin` and the full before/after list are in [final_report.md](final_report.md).
 
 ## Image GMC (M9)
 

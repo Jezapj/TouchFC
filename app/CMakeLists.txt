@@ -116,6 +116,27 @@ if(MSVC)
   # Release keeps a PDB so a crash offset maps to a function.
   target_link_options(touchfc PRIVATE /DEBUG /OPT:REF /OPT:ICF)
 endif()
+# M8: whole-program and profile-guided builds of the app.
+#   LTCG  /GL + /LTCG only
+#   GEN   instrumented; run it (scripts\pgo.ps1) to write .pgc files beside touchfc.pgd and the exe
+#   USE   optimised from those runs
+set(TOUCHFC_PGO "OFF" CACHE STRING "OFF, LTCG, GEN or USE")
+if(MSVC AND NOT TOUCHFC_PGO STREQUAL "OFF")
+  target_compile_options(touchfc PRIVATE /GL)
+  if(TOUCHFC_PGO STREQUAL "LTCG")
+    target_link_options(touchfc PRIVATE /LTCG)
+  elseif(TOUCHFC_PGO STREQUAL "GEN")
+    target_link_options(touchfc PRIVATE /LTCG /GENPROFILE)
+    # The instrumented exe needs the PGO runtime beside it.
+    get_filename_component(_cl_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    add_custom_command(TARGET touchfc POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_cl_dir}/pgort140.dll" "$<TARGET_FILE_DIR:touchfc>")
+  elseif(TOUCHFC_PGO STREQUAL "USE")
+    target_link_options(touchfc PRIVATE /LTCG /USEPROFILE)
+  else()
+    message(FATAL_ERROR "TOUCHFC_PGO must be OFF, LTCG, GEN or USE")
+  endif()
+endif()
 touchfc_warnings(touchfc)
 set_target_properties(touchfc PROPERTIES CXX_STANDARD 20)
 if(MSVC)

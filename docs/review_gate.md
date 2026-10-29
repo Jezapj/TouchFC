@@ -212,6 +212,16 @@ Telemetry before and after: `docs/bench/README.md` (selftest; no added p99 on T1
 
 Not verified on a broadcast: rating weights and xG fit are hand-set; the spare box choice with two assistant referees in shot (one is forced onto a team).
 
+## M8 state
+
+| What | Where | Notes |
+|---|---|---|
+| LTCG / PGO build | `app/CMakeLists.txt` `TOUCHFC_PGO`, [`scripts/pgo.ps1`](../scripts/pgo.ps1) | GEN build, training on selftest plus the three test clips (stub detector), USE relink in `build\pgo`. Four `.pgc` merged, 0% dropped. |
+| Telemetry runs | [`scripts/telemetry_runs.ps1`](../scripts/telemetry_runs.ps1) | 3 x 20 s selftest per build, with and without `--pin`. Raw: `docs/bench/m8_runs.csv`. |
+| Report | [`docs/bench/final_report.md`](bench/final_report.md) | Every applied optimisation with before / after, including padding (worse here) and LTCG / PGO (no latency change). |
+
+Not measured: glass latency (PresentMon), GPU inference on the S1 target hardware.
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.
