@@ -63,6 +63,13 @@ void Pipeline::join() {
   if (t2_.joinable()) t2_.join();
   if (t3_.joinable()) t3_.join();
   if (t6_.joinable()) t6_.join();
+  {
+    std::string s = "pitch: valid " + std::to_string(pitch_valid_frames_) + " of " + std::to_string(pitch_frames_) +
+                    " frames; fits";
+    for (int i = 0; i < kFitRejectCount; ++i)
+      if (reject_n_[i]) s += std::string(" ") + fit_reject_name(static_cast<FitReject>(i)) + " " + std::to_string(reject_n_[i]);
+    log_line(s);
+  }
   if (thumb_ring_.written())
     log_line("mini replay: " + std::to_string(thumb_ring_.written()) + " thumbnails, " +
              std::to_string(static_cast<double>(thumb_ns.load()) / 1.0e6) + " ms each");
@@ -351,13 +358,18 @@ void Pipeline::write_spadl(const char* path) const {
 
 void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
   for (std::uint32_t i = 0; i < slot.det_count; ++i) slot.det_team[i] = 0;
+  Lab det_lab[kMaxDetections];
+  bool det_lab_ok[kMaxDetections]{};
   for (std::uint32_t i = 0; i < slot.det_count; ++i) {
     const Detection& d = slot.dets[i];
-    if (d.track_id == 0 || d.class_id == 3) continue;
+    if (d.class_id == 3) continue;
     Lab sample;
     if (!torso_lab(slot.bgra.get(), slot.stride, slot.meta.width, slot.meta.height, d.x, d.y, d.w, d.h,
                    sample, cfg.green_margin, cfg.green_min, cfg.team_min_px))
       continue;
+    det_lab[i] = sample;
+    det_lab_ok[i] = true;
+    if (d.track_id == 0) continue;
     for (auto& t : tracker_.tracks) {
       if (t.id != d.track_id) continue;
       if (t.hits <= 1) t.lab = sample;
@@ -385,6 +397,64 @@ void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
     for (auto& t : tracker_.tracks) {
       if (t.id == 0 || t.team_lock || t.class_id == 3) continue;
       t.team = static_cast<std::uint8_t>(nearest_team(t.lab, seed_[0], seed_ok_[0], seed_[1], seed_ok_[1], cfg.team_max_dist));
+    }
+  }
+  // Every visible box on a team except one spare: the box the model calls a
+  // referee, else the one least like both kits (if past team_max_dist).
+  // Boxes not yet tracked are forced too (their team goes straight to
+  // det_team); one with no torso sample takes the nearest teamed box's team.
+  if (cfg.team_force && seed_ok_[0] && seed_ok_[1]) {
+    auto track_of = [&](std::uint16_t id) -> Track* {
+      if (id == 0) return nullptr;
+      for (auto& t : tracker_.tracks)
+        if (t.id == id) return &t;
+      return nullptr;
+    };
+    int spare = -1;
+    float spare_d = cfg.team_max_dist;
+    bool spare_ref = false;
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      const Detection& d = slot.dets[i];
+      if (d.class_id == 3) continue;
+      const Track* t = track_of(d.track_id);
+      if (t && t->team != 0) continue;
+      const bool has = t ? true : det_lab_ok[i];
+      const Lab lab = t ? t->lab : det_lab[i];
+      const float dist = has ? std::fmin(lab_dist(lab, seed_[0]), lab_dist(lab, seed_[1])) : 0.f;
+      const bool ref = d.class_id == 2;
+      if ((ref && !spare_ref) || (ref == spare_ref && dist > spare_d)) {
+        spare = static_cast<int>(i);
+        spare_d = dist;
+        spare_ref = ref;
+      }
+    }
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      const Detection& d = slot.dets[i];
+      if (static_cast<int>(i) == spare || d.class_id == 3) continue;
+      Track* t = track_of(d.track_id);
+      if (t) {
+        if (t->team == 0 && t->class_id != 3)
+          t->team = static_cast<std::uint8_t>(nearest_team(t->lab, seed_[0], true, seed_[1], true));
+      } else if (det_lab_ok[i]) {
+        slot.det_team[i] = static_cast<std::uint8_t>(nearest_team(det_lab[i], seed_[0], true, seed_[1], true));
+      }
+    }
+    // Untracked and no sample: nearest box (image) that has a team.
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      const Detection& d = slot.dets[i];
+      if (static_cast<int>(i) == spare || d.class_id == 3 || d.track_id != 0 || det_lab_ok[i]) continue;
+      float best = 1e30f;
+      for (std::uint32_t j = 0; j < slot.det_count; ++j) {
+        if (j == i || slot.dets[j].class_id == 3) continue;
+        const Track* t = track_of(slot.dets[j].track_id);
+        const std::uint8_t team = t ? t->team : slot.det_team[j];
+        if (team != 1 && team != 2) continue;
+        const float dx = slot.dets[j].x - d.x, dy = slot.dets[j].y - d.y;
+        if (dx * dx + dy * dy < best) {
+          best = dx * dx + dy * dy;
+          slot.det_team[i] = team;
+        }
+      }
     }
   }
   for (auto& t : tracker_.tracks) {
@@ -641,6 +711,7 @@ void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
     last_reject_ = fitted.valid && ls.support < lp.min_support
                        ? FitReject::Lines
                        : calib_.offer(fitted, sx, sy, dx, dy, n, W, H, head_y, params);
+    ++reject_n_[static_cast<int>(last_reject_)];
     if (pitch_logs_ < 6) {
       ++pitch_logs_;
       log_line("pitch fit: " + std::to_string(n) + " pts, error " + std::to_string(fitted.rms_m) +
@@ -660,6 +731,8 @@ void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
   const Homography& h = calib_.current();
   slot.line_support = line_support_;
   slot.pitch_valid = calib_.valid() ? 1 : 0;
+  ++pitch_frames_;
+  pitch_valid_frames_ += slot.pitch_valid;
   slot.reproj_m = h.rms_m;
   slot.pitch_age = static_cast<std::uint16_t>(calib_.age() > 65535 ? 65535 : calib_.age());
   slot.pitch_reject = static_cast<std::uint8_t>(last_reject_);

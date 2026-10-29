@@ -186,6 +186,8 @@ class Pipeline {
   float anchor_x_[32]{};
   float anchor_y_[32]{};
   int pitch_logs_ = 0;
+  std::uint32_t reject_n_[kFitRejectCount]{};  // fits per outcome, logged at join
+  std::uint32_t pitch_frames_ = 0, pitch_valid_frames_ = 0;
   Lab seed_[2]{};
   bool seed_ok_[2]{};
   std::uint16_t seed_req_id_ = 0;

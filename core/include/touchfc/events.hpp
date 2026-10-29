@@ -57,12 +57,55 @@ struct TeamStats {
   std::uint32_t shots[2]{};
   std::uint32_t key_passes[2]{};
   float poss_s[2]{};  // in-play seconds with that team in possession
+  std::uint32_t prog[2]{};        // completed passes 10 m forward, or into the final third
+  std::uint32_t recoveries[2]{};  // ball won from the other team (not a shot ending)
+  std::uint32_t high_rec[2]{};    // ... in the other team's half
+  float xg[2]{};                  // summed shot xG
+  float xt_gain[2]{};             // xT added by completed passes
+  float final_third_s[2]{};       // possession seconds in the attacking third
   float pass_pct(int t) const noexcept { return passes[t] ? 100.f * passes_ok[t] / passes[t] : 0.f; }
   float poss_pct(int t) const noexcept {
     const float s = poss_s[0] + poss_s[1];
     return s > 0.f ? 100.f * poss_s[t] / s : 50.f;
   }
 };
+
+// Team ratings 0..10, 5 when level. Tracks do not survive re-acquisition, so
+// ratings are per team. Mostly shares against the other team (detection
+// misses hit both alike), with priors so a quiet start reads 5.
+struct TeamRatings {
+  float attack = 5.f, build = 5.f, defence = 5.f, control = 5.f, overall = 5.f;
+};
+
+inline TeamRatings team_ratings(const TeamStats& s, int t) noexcept {
+  const int o = 1 - t;
+  auto share = [](float a, float b, float k) { return (a + k) / (a + b + 2.f * k); };
+  auto f = [](std::uint32_t v) { return static_cast<float>(v); };
+  auto comp = [&](int i) {  // completion 55% -> 0, 95% -> 1; prior 75% over 5 passes
+    const float c = (f(s.passes_ok[i]) + 3.75f) / (f(s.passes[i]) + 5.f);
+    return std::fmin(1.f, std::fmax(0.f, (c - 0.55f) / 0.4f));
+  };
+  TeamRatings r;
+  r.attack = 10.f * (0.45f * share(s.xg[t], s.xg[o], 0.3f) + 0.2f * share(f(s.shots[t]), f(s.shots[o]), 2.f) +
+                     0.15f * share(f(s.key_passes[t]), f(s.key_passes[o]), 1.f) +
+                     0.2f * share(s.final_third_s[t], s.final_third_s[o], 30.f));
+  r.build = 10.f * (0.4f * comp(t) + 0.3f * share(f(s.prog[t]), f(s.prog[o]), 3.f) +
+                    0.3f * share(s.xt_gain[t], s.xt_gain[o], 0.1f));
+  r.defence = 10.f * (0.35f * share(f(s.recoveries[t]), f(s.recoveries[o]), 3.f) +
+                      0.25f * share(f(s.high_rec[t]), f(s.high_rec[o]), 2.f) + 0.2f * (1.f - comp(o)) +
+                      0.2f * (1.f - share(s.xg[o], s.xg[t], 0.3f)));
+  r.control = 10.f * (0.7f * share(s.poss_s[t], s.poss_s[o], 30.f) +
+                      0.3f * share(f(s.passes[t]), f(s.passes[o]), 5.f));
+  r.overall = 0.25f * (r.attack + r.build + r.defence + r.control);
+  return r;
+}
+
+// Shot xG from distance and the angle between the posts (logistic).
+inline float shot_xg(float x, float y, float gx) noexcept {
+  const float dx = std::fabs(gx - x), d = std::hypot(dx, y);
+  const float th = std::atan2(7.32f * dx, dx * dx + y * y - 3.66f * 3.66f);
+  return 1.f / (1.f + std::exp(1.1f + 0.11f * d - 1.6f * th));
+}
 
 struct TrackStats {
   std::uint16_t track = 0;
@@ -139,7 +182,10 @@ class EventDetector {
       f.team = holder_team_;
     }
     const float speed = ball_speed();
-    if (f.holder && (f.team == 1 || f.team == 2) && dt > 0.f && dt < 0.5f) stats_.poss_s[f.team - 1] += dt;
+    if (f.holder && (f.team == 1 || f.team == 2) && dt > 0.f && dt < 0.5f) {
+      stats_.poss_s[f.team - 1] += dt;
+      if (f.ball && f.bx * static_cast<float>(dir_of(f.team, p)) > 17.5f) stats_.final_third_s[f.team - 1] += dt;
+    }
 
     // A release: the holder lost the ball.
     if (holder_ && f.holder != holder_) {
@@ -178,8 +224,13 @@ class EventDetector {
         const bool same = f.team == rel_team_;
         if (!same && (shot_cand_ || shot_end(f.t_s, p))) {
           n += emit_shot(f.t_s, out + n, p);
-        } else if (moved() >= p.pass_min_dist_m) {
-          n += emit_pass(f.t_s, same, f.holder, f.team, !same && speed > p.ball_flight_min_mps, out + n, p);
+        } else {
+          if (moved() >= p.pass_min_dist_m)
+            n += emit_pass(f.t_s, same, f.holder, f.team, !same && speed > p.ball_flight_min_mps, out + n, p);
+          if (!same && (f.team == 1 || f.team == 2)) {
+            ++stats_.recoveries[f.team - 1];
+            if (f.bx * static_cast<float>(dir_of(f.team, p)) > 0.f) ++stats_.high_rec[f.team - 1];
+          }
         }
       }
       free_ = false;
@@ -267,7 +318,11 @@ class EventDetector {
     if (ok) {
       ++stats_.passes_ok[team_i];
       if (ts) ++ts->passes_ok;
-      float v = p.rating_pass_k * (xt_at(cur_x_, cur_y_, dir) - xt_at(rel_x_, rel_y_, dir));
+      const float gain = xt_at(cur_x_, cur_y_, dir) - xt_at(rel_x_, rel_y_, dir);
+      if (gain > 0.f) stats_.xt_gain[team_i] += gain;
+      const float fx = static_cast<float>(dir);
+      if (fx * (cur_x_ - rel_x_) >= 10.f || (fx * cur_x_ > 17.5f && fx * rel_x_ <= 17.5f)) ++stats_.prog[team_i];
+      float v = p.rating_pass_k * gain;
       if (rel_opp_ <= p.rating_press_m) v *= p.rating_press_mult;
       rate(rel_track_, rel_team_, v < -p.rating_pass_floor ? -p.rating_pass_floor : v);
       last_ok_t_ = t;
@@ -334,6 +389,7 @@ class EventDetector {
     t = shot_t_;
     const float gx = shot_gx_, y_at = shot_y_;
     ++stats_.shots[team_i];
+    stats_.xg[team_i] += shot_xg(rel_x_, rel_y_, gx);
     if (TrackStats* ts = slot(rel_track_, rel_team_)) ++ts->shots;
     rate(rel_track_, rel_team_, p.rating_shot);
     last_shot_track_ = rel_track_;

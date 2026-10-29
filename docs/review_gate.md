@@ -200,6 +200,15 @@ Not verified here: the done-when on a broadcast replay (panels never cover the b
 
 Telemetry before and after: `docs/bench/README.md` (selftest; no added p99 on T1 to T3). Not verified: a shot on a broadcast replay producing a clip within 2 s (the test clips have no shots); the copy (12 ms) and T7's 50 ms poll put it far inside the limit. The playback window has not been watched here.
 
+## Team ratings and forced teams (after M15)
+
+| What | Where | Notes |
+|---|---|---|
+| Team ratings | `events.hpp` `team_ratings` | Attack, build-up, defence, control, overall, 0 to 10 (5 level), in the stats panel with xG. Shares against the other team with priors, from new `TeamStats` counters: xG (distance and post angle), xT gained, progressive passes, recoveries and high recoveries, final-third possession time. Replaces the per-player TFC on the card and HUD (tracks do not survive re-acquisition). |
+| Forced teams | `pipeline.cpp` `assign_teams` | `team_force` (Teams tab, on): once both kits are seeded, every visible box is put on the nearer kit except one spare, the model's referee or else the box least like both kits. Unteamed player boxes are grey, not cyan. |
+
+Not verified on a broadcast: rating weights and xG fit are hand-set; the spare box choice with two assistant referees in shot (one is forced onto a team).
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.

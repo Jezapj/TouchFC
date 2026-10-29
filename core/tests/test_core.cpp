@@ -1513,3 +1513,26 @@ TEST_CASE("panel flip: moves after react time, holds, then goes home") {
   f.force(1);
   REQUIRE(f.pos() == 1.f);
 }
+
+TEST_CASE("team ratings: level at the start, xG favours the shooting side") {
+  TeamStats s;
+  const TeamRatings a0 = team_ratings(s, 0);
+  REQUIRE(std::fabs(a0.overall - 5.f) < 1e-4f);
+  REQUIRE(std::fabs(a0.attack - 5.f) < 1e-4f);
+  REQUIRE(shot_xg(41.5f, 0.f, 52.5f) > shot_xg(27.5f, 0.f, 52.5f));  // 11 m beats 25 m
+  REQUIRE(shot_xg(46.5f, 0.f, 52.5f) > 0.3f);
+  REQUIRE(shot_xg(27.5f, 0.f, 52.5f) < 0.08f);
+  s.shots[0] = 4;
+  s.xg[0] = 1.2f;
+  s.recoveries[1] = 6;
+  s.passes[0] = 20;
+  s.passes_ok[0] = 18;
+  s.passes[1] = 20;
+  s.passes_ok[1] = 11;
+  const TeamRatings a = team_ratings(s, 0), b = team_ratings(s, 1);
+  REQUIRE(a.attack > 6.f);
+  REQUIRE(b.attack < 4.f);
+  REQUIRE(a.build > b.build);
+  REQUIRE(a.overall > b.overall);
+  REQUIRE(a.attack <= 10.f);
+}

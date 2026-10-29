@@ -631,11 +631,11 @@ void App::draw_view() {
     ImGui::GetForegroundDrawList()->AddRect(a, b, IM_COL32(255, 176, 32, 255), 0.f, 0, 2.f);
   }
   if (have_frame_) {
-    // Class 0 (player) is cyan, 1 (goalkeeper) yellow, 2 (referee) magenta,
+    // Class 0 (player) is grey, 1 (goalkeeper) yellow, 2 (referee) magenta,
     // 3 (ball) green, everything else grey. These classes match the roboflow
     // sports model's label order; the stub uses them too.
     static constexpr ImU32 kClassColor[] = {
-        IM_COL32(0, 220, 220, 255),   IM_COL32(255, 220, 32, 255),
+        IM_COL32(200, 200, 200, 255), IM_COL32(255, 220, 32, 255),
         IM_COL32(220, 32, 220, 255),  IM_COL32(32, 220, 32, 255),
         IM_COL32(200, 200, 200, 255),
     };
@@ -767,8 +767,7 @@ void App::draw_view() {
   if (last_pitch_valid_) {
     if (last_pc_valid_) ImGui::Text("territory A %.0f%%", last_territory_ * 100.f);
     if (last_poss_team_ != 0)
-      ImGui::Text("possession %s #%u   TFC %.1f", last_poss_team_ == 1 ? "A" : "B", last_poss_track_,
-                  (pipe_ ? pipe_->config().load().rating_base : 6.f) + last_holder_rating_);
+      ImGui::Text("possession %s #%u", last_poss_team_ == 1 ? "A" : "B", last_poss_track_);
     else if (last_ball_ok_) ImGui::TextUnformatted("ball seen, no holder");
   }
   if (pipe_) {
@@ -931,6 +930,35 @@ void App::draw_stats_panel() {
     row("completion", [&](int t) { ImGui::Text("%.0f%%", ts.pass_pct(t)); });
     row("shots", [&](int t) { ImGui::Text("%u", ts.shots[t]); });
     row("key passes", [&](int t) { ImGui::Text("%u", ts.key_passes[t]); });
+    row("xG", [&](int t) { ImGui::Text("%.2f", static_cast<double>(ts.xg[t])); });
+    ImGui::EndTable();
+  }
+  // Team ratings, 0..10 (5 level).
+  const TeamRatings tr[2] = {team_ratings(ts, 0), team_ratings(ts, 1)};
+  ImGui::Separator();
+  if (ImGui::BeginTable("ratings", 3, ImGuiTableFlags_SizingFixedFit)) {
+    auto rate = [&](const char* name, float TeamRatings::*m) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(name);
+      for (int t = 0; t < 2; ++t) {
+        ImGui::TableNextColumn();
+        const float v = tr[t].*m;
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float w = 40.f, h = ImGui::GetTextLineHeight();
+        auto* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(255, 255, 255, 30));
+        dl->AddRectFilled(p, ImVec2(p.x + w * std::clamp(v / 10.f, 0.f, 1.f), p.y + h), team_color(match_, t));
+        ImGui::Dummy(ImVec2(w, h));
+        ImGui::SameLine();
+        ImGui::Text("%.1f", static_cast<double>(v));
+      }
+    };
+    rate("attack", &TeamRatings::attack);
+    rate("build-up", &TeamRatings::build);
+    rate("defence", &TeamRatings::defence);
+    rate("control", &TeamRatings::control);
+    rate("overall", &TeamRatings::overall);
     ImGui::EndTable();
   }
   // Before kick-off and in a long break (half time): form and absentees.
@@ -973,7 +1001,6 @@ void App::draw_card() {
   else
     ImGui::Text("#%u %s", last_poss_track_, match_.teams_ok ? match_.team[t].code : (t == 0 ? "A" : "B"));
   ImGui::Text("on the ball %.1f s", last_poss_spell_s_);
-  ImGui::Text("TFC %.1f", (pipe_ ? pipe_->config().load().rating_base : 6.f) + last_holder_rating_);
   if (pl) {
     ImGui::Text("passes %u/%u   shots %u", last_holder_passes_ok_, last_holder_passes_, last_holder_shots_);
     ImGui::TextDisabled("season: %u apps  %u G  %u A", pl->apps, pl->goals, pl->assists);

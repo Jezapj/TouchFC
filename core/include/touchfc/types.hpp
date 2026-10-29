@@ -194,7 +194,8 @@ struct Config {
   std::uint8_t mini_replay = 1;
   std::uint8_t ball_off_on = 0;      // a lofted ball projects past the lines, so off by default
   std::uint8_t replay_budget_pct = 5;  // mini replay pauses above this % late/dropped; 0 never
-  std::uint8_t pad[3]{};
+  std::uint8_t team_force = 1;  // every box on a team but one (the referee)
+  std::uint8_t pad[2]{};
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };
