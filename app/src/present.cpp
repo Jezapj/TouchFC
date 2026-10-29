@@ -640,7 +640,8 @@ void App::draw_view() {
         IM_COL32(200, 200, 200, 255),
     };
     auto* dl = ImGui::GetForegroundDrawList();
-    for (std::uint32_t i = 0; i < last_det_count_; ++i) {
+    const std::uint32_t shown = pipe_ && !pipe_->config().load().show_boxes ? 0 : last_det_count_;
+    for (std::uint32_t i = 0; i < shown; ++i) {
       const Detection& d = last_dets_[i];
       const bool teamed = last_team_[i] == 1 || last_team_[i] == 2;
       const ImU32 col = teamed ? (last_team_[i] == 1 ? IM_COL32(40, 140, 255, 255) : IM_COL32(255, 70, 70, 255))

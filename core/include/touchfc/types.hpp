@@ -154,6 +154,8 @@ struct Config {
   float ball_flight_min_mps = 6.f;
   float shot_speed_mps = 8.f;
   float shot_zone_m = 35.f;          // a shot starts this close to the goal
+  float shot_end_m = 9.f;            // a loose ball this close to the goal line ends a shot
+  float shot_blind_m = 22.f;         // release this close, unseen, then dead: a shot (0 off)
   float key_pass_window_s = 5.f;     // completed pass then shot by the same team
   // TFC rating (spec 11.5): xT-based, shown as rating_base + contributions
   float rating_pass_k = 3.f;

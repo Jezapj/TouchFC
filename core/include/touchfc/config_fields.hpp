@@ -84,6 +84,8 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(ball_flight_min_mps, Events, "ball flight min m/s", 1.f, 30.f),
     TOUCHFC_CFG(shot_speed_mps, Events, "shot speed m/s", 2.f, 40.f),
     TOUCHFC_CFG(shot_zone_m, Events, "shot zone m", 10.f, 60.f),
+    TOUCHFC_CFG(shot_end_m, Events, "shot end depth m", 2.f, 20.f),
+    TOUCHFC_CFG(shot_blind_m, Events, "unseen shot range m (0 off)", 0.f, 40.f),
     TOUCHFC_CFG(key_pass_window_s, Events, "key pass window s", 1.f, 15.f),
 
     TOUCHFC_CFG(rating_base, Rating, "base", 0.f, 10.f),

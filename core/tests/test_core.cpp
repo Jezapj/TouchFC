@@ -1536,3 +1536,28 @@ TEST_CASE("team ratings: level at the start, xG favours the shooting side") {
   REQUIRE(a.overall > b.overall);
   REQUIRE(a.attack <= 10.f);
 }
+
+TEST_CASE("events: a struck ball lost at once, then a dead ball, is a shot") {
+  Sim s;
+  for (int k = 0; k < 10; ++k) s.frame(36.f, 3.f, 9, 1);  // 16.8 m out, central
+  for (int k = 0; k < 30; ++k) {  // never seen again
+    EventFrame f;
+    f.t_s = s.t;
+    s.n += s.d.step(f, 0.04f, s.log + s.n, s.p);
+    s.t += 0.04f;
+  }
+  Event out[4];
+  s.d.stop(s.t, out, s.p);
+  REQUIRE(s.d.team_stats().shots[0] == 1);
+  // Same from the halfway line is not a shot.
+  Sim w;
+  for (int k = 0; k < 10; ++k) w.frame(0.f, 3.f, 9, 1);
+  for (int k = 0; k < 30; ++k) {
+    EventFrame f;
+    f.t_s = w.t;
+    w.n += w.d.step(f, 0.04f, w.log + w.n, w.p);
+    w.t += 0.04f;
+  }
+  w.d.stop(w.t, out, w.p);
+  REQUIRE(w.d.team_stats().shots[0] == 0);
+}

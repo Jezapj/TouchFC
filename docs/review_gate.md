@@ -207,6 +207,9 @@ Telemetry before and after: `docs/bench/README.md` (selftest; no added p99 on T1
 | Team ratings | `events.hpp` `team_ratings` | Attack, build-up, defence, control, overall, 0 to 10 (5 level), in the stats panel with xG. Shares against the other team with priors, from new `TeamStats` counters: xG (distance and post angle), xT gained, progressive passes, recoveries and high recoveries, final-third possession time. Replaces the per-player TFC on the card and HUD (tracks do not survive re-acquisition). |
 | Forced teams | `pipeline.cpp` `assign_teams` | `team_force` (Teams tab, on): once both kits are seeded, every visible box is put on the nearer kit except one spare, the model's referee or else the box least like both kits. Unteamed player boxes are grey, not cyan. |
 
+| Event sensitivity | `events.hpp` | Holder kept through a ball miss of max(0.4 s, 2.5 frames), so low frame rates do not split touches. Shots also end on a loose ball within `shot_end_m` (9) of the goal line, and on a central release within `shot_blind_m` (22) of the attacked goal that is never seen again before a dead ball (0 off). Ball position reset to the release point at release (a stale one faked long moves). Untracked boxes cannot hold the ball. |
+| Show boxes | `present.cpp` | Drawing only; detections still feed tracking, minimap and stats (it used to clear them). |
+
 Not verified on a broadcast: rating weights and xG fit are hand-set; the spare box choice with two assistant referees in shot (one is forced onto a team).
 
 ## Licence and weights

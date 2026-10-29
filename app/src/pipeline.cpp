@@ -259,7 +259,8 @@ void Pipeline::update_possession(FrameSlot& slot) {
   std::uint8_t team = 0;
   if (have) {
     for (std::uint32_t i = 0; i < slot.det_count; ++i) {
-      if (slot.dets[i].class_id == 3 || slot.det_team[i] == 0 || !slot.pitch_ok[i]) continue;
+      if (slot.dets[i].class_id == 3 || slot.dets[i].track_id == 0 || slot.det_team[i] == 0 || !slot.pitch_ok[i])
+        continue;
       const float dx = slot.pitch_x[i] - bx;
       const float dy = slot.pitch_y[i] - by;
       const float d = dx * dx + dy * dy;
@@ -283,6 +284,8 @@ void Pipeline::update_possession(FrameSlot& slot) {
     ep.ball_flight_min_mps = cfg.ball_flight_min_mps;
     ep.shot_speed_mps = cfg.shot_speed_mps;
     ep.shot_zone_m = cfg.shot_zone_m;
+    ep.shot_end_m = cfg.shot_end_m;
+    ep.shot_blind_m = cfg.shot_blind_m;
     ep.key_pass_window_s = cfg.key_pass_window_s;
     ep.attack_dir = attack_dir.load(std::memory_order_relaxed);
     ep.rating_pass_k = cfg.rating_pass_k;
@@ -970,10 +973,9 @@ void Pipeline::run_t3() {
     FrameSlot& slot = pool_.slot(index);
     const Config cfg = config_.load();
     Marker marker = marker_for(slot.meta.id, slot.meta.width);
-    if (!cfg.show_boxes) {
+    if (!cfg.show_boxes) {  // drawing only; detections still feed tracking and stats
       marker.w = 0;
       marker.h = 0;
-      slot.det_count = 0;
     }
     const TimeNs now = now_ns();
     float dt = tracker_params_.dt_default;

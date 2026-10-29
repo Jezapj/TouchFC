@@ -37,6 +37,8 @@ struct EventParams {
   float ball_flight_min_mps = 6.f;
   float shot_speed_mps = 8.f;
   float shot_zone_m = 35.f;
+  float shot_end_m = 9.f;     // a loose ball this close to the goal line ends a shot
+  float shot_blind_m = 22.f;  // release this close, then unseen until a dead ball: a shot (0 off)
   float key_pass_window_s = 5.f;
   int attack_dir = 1;  // team 1 attacks +x when 1; team 2 the other way
   // TFC rating (spec 11.5)
@@ -153,7 +155,7 @@ class EventDetector {
   // incomplete pass (out of play).
   int stop(float t_s, Event* out, const EventParams& p) noexcept {
     int n = 0;
-    if (free_ && (shot_cand_ || shot_end(t_s, p))) n += emit_shot(t_s, out + n, p);
+    if (free_ && (shot_cand_ || shot_end(t_s, p) || shot_blind(t_s, p))) n += emit_shot(t_s, out + n, p);
     else if (free_ && flew_ && moved() >= p.pass_min_dist_m) n += emit_pass(t_s, false, 0, 0, false, out + n, p);
     holder_ = 0;
     free_ = false;
@@ -174,10 +176,13 @@ class EventDetector {
     // The ball detector misses frames (blur, occlusion at the feet): keep the
     // holder until the ball is seen again, for up to kHoldMissS.
     EventFrame f = in;
+    if (dt > 0.f && dt < 1.f) frame_dt_ += 0.1f * (dt - frame_dt_);
+    // Low frame rates: a miss of 2.5 frames is still one touch.
+    const float hold_s = std::fmax(kHoldMissS, 2.5f * frame_dt_);
     if (f.ball) {
       push_ball(f.t_s, f.bx, f.by);
       seen_t_ = f.t_s;
-    } else if (holder_ && f.t_s - seen_t_ < kHoldMissS) {
+    } else if (holder_ && f.t_s - seen_t_ < hold_s) {
       f.holder = holder_;
       f.team = holder_team_;
     }
@@ -197,6 +202,8 @@ class EventDetector {
         rel_team_ = holder_team_;
         rel_x_ = last_x_;
         rel_y_ = last_y_;
+        cur_x_ = last_x_;  // until the ball is seen again
+        cur_y_ = last_y_;
         rel_t_ = f.t_s;
         rel_opp_ = holder_opp_;
       }
@@ -374,11 +381,24 @@ class EventDetector {
     const float gx = cur_x_ > 0.f ? 52.5f : -52.5f;
     const float to_goal = std::fabs(gx - cur_x_);
     if (std::fabs(rel_y_) > 24.f || std::hypot(gx - rel_x_, rel_y_) > p.shot_zone_m) return false;
-    if (std::fabs(cur_x_) < 52.5f - 6.f || std::fabs(cur_y_) > 11.f) return false;
+    if (std::fabs(cur_x_) < 52.5f - p.shot_end_m || std::fabs(cur_y_) > 3.66f + p.shot_end_m) return false;
     if (std::fabs(gx - rel_x_) - to_goal < 3.f) return false;  // must travel toward goal
     shot_gx_ = gx;
     shot_y_ = std::fabs(cur_y_) < 3.66f ? cur_y_ : (cur_y_ > 0.f ? 3.66f : -3.66f);
     shot_t_ = t;
+    return true;
+  }
+
+  // Low frame rates often lose a struck ball at once: a release from a
+  // central spot within shot_blind_m of the goal it attacks, the ball not seen
+  // to move again, and a dead ball within 4 s.
+  bool shot_blind(float t, const EventParams& p) noexcept {
+    if (p.shot_blind_m <= 0.f || moved() > 3.f || t - rel_t_ > 4.f || std::fabs(rel_y_) > 20.f) return false;
+    const float gx = dir_of(rel_team_, p) >= 0 ? 52.5f : -52.5f;
+    if (std::hypot(gx - rel_x_, rel_y_) > p.shot_blind_m) return false;
+    shot_gx_ = gx;
+    shot_y_ = 0.f;
+    shot_t_ = rel_t_;
     return true;
   }
 
@@ -423,6 +443,7 @@ class EventDetector {
   Sample hist_[5]{};
   int hist_i_ = 0, hist_n_ = 0;
   float seen_t_ = -1e9f;
+  float frame_dt_ = 0.04f;
   std::uint16_t holder_ = 0;
   std::uint8_t holder_team_ = 0;
   float holder_opp_ = 99.f;
