@@ -3,6 +3,7 @@
 #include "frame_pool.hpp"
 
 #include "touchfc/detection.hpp"
+#include "touchfc/detector_presets.hpp"
 
 #include <memory>
 #include <string>
@@ -38,9 +39,9 @@ class Detector {
 // path is given.
 std::unique_ptr<Detector> make_stub_detector();
 
-// Optional ORT detector. Returns nullptr with `error` set when ORT is not
-// compiled in or the model cannot be loaded.
-std::unique_ptr<Detector> make_ort_detector(const std::string& model_path,
-                                            std::string& error);
+// Optional ORT detector. Reads YOLOv8 heads and DETR-family heads (RT-DETR,
+// D-FINE, DEIM, RF-DETR), told apart by the output shapes. Returns nullptr
+// with `error` set when ORT is not compiled in or the model cannot be loaded.
+std::unique_ptr<Detector> make_ort_detector(const DetectorPreset& preset, std::string& error);
 
 }  // namespace touchfc

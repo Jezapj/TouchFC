@@ -8,11 +8,12 @@ namespace {
 
 void print_usage() {
   std::fputs(
-      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away] [--mini-replay 0|1]\n"
+      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--detector name] [--keypoints path.onnx] [--seconds N] [--pin] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away] [--mini-replay 0|1]\n"
       "  --selftest   synthetic 50 fps clip (default)\n"
       "  --replay     pace a video file through the same pipeline\n"
       "  --overlay    pick a window and draw a click-through capture overlay\n"
-      "  --model      YOLOv8 ONNX model; without this a deterministic stub paints boxes\n"
+      "  --model      detector ONNX (YOLOv8 or DETR family); without it or --detector a stub paints boxes\n"
+      "  --detector   a preset name from config/detectors.json (overlay mode remembers the last pick)\n"
       "  --keypoints  pitch-keypoint ONNX; without it the minimap needs a manual calibration\n"
       "  --seconds    exit after N seconds (useful for a smoke run)\n"
       "  --pin        pin pipeline threads to one L3 cache\n"
@@ -43,6 +44,8 @@ int main(int argc, char** argv) {
       args.seconds = std::atof(argv[++i]);
     } else if (a == "--model" && i + 1 < argc) {
       args.model_path = argv[++i];
+    } else if (a == "--detector" && i + 1 < argc) {
+      args.detector_name = argv[++i];
     } else if (a == "--keypoints" && i + 1 < argc) {
       args.keypoints_path = argv[++i];
     } else if (a == "--match" && i + 1 < argc) {

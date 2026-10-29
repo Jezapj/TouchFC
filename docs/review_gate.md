@@ -222,6 +222,18 @@ Not verified on a broadcast: rating weights and xG fit are hand-set; the spare b
 
 Not measured: glass latency (PresentMon), GPU inference on the S1 target hardware.
 
+## M16 state
+
+| What | Where | Notes |
+|---|---|---|
+| DETR decode | [`core/include/touchfc/detr.hpp`](../core/include/touchfc/detr.hpp) | Dense (per-query class scores, probabilities or logits found per call) and sparse (labels + scores) decoders. No NMS. Dropped classes never win a query. A full list keeps the best scores. |
+| Stretch resize, ImageNet norm | [`preprocess.hpp`](../core/include/touchfc/preprocess.hpp) | `LetterboxParams::scale_y` (equal to `scale` when letterboxed), `make_stretch`, `normalize_imagenet_chw`. The AVX2 path takes the y scale. |
+| Presets | [`config/detectors.json`](../config/detectors.json), [`detector_presets.hpp`](../core/include/touchfc/detector_presets.hpp) | Main tab combo before capture (missing files greyed out, pick in `profiles/detector.txt`), `--detector`. Selftest and replay keep the stub unless asked. |
+| Head detection | [`app/src/ort_detector.cpp`](../app/src/ort_detector.cpp) | Checked with constant-output ONNX models of the sparse, split and joint heads (expected counts 2, 2, 1) and with `yolov8n.onnx` on a test clip. |
+| Tests | `core/tests/test_core.cpp` | Stretch round trip and sampling, dense logits with a background slot, sparse capacity, preset parsing and COCO map. 746 assertions in 61 cases. |
+
+Pending: a real fine-tuned D-FINE-N or RF-DETR-Nano compared with yolov8n on the test clips (inference p50, ball seen).
+
 ## Licence and weights
 
-The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. No broadcast footage is in the tree.
+The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. `docs/models.md` lists the detector licences: D-FINE, DEIM, RT-DETR (lyuwenyu) and RF-DETR are Apache 2.0; Ultralytics models (yolov8n, the roboflow/sports pitch model) are AGPL-3.0. No broadcast footage is in the tree.

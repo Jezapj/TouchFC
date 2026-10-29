@@ -29,6 +29,7 @@ inline LetterboxParams make_letterbox(std::uint32_t sw, std::uint32_t sh,
   const float sx = static_cast<float>(dst_side) / static_cast<float>(sw);
   const float sy = static_cast<float>(dst_side) / static_cast<float>(sh);
   p.scale = std::min(sx, sy);
+  p.scale_y = p.scale;
   const float used_w = static_cast<float>(sw) * p.scale;
   const float used_h = static_cast<float>(sh) * p.scale;
   p.pad_x = (static_cast<float>(dst_side) - used_w) * 0.5f;
@@ -36,14 +37,30 @@ inline LetterboxParams make_letterbox(std::uint32_t sw, std::uint32_t sh,
   return p;
 }
 
+// Plain resize to a square input, no padding: what Roboflow's "stretch"
+// export and the D-FINE / RT-DETR training pipelines feed the model.
+inline LetterboxParams make_stretch(std::uint32_t sw, std::uint32_t sh,
+                                    std::uint32_t dst_side) noexcept {
+  LetterboxParams p{};
+  p.src_w = sw;
+  p.src_h = sh;
+  p.dst_w = dst_side;
+  p.dst_h = dst_side;
+  if (sw == 0 || sh == 0 || dst_side == 0) return p;
+  p.scale = static_cast<float>(dst_side) / static_cast<float>(sw);
+  p.scale_y = static_cast<float>(dst_side) / static_cast<float>(sh);
+  return p;
+}
+
 // Map a detection in letterboxed coordinates back to original image pixels.
 inline void unletterbox_box(const LetterboxParams& p, float& x, float& y,
                             float& w, float& h) noexcept {
   const float inv = p.scale > 0 ? 1.f / p.scale : 1.f;
+  const float inv_y = p.scale_y > 0 ? 1.f / p.scale_y : 1.f;
   x = (x - p.pad_x) * inv;
-  y = (y - p.pad_y) * inv;
+  y = (y - p.pad_y) * inv_y;
   w = w * inv;
-  h = h * inv;
+  h = h * inv_y;
 }
 
 // Nearest-neighbour BGRA -> CHW float32, normalised to [0,1], padded to 114/255
@@ -69,8 +86,9 @@ inline void bgra_letterbox_to_chw_scalar(const std::uint8_t* src, std::uint32_t 
   // Precompute source y for each destination row (nearest neighbour).
   // dy=0..D-1, src_y = clamp(floor((dy - pad_y) / scale), 0, sh-1), or -1 for pad.
   const float inv = p.scale > 0 ? 1.f / p.scale : 0.f;
+  const float inv_y = p.scale_y > 0 ? 1.f / p.scale_y : 0.f;
   for (std::uint32_t dy = 0; dy < D; ++dy) {
-    const float fy = (static_cast<float>(dy) + 0.5f - p.pad_y) * inv - 0.5f;
+    const float fy = (static_cast<float>(dy) + 0.5f - p.pad_y) * inv_y - 0.5f;
     const int sy_i = static_cast<int>(std::floor(fy + 0.5f));
     const bool row_pad = sy_i < 0 || sy_i >= static_cast<int>(sh);
     const std::uint8_t* src_row = row_pad ? nullptr : src + static_cast<std::size_t>(sy_i) * src_stride;
@@ -113,13 +131,14 @@ inline void bgra_letterbox_to_chw_avx2(const std::uint8_t* src, std::uint32_t sw
   constexpr float kPad = 114.f / 255.f;
   constexpr float kInv = 1.f / 255.f;
   const float inv_scale = p.scale > 0 ? 1.f / p.scale : 0.f;
+  const float inv_scale_y = p.scale_y > 0 ? 1.f / p.scale_y : 0.f;
 
   const __m256 v_inv = _mm256_set1_ps(kInv);
   const __m256 v_pad = _mm256_set1_ps(kPad);
   const __m256i v_mask_ff = _mm256_set1_epi32(0xff);
 
   for (std::uint32_t dy = 0; dy < D; ++dy) {
-    const float fy = (static_cast<float>(dy) + 0.5f - p.pad_y) * inv_scale - 0.5f;
+    const float fy = (static_cast<float>(dy) + 0.5f - p.pad_y) * inv_scale_y - 0.5f;
     const int sy_i = static_cast<int>(std::floor(fy + 0.5f));
     const bool row_pad = sy_i < 0 || sy_i >= static_cast<int>(sh);
     float* r = dR + static_cast<std::size_t>(dy) * D;
@@ -200,6 +219,19 @@ inline void bgra_letterbox_to_chw_avx2(const std::uint8_t* src, std::uint32_t sw
   }
 }
 #endif  // TOUCHFC_HAS_AVX2
+
+// ImageNet mean / std on a [0,1] CHW tensor (RF-DETR and other DINOv2 or
+// ResNet backbones that were trained normalised).
+inline void normalize_imagenet_chw(float* dst, std::uint32_t side) noexcept {
+  static constexpr float kMean[3] = {0.485f, 0.456f, 0.406f};
+  static constexpr float kInvStd[3] = {1.f / 0.229f, 1.f / 0.224f, 1.f / 0.225f};
+  const std::size_t plane = static_cast<std::size_t>(side) * side;
+  for (int c = 0; c < 3; ++c) {
+    float* p = dst + c * plane;
+    const float m = kMean[c], k = kInvStd[c];
+    for (std::size_t i = 0; i < plane; ++i) p[i] = (p[i] - m) * k;
+  }
+}
 
 // Runtime dispatcher. Call this from the pipeline.
 inline void bgra_letterbox_to_chw(const std::uint8_t* src, std::uint32_t sw,

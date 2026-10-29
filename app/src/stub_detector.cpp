@@ -58,7 +58,7 @@ std::unique_ptr<Detector> make_stub_detector() {
 }
 
 #if !defined(TOUCHFC_HAS_ORT)
-std::unique_ptr<Detector> make_ort_detector(const std::string&, std::string& error) {
+std::unique_ptr<Detector> make_ort_detector(const DetectorPreset&, std::string& error) {
   error = "ONNX Runtime not compiled in; set TOUCHFC_ORT_ROOT and rebuild";
   return nullptr;
 }

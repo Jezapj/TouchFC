@@ -32,6 +32,7 @@ inline std::uint32_t decode_pitch_pose(const float* output, std::uint32_t num_ke
   }
   if (best_s < instance_conf) return 0;
   const float inv = letterbox.scale > 0.f ? 1.f / letterbox.scale : 1.f;
+  const float inv_y = letterbox.scale_y > 0.f ? 1.f / letterbox.scale_y : 1.f;
   std::uint32_t n = 0;
   for (std::uint32_t k = 0; k < num_keypoints && n < out_capacity; ++k) {
     const std::size_t base = static_cast<std::size_t>(5 + 3 * k) * stride;
@@ -39,7 +40,7 @@ inline std::uint32_t decode_pitch_pose(const float* output, std::uint32_t num_ke
     if (vis < keypoint_conf) continue;
     PitchKeypoint& kp = out[n++];
     kp.x = (output[base + best] - letterbox.pad_x) * inv;
-    kp.y = (output[base + stride + best] - letterbox.pad_y) * inv;
+    kp.y = (output[base + stride + best] - letterbox.pad_y) * inv_y;
     kp.id = static_cast<std::uint8_t>(k);
   }
   return n;

@@ -60,7 +60,7 @@ Steps, in PowerShell:
    ```
 3. Install ONNX Runtime. Download `onnxruntime-win-x64-1.20.1.zip` from https://github.com/microsoft/onnxruntime/releases. Extract it so that `third_party\onnxruntime\include\onnxruntime_cxx_api.h` exists. Without it the app builds with a stub detector that draws fake boxes.
 4. Put the models in `third_party\models\`. Weights are never committed; read each licence first (see `scripts/fetch_models.ps1`).
-   - `yolov8n.onnx`, the player and ball detector. Make it with `pip install ultralytics`, then `yolo export model=yolov8n.pt format=onnx imgsz=640`. A football-specific detector with player, goalkeeper, referee and ball classes, exported the same way, detects the ball much better.
+   - A player and ball detector. The presets in `config/detectors.json` list the expected files: a D-FINE or RF-DETR model fine-tuned on football data (Apache 2.0 code; how to train and export one: `docs/models.md`), or, for testing, `yolov8n.onnx` (Ultralytics, AGPL-3.0) made with `pip install ultralytics`, then `yolo export model=yolov8n.pt format=onnx imgsz=640`.
    - `football-pitch-detection.onnx`, the 32-point pitch keypoint model from https://github.com/roboflow/sports, exported to ONNX.
 5. Configure, build and test.
    ```
@@ -77,17 +77,18 @@ Run from the repo root. The app reads `data\` and writes `profiles\`, `cache\` a
 
 On a recorded match:
 ```
-build\windows-msvc\app\Release\touchfc.exe --replay match.mp4 --model third_party\models\yolov8n.onnx --keypoints third_party\models\football-pitch-detection.onnx
+build\windows-msvc\app\Release\touchfc.exe --replay match.mp4 --detector "Light: D-FINE-N" --keypoints third_party\models\football-pitch-detection.onnx
 ```
 
 On a live stream:
 ```
-build\windows-msvc\app\Release\touchfc.exe --overlay --model third_party\models\yolov8n.onnx --keypoints third_party\models\football-pitch-detection.onnx
+build\windows-msvc\app\Release\touchfc.exe --overlay --keypoints third_party\models\football-pitch-detection.onnx
 ```
+In overlay mode, pick the detector in the Main tab before **Start capture**: Light for a CPU, Balanced or Quality with a GPU. Presets whose file is missing are greyed out, and the last pick is remembered. `--detector "<name>"` or `--model file.onnx` choose one from the command line.
 Without `--keypoints` the pitch is never calibrated, so the minimap, possession and every event stay empty.
 
 First run on a match:
-1. Choose the window showing the stream (a browser or player), then **Start capture**. Play the stream full screen or large.
+1. Choose the window showing the stream (a browser or player) and the detector, then **Start capture**. Play the stream full screen or large.
 2. **Match tab:** choose the league, date, home and away teams. This fetches the lineups, form and kit colours. You can also start with `--match eng.1:YYYYMMDD:home:away`.
 3. **Main tab:** if the boxes are not blue and red yet, click one player of each team and press **A** or **B**. Everyone else then follows their kit colour. Use **attack direction** if team A attacks to the left.
 4. Wait for a wide shot. The HUD should show `pitch wide ... kp` with a small fit error, and dots on the minimap.

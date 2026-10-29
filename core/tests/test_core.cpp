@@ -5,6 +5,8 @@
 #include "touchfc/config_json.hpp"
 #include "touchfc/cpu.hpp"
 #include "touchfc/detection.hpp"
+#include "touchfc/detector_presets.hpp"
+#include "touchfc/detr.hpp"
 #include "touchfc/espn.hpp"
 #include "touchfc/events.hpp"
 #include "touchfc/frame_check.hpp"
@@ -549,6 +551,113 @@ TEST_CASE("yolo decode drops below-threshold anchors") {
   REQUIRE(out[0].score >= 0.9f);              // sorted by score, 0.95 first
   REQUIRE(out[0].class_id == 3);
   REQUIRE(out[1].class_id == 0);
+}
+
+TEST_CASE("stretch maps a box back with separate x and y scales") {
+  const LetterboxParams p = make_stretch(1280, 720, 640);
+  REQUIRE(p.pad_x == 0.f);
+  REQUIRE(p.pad_y == 0.f);
+  float x = 320, y = 320, w = 64, h = 64;
+  unletterbox_box(p, x, y, w, h);
+  REQUIRE(std::abs(x - 640.f) < 1e-3f);
+  REQUIRE(std::abs(y - 360.f) < 1e-3f);
+  REQUIRE(std::abs(w - 128.f) < 1e-3f);
+  REQUIRE(std::abs(h - 72.f) < 1e-3f);
+  // Preprocess samples the stretched source: dst row 320 is src row 360.
+  std::vector<std::uint8_t> src(1280u * 720u * 4u, 0);
+  for (std::uint32_t y = 358; y < 363; ++y)  // red patch at the centre
+    for (std::uint32_t x = 636; x < 646; ++x) src[(y * 1280u + x) * 4u + 2] = 255;
+  std::vector<float> dst(3u * 640u * 640u);
+  bgra_letterbox_to_chw(src.data(), 1280, 720, 1280 * 4, dst.data(), p);
+  REQUIRE(dst[320u * 640u + 320u] == 1.f);
+  const LetterboxParams lb = make_letterbox(1280, 720, 640);
+  REQUIRE(lb.scale_y == lb.scale);
+}
+
+TEST_CASE("detr dense: logits, class map, background never wins") {
+  // RF-DETR style: boxes [Q,4] cxcywh in [0,1], scores [Q,C] logits, slot 0 a
+  // superclass the map drops.
+  constexpr std::uint32_t Q = 3, C = 5;
+  const float boxes[Q * 4] = {0.5f, 0.5f, 0.1f, 0.2f,  0.25f, 0.25f, 0.01f, 0.01f,  0.9f, 0.9f, 0.1f, 0.1f};
+  const float scores[Q * C] = {
+      9.f, -1.f, -5.f, 3.f, -5.f,   // background highest, then player: a player
+      -9.f, 2.f, -9.f, -9.f, -9.f,  // ball
+      -9.f, -9.f, -9.f, -3.f, -9.f, // weak: sigmoid(-3) = 0.047
+  };
+  DetectorPreset preset;
+  preset.classes = {"", "ball", "goalkeeper", "player", "referee"};
+  std::int8_t map[kMaxModelClasses];
+  const std::uint32_t mn = build_class_map(preset, C, map);
+  REQUIRE(mn == C);
+  const LetterboxParams lb = make_stretch(1280, 720, 640);
+  Detection out[8];
+  bool trunc = true;
+  const std::uint32_t n = decode_detr_dense(boxes, 4, scores, C, Q, C, DetrBox::CxcywhNorm, 0.25f,
+                                            lb, map, mn, out, 8, trunc);
+  REQUIRE_FALSE(trunc);
+  REQUIRE(n == 2);
+  REQUIRE(out[0].class_id == 0);  // player, sigmoid(3) = 0.95
+  REQUIRE(out[0].score > 0.9f);
+  REQUIRE(std::abs(out[0].x - (640.f - 64.f)) < 1e-2f);
+  REQUIRE(std::abs(out[0].h - 144.f) < 1e-2f);
+  REQUIRE(out[1].class_id == 3);  // ball
+  // Probabilities are read as they are.
+  const float probs[Q * C] = {0, 0, 0, 0.8f, 0, 0, 0.3f, 0, 0, 0, 0, 0, 0, 0, 0.1f};
+  REQUIRE(decode_detr_dense(boxes, 4, probs, C, Q, C, DetrBox::CxcywhNorm, 0.25f, lb, map, mn,
+                            out, 8, trunc) == 2);
+  REQUIRE(std::abs(out[1].score - 0.3f) < 1e-6f);
+}
+
+TEST_CASE("detr sparse: deploy export labels, pixel boxes, capacity keeps the best") {
+  constexpr std::uint32_t Q = 4;
+  const std::int64_t labels[Q] = {2, 0, 7, 2};  // player, ball, unknown, player
+  const float boxes[Q * 4] = {10, 20, 30, 60,  100, 100, 104, 104,  0, 0, 5, 5,  200, 200, 220, 260};
+  const float scores[Q] = {0.6f, 0.9f, 0.99f, 0.7f};
+  DetectorPreset preset;
+  preset.classes = {"ball", "goalkeeper", "player", "referee"};
+  std::int8_t map[kMaxModelClasses];
+  const std::uint32_t mn = build_class_map(preset, 4, map);
+  const LetterboxParams lb = make_letterbox(640, 640, 640);
+  Detection out[2];
+  bool trunc = false;
+  const std::uint32_t n =
+      decode_detr_sparse(labels, boxes, scores, Q, DetrBox::XyxyPx, 0.5f, lb, map, mn, out, 2, trunc);
+  REQUIRE(trunc);
+  REQUIRE(n == 2);
+  REQUIRE(out[0].class_id == 3);  // ball 0.9
+  REQUIRE(out[1].class_id == 0);  // player 0.7 replaced 0.6
+  REQUIRE(out[1].score == 0.7f);
+  REQUIRE(out[1].w == 20.f);
+  REQUIRE(out[1].h == 60.f);
+}
+
+TEST_CASE("detector presets: parse, skip bad entries, COCO map by default") {
+  const std::string text = R"({"detectors": [
+    {"name": "a", "file": "m/a.onnx", "resize": "stretch", "norm": "imagenet", "classes": ["ball", "player"]},
+    {"name": "bad", "file": 3},
+    {"name": "b", "file": "m/b.onnx", "note": 7},
+    {"name": "c", "file": "m/c.onnx"}]})";
+  const auto p = parse_detector_presets(text);
+  REQUIRE(p.size() == 2);
+  REQUIRE(p[0].stretch);
+  REQUIRE(p[0].imagenet);
+  REQUIRE(p[0].classes.size() == 2);
+  REQUIRE_FALSE(p[1].stretch);
+  REQUIRE(parse_detector_presets("not json").empty());
+  std::int8_t map[kMaxModelClasses];
+  REQUIRE(build_class_map(p[1], 80, map) == 80);
+  REQUIRE(map[0] == 0);
+  REQUIRE(map[32] == 3);
+  REQUIRE(map[2] == -1);
+  REQUIRE(build_class_map(p[1], 4, map) == 0);  // a 4-class head without a list: ids as they are
+  Detection d[3]{};
+  d[0].class_id = 32;
+  d[1].class_id = 5;
+  d[2].class_id = 0;
+  build_class_map(p[1], 80, map);
+  REQUIRE(apply_class_map(d, 3, map, 80) == 2);
+  REQUIRE(d[0].class_id == 3);
+  REQUIRE(d[1].class_id == 0);
 }
 
 TEST_CASE("1D kalman learns velocity") {

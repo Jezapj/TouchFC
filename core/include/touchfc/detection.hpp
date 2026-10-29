@@ -31,9 +31,10 @@ struct LetterboxParams {
   std::uint32_t src_h = 0;
   std::uint32_t dst_w = 0;
   std::uint32_t dst_h = 0;
-  float scale = 1.f;   // dst = round(src * scale)
+  float scale = 1.f;   // dst = round(src * scale), x (and y when letterboxed)
   float pad_x = 0.f;   // offset of src inside dst
   float pad_y = 0.f;
+  float scale_y = 1.f; // y scale; equals scale unless stretched
 };
 
 // Max detections carried on a slot. 128 is comfortable for an association

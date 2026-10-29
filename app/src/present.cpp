@@ -137,6 +137,8 @@ class App {
   void refresh_windows();
   bool start_overlay_capture();
   std::unique_ptr<Detector> make_detector();
+  void load_presets();
+  void draw_detector_pick();
   std::unique_ptr<PitchModel> make_pitch();
   void imgui_begin(Binding& binding);
   void imgui_end(ID3D11RenderTargetView* rtv);
@@ -290,6 +292,9 @@ class App {
   std::unique_ptr<FramePool> pool_;
   std::unique_ptr<HdrSink> sink_;
   std::unique_ptr<Detector> detector_;
+  std::vector<DetectorPreset> presets_;
+  std::vector<char> preset_ok_;  // file present
+  int preset_ = -1;              // -1: --model or the stub
   std::unique_ptr<PitchModel> pitch_;
   std::unique_ptr<Pipeline> pipe_;
   std::unique_ptr<Services> services_;
@@ -1118,14 +1123,95 @@ void App::refresh_windows() {
       reinterpret_cast<LPARAM>(&windows_));
 }
 
+namespace {
+constexpr const char* kPresetFile = "config/detectors.json";
+constexpr const char* kPresetPick = "profiles/detector.txt";
+}  // namespace
+
+// --detector wins; overlay mode falls back to the last pick, then the first
+// preset whose file is present. Selftest and replay keep the stub unless asked.
+void App::load_presets() {
+  std::ifstream in(kPresetFile);
+  if (in) {
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    presets_ = parse_detector_presets(text);
+  }
+  preset_ok_.assign(presets_.size(), 0);
+  std::error_code ec;
+  for (std::size_t i = 0; i < presets_.size(); ++i)
+    preset_ok_[i] = std::filesystem::is_regular_file(presets_[i].file, ec) ? 1 : 0;
+  auto find = [&](const std::string& name) {
+    for (std::size_t i = 0; i < presets_.size(); ++i)
+      if (presets_[i].name == name) return static_cast<int>(i);
+    return -1;
+  };
+  if (!args_.model_path.empty()) return;
+  if (!args_.detector_name.empty()) {
+    preset_ = find(args_.detector_name);
+    if (preset_ < 0) log_line("detector preset not found: " + args_.detector_name);
+    return;
+  }
+  if (args_.mode != AppArgs::Mode::Overlay) return;
+  std::ifstream last(kPresetPick);
+  std::string name;
+  if (std::getline(last, name)) preset_ = find(name);
+  if (preset_ >= 0 && preset_ok_[preset_]) return;
+  preset_ = -1;
+  for (std::size_t i = 0; i < presets_.size() && preset_ < 0; ++i)
+    if (preset_ok_[i]) preset_ = static_cast<int>(i);
+}
+
 std::unique_ptr<Detector> App::make_detector() {
+  DetectorPreset p;
   if (!args_.model_path.empty()) {
+    // A listed model keeps its resize, normalisation and class list.
+    const auto file = std::filesystem::path(args_.model_path).filename();
+    for (const auto& q : presets_)
+      if (std::filesystem::path(q.file).filename() == file) p = q;
+    if (p.name.empty()) p.name = file.string();
+    p.file = args_.model_path;
+  } else if (preset_ >= 0) {
+    p = presets_[preset_];
+  }
+  if (!p.file.empty()) {
     std::string error;
-    auto det = make_ort_detector(args_.model_path, error);
+    auto det = make_ort_detector(p, error);
     if (det) return det;
     log_line("ORT detector unavailable (" + error + "); using stub");
   }
   return make_stub_detector();
+}
+
+// Main tab, before capture: the model is fixed for a session (T2 allocates
+// its tensors before Pipeline::start).
+void App::draw_detector_pick() {
+  if (!args_.model_path.empty()) {
+    ImGui::Text("detector: %s (--model)", args_.model_path.c_str());
+    return;
+  }
+  if (presets_.empty()) {
+    ImGui::TextWrapped("detector: stub (no %s)", kPresetFile);
+    return;
+  }
+  const char* shown = preset_ >= 0 ? presets_[preset_].name.c_str() : "stub (test boxes)";
+  ImGui::SetNextItemWidth(-1);
+  if (ImGui::BeginCombo("##detector", shown)) {
+    if (ImGui::Selectable("stub (test boxes)", preset_ < 0)) preset_ = -1;
+    for (std::size_t i = 0; i < presets_.size(); ++i) {
+      ImGui::BeginDisabled(!preset_ok_[i]);
+      const std::string item = presets_[i].name + (preset_ok_[i] ? "" : "  (file missing)");
+      if (ImGui::Selectable(item.c_str(), preset_ == static_cast<int>(i))) {
+        preset_ = static_cast<int>(i);
+        std::error_code ec;
+        std::filesystem::create_directories("profiles", ec);
+        std::ofstream(kPresetPick) << presets_[i].name;
+      }
+      ImGui::EndDisabled();
+      if (!presets_[i].note.empty() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s\n%s", presets_[i].file.c_str(), presets_[i].note.c_str());
+    }
+    ImGui::EndCombo();
+  }
 }
 
 std::unique_ptr<PitchModel> App::make_pitch() {
@@ -1728,6 +1814,7 @@ void App::draw_control() {
       }
       ImGui::EndListBox();
     }
+    draw_detector_pick();
     if (ImGui::Button("Start capture") && start_overlay_capture()) {
       status_ = "capturing " + std::to_string(reinterpret_cast<std::uintptr_t>(selected_));
     }
@@ -1744,6 +1831,7 @@ int App::run() {
   begin_present_mmcss();
   winrt::init_apartment(winrt::apartment_type::multi_threaded);
   if (!args_.pitch_dump_path.empty()) pitch_dump_ = std::fopen(args_.pitch_dump_path.c_str(), "w");
+  load_presets();
   if (!create_gpu(gpu_)) return 1;
   if (!compile_pass(gpu_.device.Get(), false, copy_pass_)) return 1;
   if (!compile_pass(gpu_.device.Get(), true, premul_pass_)) return 1;
