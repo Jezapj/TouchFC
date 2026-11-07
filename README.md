@@ -60,7 +60,11 @@ Steps, in PowerShell:
    ```
 3. Install ONNX Runtime. Download `onnxruntime-win-x64-1.20.1.zip` from https://github.com/microsoft/onnxruntime/releases. Extract it so that `third_party\onnxruntime\include\onnxruntime_cxx_api.h` exists. Without it the app builds with a stub detector that draws fake boxes.
 4. Put the models in `third_party\models\`. Weights are never committed; read each licence first (see `scripts/fetch_models.ps1`).
-   - A player and ball detector. The presets in `config/detectors.json` list the expected files: a D-FINE or RF-DETR model fine-tuned on football data (Apache 2.0 code; how to train and export one: `docs/models.md`), or, for testing, `yolov8n.onnx` (Ultralytics, AGPL-3.0) made with `pip install ultralytics`, then `yolo export model=yolov8n.pt format=onnx imgsz=640`.
+   - A player and ball detector. The presets in `config/detectors.json` list the expected files: a D-FINE or RF-DETR model fine-tuned on football data (Apache 2.0 code; how to train and export one: `docs/models.md`), or, for testing, a YOLO model (Ultralytics, AGPL-3.0). This script sets up Python with Ultralytics in `touchfc_train\`, downloads or copies a YOLO11n soccer `best.pt`, and exports it to `yolo11n_soccer_960.onnx` and `yolo11n_soccer_1280.onnx`; `-Coco` also makes `yolov8n.onnx`:
+     ```
+     powershell -ExecutionPolicy Bypass -File scripts\fetch_yolo_models.ps1 -Source <url or path to best.pt>
+     powershell -ExecutionPolicy Bypass -File scripts\fetch_yolo_models.ps1 -Coco
+     ```
    - `football-pitch-detection.onnx`, the 32-point pitch keypoint model from https://github.com/roboflow/sports, exported to ONNX.
 5. Configure, build and test.
    ```
