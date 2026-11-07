@@ -99,6 +99,8 @@ class Pipeline {
   std::atomic<std::uint64_t> late_frames{0};
   std::atomic<std::uint64_t> command_warns{0};
   std::atomic<int> attack_dir{1};
+  std::atomic<std::uint8_t> team_source{0};  // 0 none yet, 1 from the players, 2 provider kits, 3 a click
+  std::atomic<bool> dir_found{false};        // attack direction set from player positions
   std::atomic<std::int64_t> present_p50_ns{0};
   std::atomic<std::int64_t> present_p99_ns{0};
 
@@ -192,6 +194,19 @@ class Pipeline {
   bool seed_ok_[2]{};
   std::uint16_t seed_req_id_ = 0;
   std::uint8_t seed_req_team_ = 0;
+  void auto_kits(const FrameSlot& slot, const Config& cfg);
+  void auto_attack_dir(const FrameSlot& slot, const Config& cfg);
+  void swap_teams();
+  bool kits_crossed_provider(Lab a, Lab b, bool& known) const noexcept;
+  KitClusterer kits_{};
+  std::uint32_t kit_frames_[3]{};
+  TimeNs kit_sample_ns_ = 0;  // frames seen, skipped (not wide / dead), solves; logged at join
+  std::uint8_t seed_src_ = 0;  // as team_source
+  bool kit_order_done_ = false;
+  bool dir_manual_ = false;
+  float dir_ema_ = 0.f;  // in play: mean pitch x of team B minus team A (> 0: A's goal on the left)
+  float dir_w_ = 0.f;    // seconds of that evidence
+  TimeNs dir_t_ns_ = 0;
   struct Mem {
     std::uint16_t id = 0;
     float x = 0.f;

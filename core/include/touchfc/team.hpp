@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <utility>
 
 namespace touchfc {
 
@@ -79,6 +80,95 @@ inline int nearest_team(Lab sample, Lab seed_a, bool a_ok, Lab seed_b, bool b_ok
   const float d = da <= db ? da : db;
   if (d > max_dist) return 0;
   return da <= db ? 1 : 2;
+}
+
+// The two kit colours from the players themselves, so no click is needed. A
+// ring of torso samples (tracked outfield players, wide shots), then k-means
+// with k = 3: the third cluster takes referees, keepers and shirts in shadow.
+// The two biggest clusters are the kits when each holds min_share of the
+// samples and they are at least min_sep apart. Fixed storage, no allocation.
+struct KitClusterer {
+  static constexpr int kCap = 512;
+  Lab s[kCap]{};
+  int n = 0;
+  int head = 0;
+  int added = 0;  // since the last solve
+  float last_sep = 0.f;    // last solve: distance between the two biggest clusters
+  float last_share = 0.f;  // ... and the second one's share of the samples
+
+  void add(Lab lab) noexcept {
+    s[head] = lab;
+    head = (head + 1) % kCap;
+    if (n < kCap) ++n;
+    ++added;
+  }
+  void clear() noexcept { n = head = added = 0; }
+
+  bool solve(float min_sep, float min_share, int min_n, Lab& a, Lab& b) noexcept {
+    added = 0;
+    if (n < min_n || n < 3) return false;
+    // Deterministic spread-out start: far from the mean, far from that, then
+    // the sample furthest from both.
+    Lab mean{};
+    for (int i = 0; i < n; ++i) {
+      mean.L += s[i].L;
+      mean.a += s[i].a;
+      mean.b += s[i].b;
+    }
+    mean.L /= n;
+    mean.a /= n;
+    mean.b /= n;
+    auto farthest = [&](const Lab* c, int k) {
+      int best = 0;
+      float best_d = -1.f;
+      for (int i = 0; i < n; ++i) {
+        float d = 1e30f;
+        for (int j = 0; j < k; ++j) d = std::fmin(d, lab_dist(s[i], c[j]));
+        if (d > best_d) {
+          best_d = d;
+          best = i;
+        }
+      }
+      return s[best];
+    };
+    Lab c[3];
+    c[0] = farthest(&mean, 1);
+    c[1] = farthest(c, 1);
+    c[2] = farthest(c, 2);
+    int count[3]{};
+    for (int it = 0; it < 12; ++it) {
+      Lab sum[3]{};
+      for (int& k : count) k = 0;
+      for (int i = 0; i < n; ++i) {
+        int best = 0;
+        for (int k = 1; k < 3; ++k)
+          if (lab_dist(s[i], c[k]) < lab_dist(s[i], c[best])) best = k;
+        sum[best].L += s[i].L;
+        sum[best].a += s[i].a;
+        sum[best].b += s[i].b;
+        ++count[best];
+      }
+      for (int k = 0; k < 3; ++k)
+        if (count[k] > 0) c[k] = {sum[k].L / count[k], sum[k].a / count[k], sum[k].b / count[k]};
+    }
+    int i0 = 0, i1 = 1, i2 = 2;  // by count, descending
+    if (count[i1] > count[i0]) std::swap(i0, i1);
+    if (count[i2] > count[i1]) std::swap(i1, i2);
+    if (count[i1] > count[i0]) std::swap(i0, i1);
+    last_sep = lab_dist(c[i0], c[i1]);
+    last_share = static_cast<float>(count[i1]) / static_cast<float>(n);
+    if (static_cast<float>(count[i1]) < min_share * static_cast<float>(n)) return false;
+    if (lab_dist(c[i0], c[i1]) < min_sep) return false;
+    a = c[i0];
+    b = c[i1];
+    return true;
+  }
+};
+
+// True when (a, b) fits (ref_a, ref_b) better crossed: keeps team A on the
+// same kit when the clusters are refreshed, or follows the provider's order.
+inline bool kits_crossed(Lab a, Lab b, Lab ref_a, Lab ref_b) noexcept {
+  return lab_dist(a, ref_b) + lab_dist(b, ref_a) < lab_dist(a, ref_a) + lab_dist(b, ref_b);
 }
 
 struct LostLabel {

@@ -46,7 +46,7 @@ Weights trained on a dataset carry that dataset's terms in practice: an Apache 2
 Any GPU with 8 GB or more, or a hosted notebook. One to three hours.
 
 1. Download a CC BY 4.0 football dataset with ball, goalkeeper, player and referee from Roboflow Universe, in COCO format, 640 x 640 stretch.
-2. Train one of these:
+2. Run [`scripts/train_detector.py`](../scripts/train_detector.py) on the GPU machine (standalone; `--help` lists the options). It downloads the dataset with `ROBOFLOW_API_KEY` or takes `--dataset-dir`, trains, exports, and prints the `config/detectors.json` entry with the class list read from the export. By hand, it does:
    - **D-FINE-N:** clone https://github.com/Peterande/D-FINE, point `configs/dataset/custom_detection.yml` at the export (`remap_mscoco_category: False`, `num_classes: 5`), train `configs/dfine/custom/dfine_hgnetv2_n_custom.yml`, then `python tools/deployment/export_onnx.py -c <config> -r best_stg2.pth`.
    - **RF-DETR-Nano:** `pip install rfdetr`, `RFDETRNano().train(dataset_dir=..., epochs=50)`, then `model.export()`.
 3. Copy the ONNX to the preset's `file` (for example `third_party/models/dfine_n_soccer.onnx`) and pick it in the Main tab.

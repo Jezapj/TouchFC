@@ -17,3 +17,7 @@ test_clips/
 cache/
 spadl.csv
 profiles/
+
+# scripts/train_detector.py output
+touchfc_train/
+touchfc_models/

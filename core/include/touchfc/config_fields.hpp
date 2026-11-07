@@ -70,6 +70,10 @@ inline constexpr CfgField kConfigFields[] = {
 
     TOUCHFC_CFG(team_max_dist, Teams, "kit colour distance", 5.f, 120.f),
     TOUCHFC_CFG(team_force, Teams, "force teams (one spare box)", 0, 1),
+    TOUCHFC_CFG(team_auto, Teams, "find kits automatically", 0, 1),
+    TOUCHFC_CFG(kit_auto_sep, Teams, "auto kit separation", 10.f, 80.f),
+    TOUCHFC_CFG(kit_auto_share, Teams, "auto kit min share", 0.05f, 0.45f),
+    TOUCHFC_CFG(dir_auto, Teams, "attack direction from positions", 0, 1),
     TOUCHFC_CFG(team_min_px, Teams, "min torso samples", 2, 200),
 
     TOUCHFC_CFG(view_angle_max_deg, PlayState, "view angle max deg", 5.f, 90.f),

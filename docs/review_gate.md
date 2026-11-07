@@ -234,6 +234,15 @@ Not measured: glass latency (PresentMon), GPU inference on the S1 target hardwar
 
 Pending: a real fine-tuned D-FINE-N or RF-DETR-Nano compared with yolov8n on the test clips (inference p50, ball seen).
 
+## Automatic teams and attack direction
+
+| What | Where | Notes |
+|---|---|---|
+| Kits from the players | `KitClusterer` in [`team.hpp`](../core/include/touchfc/team.hpp), `Pipeline::auto_kits` | Torso Lab of tracked players every 0.2 s on wide in-play frames, feet on the pitch once calibrated (keeps the touchline crowd out). k-means k = 3, two biggest clusters when 20 Lab apart and 20% each (`kit_auto_sep`, `kit_auto_share`). Refreshed as samples arrive, A kept on its kit. |
+| Order | `kits_crossed_provider`, `seed_kits` | With Match-tab kit colours, A is home (colour or alternate, whichever is nearer). A click against the found order swaps instead of duplicating a seed. **swap A/B** swaps seeds, tracks, team stats and direction. |
+| Attack direction | `Pipeline::auto_attack_dir` | Mean pitch x of B minus A over in-play frames (defenders stay goal-side), plain mean for 45 s then a 45 s EMA, so half time is followed. Set after 15 s and 2 m. A manual press stops it until **find teams again**. |
+| Checked | test clips, YOLO11n 960 | Kits found on both wide clips (yellow vs green / white, amateur drone footage); direction from 36 s on one. Tests: clustering with a referee cluster, alike kits refused, order kept, stats swap. Broadcast check pending. |
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. `docs/models.md` lists the detector licences: D-FINE, DEIM, RT-DETR (lyuwenyu) and RF-DETR are Apache 2.0; Ultralytics models (yolov8n, the roboflow/sports pitch model) are AGPL-3.0. No broadcast footage is in the tree.

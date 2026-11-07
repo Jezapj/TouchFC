@@ -631,6 +631,18 @@ TEST_CASE("detr sparse: deploy export labels, pixel boxes, capacity keeps the be
   REQUIRE(out[1].h == 60.f);
 }
 
+TEST_CASE("class names map by keyword") {
+  REQUIRE(touchfc_class_of("soccer-ball") == 3);
+  REQUIRE(touchfc_class_of("soccer-player") == 0);
+  REQUIRE(touchfc_class_of("soccer-referee") == 2);
+  REQUIRE(touchfc_class_of("Goalkeeper") == 1);
+  REQUIRE(touchfc_class_of("football-player") == 0);
+  REQUIRE(touchfc_class_of("sports ball") == 3);
+  REQUIRE(touchfc_class_of("person") == 0);
+  REQUIRE(touchfc_class_of("") == -1);
+  REQUIRE(touchfc_class_of("car") == -1);
+}
+
 TEST_CASE("detector presets: parse, skip bad entries, COCO map by default") {
   const std::string text = R"({"detectors": [
     {"name": "a", "file": "m/a.onnx", "resize": "stretch", "norm": "imagenet", "classes": ["ball", "player"]},
@@ -851,6 +863,41 @@ TEST_CASE("statsbomb frame is a pitch-control input") {
   pitch_control(crowd, 22, 0.f, 0.f, true, grid);
   const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   REQUIRE(ms < 100.0);
+}
+
+TEST_CASE("kits found from the players: two shirts plus a referee") {
+  KitClusterer k;
+  const Lab red{45.f, 60.f, 40.f}, blue{35.f, 10.f, -50.f}, ref{20.f, 0.f, 0.f};
+  for (int i = 0; i < 300; ++i) {
+    const float j = static_cast<float>(i % 7) - 3.f;  // shading spread
+    k.add(i % 10 == 0 ? ref : (i % 2 ? Lab{red.L + j, red.a + j, red.b} : Lab{blue.L + j, blue.a, blue.b + j}));
+  }
+  Lab a, b;
+  REQUIRE(k.solve(30.f, 0.2f, 160, a, b));
+  const bool a_red = lab_dist(a, red) < lab_dist(a, blue);
+  REQUIRE(lab_dist(a_red ? a : b, red) < 6.f);
+  REQUIRE(lab_dist(a_red ? b : a, blue) < 6.f);
+  REQUIRE(k.added == 0);
+  // Refreshed clusters keep A on its kit.
+  REQUIRE(kits_crossed(blue, red, red, blue));
+  REQUIRE_FALSE(kits_crossed(red, blue, red, blue));
+  // Too few samples, or two kits that look alike: no answer.
+  KitClusterer few;
+  for (int i = 0; i < 50; ++i) few.add(i % 2 ? red : blue);
+  REQUIRE_FALSE(few.solve(30.f, 0.2f, 160, a, b));
+  KitClusterer alike;
+  for (int i = 0; i < 300; ++i) alike.add(i % 2 ? red : Lab{red.L + 8.f, red.a, red.b});
+  REQUIRE_FALSE(alike.solve(30.f, 0.2f, 160, a, b));
+}
+
+TEST_CASE("team stats swap with the teams") {
+  TeamStats s;
+  s.passes[0] = 7;
+  s.xg[1] = 0.4f;
+  s.swap();
+  REQUIRE(s.passes[1] == 7);
+  REQUIRE(s.passes[0] == 0);
+  REQUIRE(s.xg[0] == 0.4f);
 }
 
 TEST_CASE("team colour follows the seed and survives a gap") {

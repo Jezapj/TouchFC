@@ -70,6 +70,15 @@ void Pipeline::join() {
       if (reject_n_[i]) s += std::string(" ") + fit_reject_name(static_cast<FitReject>(i)) + " " + std::to_string(reject_n_[i]);
     log_line(s);
   }
+  if (kit_frames_[0]) {
+    char s[260];
+    std::snprintf(s, sizeof(s),
+                  "teams: source %u; %u frames, %u not wide or dead; %d shirt samples, %u solves, last sep %.1f "
+                  "share %.2f; direction %.0f s of evidence, B - A %.1f m",
+                  static_cast<unsigned>(seed_src_), kit_frames_[0], kit_frames_[1], kits_.n, kit_frames_[2],
+                  kits_.last_sep, kits_.last_share, dir_w_, dir_ema_);
+    log_line(s);
+  }
   if (thumb_ring_.written())
     log_line("mini replay: " + std::to_string(thumb_ring_.written()) + " thumbnails, " +
              std::to_string(static_cast<double>(thumb_ns.load()) / 1.0e6) + " ms each");
@@ -388,14 +397,20 @@ void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
     for (auto& t : tracker_.tracks) {
       if (t.id != seed_req_id_) continue;
       const int s = seed_req_team_ - 1;
+      // A click against the found order swaps the teams instead of giving
+      // both seeds the same kit.
+      if (seed_ok_[0] && seed_ok_[1] && lab_dist(t.lab, seed_[1 - s]) < lab_dist(t.lab, seed_[s])) swap_teams();
       seed_[s] = t.lab;
       seed_ok_[s] = true;
       t.team = seed_req_team_;
       t.team_lock = true;
+      seed_src_ = 3;
+      team_source.store(3, std::memory_order_relaxed);
       break;
     }
     seed_req_id_ = 0;
   }
+  auto_kits(slot, cfg);
   if (seed_ok_[0] || seed_ok_[1]) {
     for (auto& t : tracker_.tracks) {
       if (t.id == 0 || t.team_lock || t.class_id == 3) continue;
@@ -562,7 +577,113 @@ void Pipeline::assign_teams(FrameSlot& slot, const Config& cfg) {
     for (const auto& t : tracker_.tracks)
       if (t.id == id) slot.det_team[i] = t.class_id == 3 ? 0 : t.team;
   }
+  auto_attack_dir(slot, cfg);
   update_possession(slot);
+}
+
+// Kits from the shirts on screen (wide shots in play, so not the bench or a
+// close-up). Refreshed as samples come in, keeping A on the same kit.
+void Pipeline::auto_kits(const FrameSlot& slot, const Config& cfg) {
+  if (!cfg.team_auto || seed_src_ == 3) return;
+  ++kit_frames_[0];
+  if (slot.scene != static_cast<std::uint8_t>(Scene::Wide) || play_dead_) {
+    ++kit_frames_[1];
+    return;
+  }
+  // Every 0.2 s, whatever the frame rate, so a slow PC fills the ring as fast.
+  // Once the pitch is known, only feet on it: not the crowd on the touchline.
+  if (slot.meta.t_capture - kit_sample_ns_ >= 200000000)
+    for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+      const Detection& d = slot.dets[i];
+      if (d.track_id == 0 || d.class_id != 0 || (slot.pitch_valid && !slot.pitch_ok[i])) continue;
+      for (const auto& t : tracker_.tracks)
+        if (t.id == d.track_id && t.hits >= 5) {
+          kits_.add(t.lab);
+          kit_sample_ns_ = slot.meta.t_capture;
+          break;
+        }
+    }
+  if (kits_.added < 48) return;
+  Lab a, b;
+  ++kit_frames_[2];
+  if (!kits_.solve(cfg.kit_auto_sep, cfg.kit_auto_share, 96, a, b)) return;
+  if (seed_ok_[0] && seed_ok_[1]) {
+    if (kits_crossed(a, b, seed_[0], seed_[1])) std::swap(a, b);
+  } else {
+    bool known = false;
+    if (kits_crossed_provider(a, b, known)) std::swap(a, b);
+    kit_order_done_ = known;
+  }
+  const bool first = seed_src_ != 1;
+  seed_[0] = a;
+  seed_[1] = b;
+  seed_ok_[0] = seed_ok_[1] = true;
+  seed_src_ = 1;
+  team_source.store(1, std::memory_order_relaxed);
+  if (first) {
+    char s[160];
+    std::snprintf(s, sizeof(s), "team colours found from the players: A Lab %.0f %.0f %.0f, B Lab %.0f %.0f %.0f", a.L,
+                  a.a, a.b, b.L, b.a, b.b);
+    log_line(s);
+  }
+}
+
+// Which found kit is home: the provider's colour or alternate nearer each.
+bool Pipeline::kits_crossed_provider(Lab a, Lab b, bool& known) const noexcept {
+  known = match_.team[0].has_color && match_.team[1].has_color;
+  if (!known) return false;
+  auto cost = [](Lab x, const TeamInfo& t) {
+    float d = 1e30f;
+    for (const std::uint32_t c : {t.color, t.alt_color})
+      if (c != 0)
+        d = std::fmin(d, lab_dist(x, rgb_to_lab(static_cast<std::uint8_t>(c >> 16), static_cast<std::uint8_t>(c >> 8),
+                                                static_cast<std::uint8_t>(c))));
+    return d;
+  };
+  return cost(a, match_.team[1]) + cost(b, match_.team[0]) < cost(a, match_.team[0]) + cost(b, match_.team[1]);
+}
+
+void Pipeline::swap_teams() {
+  std::swap(seed_[0], seed_[1]);
+  std::swap(seed_ok_[0], seed_ok_[1]);
+  auto flip = [](std::uint8_t& t) {
+    if (t == 1 || t == 2) t = static_cast<std::uint8_t>(3 - t);
+  };
+  for (auto& t : tracker_.tracks) flip(t.team);
+  for (int i = 0; i < prev_n_; ++i) flip(prev_[i].team);
+  for (int i = 0; i < lost_n_; ++i) flip(lost_[i].team);
+  events_.swap_teams();
+  dir_ema_ = -dir_ema_;
+  // The kits still run the same way; A is now the other one.
+  attack_dir.store(-attack_dir.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+// Defenders stay goal-side whoever has the ball, so over time each team
+// stands nearer its own goal. A slow mean (45 s) also follows the change of
+// ends at half time.
+void Pipeline::auto_attack_dir(const FrameSlot& slot, const Config& cfg) {
+  const TimeNs now = slot.meta.t_capture;
+  const float dt = dir_t_ns_ ? std::fmin(1.f, static_cast<float>(now - dir_t_ns_) * 1e-9f) : 0.f;
+  dir_t_ns_ = now;
+  if (!cfg.dir_auto || dir_manual_ || play_dead_ || !slot.pitch_valid || seed_src_ == 0 || dt <= 0.f) return;
+  float sx[2]{};
+  int n[2]{};
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    const std::uint8_t t = slot.det_team[i];
+    if ((t != 1 && t != 2) || !slot.pitch_ok[i] || slot.dets[i].class_id >= 2) continue;
+    sx[t - 1] += slot.pitch_x[i];
+    ++n[t - 1];
+  }
+  if (n[0] < 3 || n[1] < 3) return;
+  dir_w_ += dt;
+  // A plain mean for the first 45 s, then the slow one.
+  dir_ema_ += dt / std::fmin(45.f, dir_w_) * (sx[1] / n[1] - sx[0] / n[0] - dir_ema_);
+  if (dir_w_ < 15.f || std::fabs(dir_ema_) < 2.f) return;
+  const int want = dir_ema_ > 0.f ? 1 : -1;
+  const bool changed = attack_dir.exchange(want, std::memory_order_relaxed) != want;
+  if (!dir_found.exchange(true, std::memory_order_relaxed) || changed)
+    log_line(want > 0 ? "attack direction: team A attacks right (player positions)"
+                      : "attack direction: team A attacks left (player positions)");
 }
 
 // M15: a thumbnail per presented frame (every second one above 30 fps) into
@@ -847,6 +968,15 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
 // set, but only when each sits near a cluster of tracked players: the listed
 // colour is the club colour, not necessarily the kit worn today.
 void Pipeline::seed_kits(const Config& cfg) {
+  if (seed_src_ == 1 && !kit_order_done_) {  // kits found from the players: the provider only names them
+    bool known = false;
+    if (kits_crossed_provider(seed_[0], seed_[1], known)) {
+      swap_teams();
+      log_line("teams swapped to the provider's home / away");
+    }
+    kit_order_done_ = known;
+    return;
+  }
   if (seed_ok_[0] || seed_ok_[1]) return;
   Lab best[2];
   for (int s = 0; s < 2; ++s) {
@@ -871,6 +1001,8 @@ void Pipeline::seed_kits(const Config& cfg) {
   seed_[0] = best[0];
   seed_[1] = best[1];
   seed_ok_[0] = seed_ok_[1] = true;
+  seed_src_ = 2;
+  team_source.store(2, std::memory_order_relaxed);
   log_line("team colours seeded from the provider");
 }
 
@@ -952,6 +1084,24 @@ void Pipeline::run_t3() {
     while (commands_.try_pop(command)) {
       if (command.type == CmdType::ApplyAttackDir) {
         attack_dir.store(command.u8a == 0 ? -1 : 1, std::memory_order_relaxed);
+        dir_manual_ = true;
+        dir_found.store(false, std::memory_order_relaxed);
+      } else if (command.type == CmdType::SwapTeams) {
+        swap_teams();
+        kit_order_done_ = true;  // the user's order wins over the provider's
+      } else if (command.type == CmdType::AutoTeams) {
+        seed_ok_[0] = seed_ok_[1] = false;
+        seed_src_ = 0;
+        kit_order_done_ = false;
+        kits_.clear();
+        for (auto& t : tracker_.tracks) {
+          t.team = 0;
+          t.team_lock = false;
+        }
+        dir_manual_ = false;
+        dir_ema_ = dir_w_ = 0.f;
+        team_source.store(0, std::memory_order_relaxed);
+        dir_found.store(false, std::memory_order_relaxed);
       } else if (command.type == CmdType::SetTeamSeed && (command.u8a == 1 || command.u8a == 2)) {
         seed_req_id_ = command.u16a;
         seed_req_team_ = command.u8a;

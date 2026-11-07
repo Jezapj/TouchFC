@@ -1690,6 +1690,26 @@ void App::draw_control() {
       ImGui::EndTabBar();
     }
     if (main_tab) {
+    auto push_cmd = [&](CmdType type) {
+      UiCommand cmd;
+      cmd.type = type;
+      if (!pipe_->commands().try_push(cmd)) {
+        pending_ = cmd;
+        pending_cmd_ = true;
+        pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
+    static constexpr const char* kTeamSource[] = {"looking for the two kits (wide shots, in play)",
+                                                  "kits found from the players", "kits from the Match tab",
+                                                  "set by a click"};
+    const std::uint8_t src = pipe_->team_source.load(std::memory_order_relaxed);
+    ImGui::Text("teams: %s", kTeamSource[src < 4 ? src : 0]);
+    if (ImGui::Button("swap A/B")) push_cmd(CmdType::SwapTeams);
+    ImGui::SameLine();
+    if (ImGui::Button("find teams again")) push_cmd(CmdType::AutoTeams);
+    ImGui::Text("team A attacks %s%s", pipe_->attack_dir.load() > 0 ? "right" : "left",
+                pipe_->dir_found.load(std::memory_order_relaxed) ? " (from positions)" : "");
+    ImGui::SameLine();
     if (ImGui::Button("attack direction")) {
       UiCommand cmd;
       cmd.type = CmdType::ApplyAttackDir;
@@ -1700,7 +1720,7 @@ void App::draw_control() {
         pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    ImGui::TextUnformatted("Click a track to set its team. Others follow that colour.");
+    ImGui::TextUnformatted("Wrong team? Click a track's A or B; the rest follow its colour.");
     int shown = 0;
     for (std::uint32_t i = 0; i < last_det_count_ && shown < 12; ++i) {
       const auto id = last_dets_[i].track_id;

@@ -90,7 +90,7 @@ Without `--keypoints` the pitch is never calibrated, so the minimap, possession 
 First run on a match:
 1. Choose the window showing the stream (a browser or player) and the detector, then **Start capture**. Play the stream full screen or large.
 2. **Match tab:** choose the league, date, home and away teams. This fetches the lineups, form and kit colours. You can also start with `--match eng.1:YYYYMMDD:home:away`.
-3. **Main tab:** if the boxes are not blue and red yet, click one player of each team and press **A** or **B**. Everyone else then follows their kit colour. Use **attack direction** if team A attacks to the left.
+3. Teams and attack direction are automatic. After a few seconds of wide play the Main tab shows `teams: kits found from the players`, and after about 15 s `team A attacks ... (from positions)`; the change of ends at half time is followed too. With a fixture in the Match tab, A is the home team. If the order is wrong, press **swap A/B**; if a player is on the wrong team, press their **A** or **B** (the rest follow that colour). **find teams again** undoes clicks and starts over.
 4. Wait for a wide shot. The HUD should show `pitch wide ... kp` with a small fit error, and dots on the minimap.
 5. **Tuning tab:** adjust thresholds, for example player and ball confidence, and the pass and shot sliders in Events. Then **save profile**. The last profile used loads on the next start.
 6. The stats panel, the on-ball card and the mini replay appear on the overlay. **mini replay: last 5 s** in the Main tab tests the replay.

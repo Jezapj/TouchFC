@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace touchfc {
 
@@ -65,6 +66,11 @@ struct TeamStats {
   float xg[2]{};                  // summed shot xG
   float xt_gain[2]{};             // xT added by completed passes
   float final_third_s[2]{};       // possession seconds in the attacking third
+  void swap() noexcept {
+    auto sw = [](auto& v) { std::swap(v[0], v[1]); };
+    sw(passes), sw(passes_ok), sw(shots), sw(key_passes), sw(poss_s), sw(prog);
+    sw(recoveries), sw(high_rec), sw(xg), sw(xt_gain), sw(final_third_s);
+  }
   float pass_pct(int t) const noexcept { return passes[t] ? 100.f * passes_ok[t] / passes[t] : 0.f; }
   float poss_pct(int t) const noexcept {
     const float s = poss_s[0] + poss_s[1];
@@ -145,6 +151,16 @@ class EventDetector {
   static constexpr int kTracks = 96;
 
   const TeamStats& team_stats() const noexcept { return stats_; }
+  // Teams relabelled A <-> B (auto kits ordered late, or the user's swap).
+  void swap_teams() noexcept {
+    stats_.swap();
+    auto flip = [](std::uint8_t& t) {
+      if (t == 1 || t == 2) t = static_cast<std::uint8_t>(3 - t);
+    };
+    flip(holder_team_);
+    flip(rel_team_);
+    flip(last_shot_team_);
+  }
   const TrackStats* track(std::uint16_t id) const noexcept {
     for (const auto& t : tracks_)
       if (t.track == id) return &t;

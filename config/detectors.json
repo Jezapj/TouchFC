@@ -13,7 +13,7 @@
       "file": "third_party/models/rfdetr_nano_soccer.onnx",
       "resize": "stretch",
       "norm": "imagenet",
-      "classes": ["", "ball", "goalkeeper", "player", "referee"],
+      "classes": ["", "soccer-ball", "soccer-player", "soccer-referee"],
       "note": "CPU. RF-DETR (Apache 2.0) fine-tuned on a CC BY football set; see docs/models.md"
     },
     {
@@ -31,6 +31,22 @@
       "norm": "imagenet",
       "classes": ["", "ball", "goalkeeper", "player", "referee"],
       "note": "GPU build of ONNX Runtime recommended"
+    },
+    {
+      "name": "Test: YOLO11n soccer 960",
+      "file": "third_party/models/yolo11n_soccer_960.onnx",
+      "resize": "letterbox",
+      "norm": "unit",
+      "classes": ["Player", "Ball", "Referee"],
+      "note": "Ultralytics YOLO11n trained at 1280, run at 960. AGPL-3.0: testing only"
+    },
+    {
+      "name": "Test: YOLO11n soccer 1280",
+      "file": "third_party/models/yolo11n_soccer_1280.onnx",
+      "resize": "letterbox",
+      "norm": "unit",
+      "classes": ["Player", "Ball", "Referee"],
+      "note": "Ultralytics YOLO11n at its training size: best ball recall, about 4x the cost of 640. AGPL-3.0: testing only"
     },
     {
       "name": "Test: COCO yolov8n",

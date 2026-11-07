@@ -105,7 +105,9 @@ enum class CmdType : std::uint8_t {
   ResetHomography,
   ApplyAttackDir,
   SetScorebugRoi,  // f[0..3] = x, y, w, h in frame pixels; w = 0 back to auto
-  TestReplay       // mini replay of the last 5.5 s
+  TestReplay,      // mini replay of the last 5.5 s
+  SwapTeams,       // A <-> B: seeds, tracks, stats and attack direction
+  AutoTeams        // forget clicks; find kits and direction again
 };
 
 struct UiCommand {
@@ -144,6 +146,8 @@ struct Config {
   float scene_close_frac = 0.12f;  // below this grass share: not a pitch view
   // Teams
   float team_max_dist = 45.f;      // Lab distance to the nearer kit seed; beyond it, no team
+  float kit_auto_sep = 20.f;       // kits found from the players: clusters this far apart (Lab)
+  float kit_auto_share = 0.2f;     // ... each with this share of the shirt samples
   // Play state
   float view_angle_max_deg = 40.f;     // pitch long axis tilt at the image centre
   float player_height_max_frac = 0.25f;  // median player box height / frame height
@@ -197,7 +201,9 @@ struct Config {
   std::uint8_t ball_off_on = 0;      // a lofted ball projects past the lines, so off by default
   std::uint8_t replay_budget_pct = 5;  // mini replay pauses above this % late/dropped; 0 never
   std::uint8_t team_force = 1;  // every box on a team but one (the referee)
-  std::uint8_t pad[2]{};
+  std::uint8_t team_auto = 1;   // find the two kits from the players, no click
+  std::uint8_t dir_auto = 1;    // attack direction from where each team stands
+  std::uint8_t pad[2]{};        // explicit, so profiles round-trip byte for byte
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };

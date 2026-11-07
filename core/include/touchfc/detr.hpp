@@ -11,13 +11,22 @@
 namespace touchfc {
 
 // TouchFC class ids: 0 player, 1 goalkeeper, 2 referee, 3 ball. A model's own
-// labels map onto these by name; anything else (crowd, ads, a background
-// slot) maps to -1 and is dropped.
+// labels map onto these by keyword, so "soccer-ball" or "Football Player"
+// work; anything else (crowd, ads, a background slot) maps to -1 and is
+// dropped. Keeper and player come before ball so "football-player" is a player.
 inline int touchfc_class_of(std::string_view name) noexcept {
-  if (name == "player" || name == "players" || name == "person") return 0;
-  if (name == "goalkeeper" || name == "goalkeepers" || name == "goalie") return 1;
-  if (name == "referee" || name == "referees") return 2;
-  if (name == "ball" || name == "football" || name == "sports ball") return 3;
+  char buf[64];
+  const std::size_t n = name.size() < sizeof(buf) ? name.size() : sizeof(buf);
+  for (std::size_t i = 0; i < n; ++i) {
+    const char c = name[i];
+    buf[i] = c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+  }
+  const std::string_view s(buf, n);
+  auto has = [&](std::string_view k) { return s.find(k) != std::string_view::npos; };
+  if (has("goalkeeper") || has("goalie") || has("keeper")) return 1;
+  if (has("referee")) return 2;
+  if (has("player") || s == "person") return 0;
+  if (has("ball")) return 3;
   return -1;
 }
 
