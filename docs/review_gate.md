@@ -243,6 +243,16 @@ Pending: a real fine-tuned D-FINE-N or RF-DETR-Nano compared with yolov8n on the
 | Attack direction | `Pipeline::auto_attack_dir` | Mean pitch x of B minus A over in-play frames (defenders stay goal-side), plain mean for 45 s then a 45 s EMA, so half time is followed. Set after 15 s and 2 m. A manual press stops it until **find teams again**. |
 | Checked | test clips, YOLO11n 960 | Kits found on both wide clips (yellow vs green / white, amateur drone footage); direction from 36 s on one. Tests: clustering with a referee cluster, alike kits refused, order kept, stats swap. Broadcast check pending. |
 
+## Overlay shell (M17)
+
+| What | Where | Notes |
+|---|---|---|
+| Start card | `App::draw_start_card` in [`present.cpp`](../app/src/present.cpp), [`shell_win.cpp`](../app/src/shell_win.cpp) | Borderless rounded card (DWM corners, off the taskbar, out of captures). Windows scored: last pick, players, browsers, football words, z-order; minimised, cloaked and tool windows dropped. Profile and model combos, **Start** or Enter. No-argument start is overlay mode; a lone console is freed and stderr goes to `touchfc.log`; the cwd walks up to `config\detectors.json`. |
+| Live menu | `App::draw_live_card`, `set_menu`, `place_menu` | Alt+T (`RegisterHotKey`) or the tray icon. Docked top right in the stream. Home (status, swap, flip, find again, boxes, mini replay, map), Match, Advanced (click calibration, performance HUD, thresholds and profiles). Esc hides. **Change window** tears down in `run()`'s order and returns to the start card; a closed target does the same. |
+| Clicks on the video | `set_view_interactive`, `on_view_click` | While the menu is open the overlay drops `WS_EX_TRANSPARENT` and `WS_EX_LAYERED` (a layered window with no bitmap hit-tests as empty). Left-click a player: A, right: B (smallest box under the cursor). Calibration clicks set the next landmark; right-click skips. |
+| Overlay | `draw_view` | HUD and the M1 test box only with the performance overlay. Boxes off by default (`show_boxes` 0), shown while the menu is open. Toasts: started, kits found, direction found, team clicks. Segoe UI, rounded panels. |
+| Checked | ffplay with `right_side_pitch.mp4`, YOLO11n 960, `--recordable` screenshots | Card sized to content (auto-resize clamps to the card, so content height is measured). `WindowFromPoint` over the clip: TouchFC with the menu open, the player when closed. Change window then Start again: no crash, clean exit. Tests 774 / 64, selftest 0. Not checked: a real click on a player, the tray menu by hand, a second monitor, DPI other than the dev box. |
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. `docs/models.md` lists the detector licences: D-FINE, DEIM, RT-DETR (lyuwenyu) and RF-DETR are Apache 2.0; Ultralytics models (yolov8n, the roboflow/sports pitch model) are AGPL-3.0. No broadcast footage is in the tree.

@@ -21,3 +21,4 @@ profiles/
 # scripts/train_detector.py output
 touchfc_train/
 touchfc_models/
+touchfc.log

@@ -60,7 +60,8 @@ add_executable(touchfc
   src/ort_detector.cpp
   src/http_win.cpp
   src/ocr_win.cpp
-  src/services.cpp)
+  src/services.cpp
+  src/shell_win.cpp)
 target_include_directories(touchfc PRIVATE
   src
   ${TOUCHFC_CPPWINRT})
@@ -71,6 +72,7 @@ target_link_libraries(touchfc PRIVATE
   dxgi
   d3dcompiler
   dwmapi
+  shell32
   dcomp
   windowsapp
   winhttp

@@ -4,6 +4,7 @@
 #include "log.hpp"
 #include "pipeline.hpp"
 #include "services.hpp"
+#include "shell_win.hpp"
 #include "threads_win.hpp"
 #include "win_time.hpp"
 
@@ -97,11 +98,6 @@ struct Binding {
   bool control = false;
 };
 
-struct ListedWindow {
-  HWND hwnd = nullptr;
-  std::string title;
-};
-
 class App {
  public:
   explicit App(const AppArgs& args) : args_(args) {
@@ -114,8 +110,25 @@ class App {
 
   void on_view_resize() { view_dirty_ = true; }
   void on_control_resize() { control_dirty_ = true; }
+  // Overlay shell: Alt+T, tray, clicks on the video while the menu is open.
+  bool shell() const { return args_.mode == AppArgs::Mode::Overlay; }
+  void toggle_menu() { set_menu(!menu_open_); }
+  void on_close();  // live: hide the menu; before capture: quit
+  void on_tray(LPARAM lp);
+  void on_shell_cmd(UINT id);
+  bool view_interactive() const { return view_interactive_; }
+  void on_view_click(int x, int y, bool right);
 
  private:
+  void set_menu(bool open);
+  void set_view_interactive(bool on);
+  void place_menu();
+  void draw_menu();
+  void draw_start_card();
+  void draw_live_card();
+  void stop_capture(const char* why);
+  void toast(std::string text, double seconds = 4.0);
+  void push_cmd(const UiCommand& cmd);
   bool create_window(HWND& out, const wchar_t* title, DWORD style, DWORD ex, int w, int h, Binding& binding);
   bool create_hwnd_swap(HWND hwnd, Microsoft::WRL::ComPtr<IDXGISwapChain1>& swap, bool premultiplied);
   void recreate_rtv(IDXGISwapChain1* swap, Microsoft::WRL::ComPtr<ID3D11RenderTargetView>& rtv);
@@ -281,8 +294,27 @@ class App {
   float fps_ = 0;
   int fps_frames_ = 0;
   TimeNs fps_t_ = 0;
-  std::vector<ListedWindow> windows_;
+  std::vector<ShellWindow> windows_;
   HWND selected_ = nullptr;
+  std::string last_window_title_;
+  // Overlay shell state.
+  bool menu_open_ = true;
+  bool view_interactive_ = false;
+  bool show_diag_ = true;  // the HUD; off in overlay mode
+  bool calib_mode_ = false;
+  bool raise_menu_ = false;
+  bool hotkey_ok_ = false;
+  bool tray_ok_ = false;
+  bool quit_ = false;
+  ImFont* title_font_ = nullptr;
+  ImVec2 menu_sz_{460.f, 300.f};
+  float dpi_ = 1.f;
+  float view_ox_ = 0.f, view_oy_ = 0.f, view_scale_ = 1.f;
+  std::string toast_;
+  TimeNs toast_until_ = 0;
+  std::uint8_t seen_team_source_ = 0;
+  bool seen_dir_ = false;
+  std::vector<std::string> profiles_;
   TimeNs window_refresh_ = 0;
   std::string status_;
   bool pending_cmd_ = false;
@@ -308,12 +340,35 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     ImGui::SetCurrentContext(binding->imgui);
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) return 1;
   }
+  App* app = binding ? binding->app : nullptr;
   switch (msg) {
     case WM_SIZE:
-      if (binding && binding->app) {
-        if (binding->control) binding->app->on_control_resize();
-        else binding->app->on_view_resize();
+      if (app) {
+        if (binding->control) app->on_control_resize();
+        else app->on_view_resize();
       }
+      return 0;
+    case WM_HOTKEY:
+      if (app) app->toggle_menu();
+      return 0;
+    case kTrayMsg:
+      if (app) app->on_tray(lparam);
+      return 0;
+    case WM_COMMAND:
+      if (app && lparam == 0) app->on_shell_cmd(LOWORD(wparam));
+      return 0;
+    case WM_CLOSE:
+      // The overlay menu hides; quit is in the menu and the tray.
+      if (app && app->shell()) {
+        app->on_close();
+        return 0;
+      }
+      break;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+      if (app && !binding->control && app->view_interactive())
+        app->on_view_click(static_cast<short>(LOWORD(lparam)), static_cast<short>(HIWORD(lparam)),
+                           msg == WM_RBUTTONDOWN);
       return 0;
     case WM_DESTROY:
       PostQuitMessage(0);
@@ -610,6 +665,9 @@ void App::draw_view() {
     oy = (ch - dh) * 0.5f;
     fitted = {ox, oy, dw, dh, 0.f, 1.f};
   }
+  view_ox_ = ox;
+  view_oy_ = oy;
+  view_scale_ = scale;
 
   const bool overlay = args_.mode == AppArgs::Mode::Overlay;
   ID3D11RenderTargetView* imgui_target = view_rtv_.Get();
@@ -629,7 +687,7 @@ void App::draw_view() {
   }
 
   imgui_begin(view_binding_);
-  if (have_frame_ && last_draw_.box_w > 1.f) {
+  if (show_diag_ && have_frame_ && last_draw_.box_w > 1.f) {
     const ImVec2 a(ox + last_draw_.box_x * scale, oy + last_draw_.box_y * scale);
     const ImVec2 b(ox + (last_draw_.box_x + last_draw_.box_w) * scale,
                    oy + (last_draw_.box_y + last_draw_.box_h) * scale);
@@ -645,7 +703,9 @@ void App::draw_view() {
         IM_COL32(200, 200, 200, 255),
     };
     auto* dl = ImGui::GetForegroundDrawList();
-    const std::uint32_t shown = pipe_ && !pipe_->config().load().show_boxes ? 0 : last_det_count_;
+    // Boxes also show while the menu is open: a click on one fixes its team.
+    const std::uint32_t shown =
+        pipe_ && !pipe_->config().load().show_boxes && !view_interactive_ ? 0 : last_det_count_;
     for (std::uint32_t i = 0; i < shown; ++i) {
       const Detection& d = last_dets_[i];
       const bool teamed = last_team_[i] == 1 || last_team_[i] == 2;
@@ -738,6 +798,54 @@ void App::draw_view() {
       dl->PopClipRect();
     }
   }
+  if (pipe_)
+    if (const MatchInfo* m = pipe_->match_ui().try_read()) match_ = *m;
+  if (shell() && pipe_) {
+    // First-run news, once each: kits, then direction.
+    const std::uint8_t src = pipe_->team_source.load(std::memory_order_relaxed);
+    if (src != seen_team_source_ && src == 1) toast("Teams found from the shirts.");
+    seen_team_source_ = src;
+    const bool dir = pipe_->dir_found.load(std::memory_order_relaxed);
+    if (dir && !seen_dir_)
+      toast(std::string("Attack direction found: team A attacks ") + (pipe_->attack_dir.load() > 0 ? "right." : "left."));
+    seen_dir_ = dir;
+  }
+  if (!toast_.empty() && now < toast_until_) {
+    // Top centre pill, fading over its last half second.
+    const float fade = std::min(1.f, static_cast<float>(toast_until_ - now) / 5.0e8f);
+    const ImVec2 sz = ImGui::CalcTextSize(toast_.c_str());
+    const float px = 14.f * dpi_, py = 8.f * dpi_;
+    const ImVec2 a(0.5f * (cw - sz.x) - px, 18.f * dpi_);
+    const ImVec2 b(a.x + sz.x + 2.f * px, a.y + sz.y + 2.f * py);
+    auto* fg = ImGui::GetForegroundDrawList();
+    fg->AddRectFilled(a, b, IM_COL32(16, 18, 22, static_cast<int>(225 * fade)), 0.5f * (b.y - a.y));
+    fg->AddCircleFilled(ImVec2(a.x + 0.55f * px, 0.5f * (a.y + b.y)), 3.f * dpi_,
+                        IM_COL32(46, 200, 110, static_cast<int>(255 * fade)));
+    fg->AddText(ImVec2(a.x + px, a.y + py), IM_COL32(240, 242, 245, static_cast<int>(255 * fade)), toast_.c_str());
+  }
+  if (view_interactive_) {
+    char hint[160];
+    if (calib_mode_)
+      std::snprintf(hint, sizeof(hint), "Click: %s   (right-click skips, Esc finishes)", kPitchLandmarkName[calib_pick_]);
+    else
+      std::snprintf(hint, sizeof(hint), "Left-click a player: team A.  Right-click: team B.");
+    const ImVec2 sz = ImGui::CalcTextSize(hint);
+    const ImVec2 a(0.5f * (cw - sz.x) - 12.f * dpi_, ch - sz.y - 34.f * dpi_);
+    auto* fg = ImGui::GetForegroundDrawList();
+    if (calib_mode_)
+      for (int i = 0; i < kPitchLandmarks; ++i) {
+        if (!sent_anchor_[i]) continue;
+        const ImVec2 p(ox + sent_ax_[i] * scale, oy + sent_ay_[i] * scale);
+        char id[4];
+        std::snprintf(id, sizeof(id), "%d", i);
+        fg->AddCircle(p, 5.f * dpi_, IM_COL32(0, 255, 255, 255), 0, 2.f);
+        fg->AddText(ImVec2(p.x + 6.f * dpi_, p.y - 16.f * dpi_), IM_COL32(0, 255, 255, 255), id);
+      }
+    fg->AddRectFilled(a, ImVec2(a.x + sz.x + 24.f * dpi_, a.y + sz.y + 14.f * dpi_), IM_COL32(16, 18, 22, 210),
+                      8.f * dpi_);
+    fg->AddText(ImVec2(a.x + 12.f * dpi_, a.y + 7.f * dpi_), IM_COL32(240, 242, 245, 255), hint);
+  }
+  if (show_diag_) {
   ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Always);
   ImGui::SetNextWindowBgAlpha(0.55f);
   ImGui::Begin("HUD", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize);
@@ -745,8 +853,6 @@ void App::draw_view() {
   const double p99 = pipe_ ? static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6 : 0;
   ImGui::Text("capture-to-present-call  p50 %.2f ms   p99 %.2f ms", p50, p99);
   ImGui::Text("present %.1f fps   frame %llu", fps_, static_cast<unsigned long long>(last_frame_));
-  if (pipe_)
-    if (const MatchInfo* m = pipe_->match_ui().try_read()) match_ = *m;
   if (pipe_) {
     if (pipe_->replay_over_budget.load(std::memory_order_relaxed))
       ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "mini replay paused: over the frame budget");
@@ -791,6 +897,9 @@ void App::draw_view() {
     ImGui::TextUnformatted("click-through overlay");
   }
   ImGui::End();
+  } else {
+    hud_h_ = 0.f;
+  }
   if (have_frame_) {
     draw_stats_panel();
     draw_card();
@@ -1106,21 +1215,11 @@ void App::refresh_windows() {
   const TimeNs now = now_ns();
   if (now - window_refresh_ < 1000000000 && !windows_.empty()) return;
   window_refresh_ = now;
-  windows_.clear();
-  EnumWindows(
-      [](HWND hwnd, LPARAM lp) -> BOOL {
-        if (!IsWindowVisible(hwnd)) return TRUE;
-        wchar_t title[256]{};
-        if (GetWindowTextW(hwnd, title, 256) <= 0) return TRUE;
-        wchar_t klass[64]{};
-        GetClassNameW(hwnd, klass, 64);
-        if (wcscmp(klass, L"TouchFCWindow") == 0) return TRUE;
-        char utf8[512]{};
-        WideCharToMultiByte(CP_UTF8, 0, title, -1, utf8, sizeof(utf8), nullptr, nullptr);
-        reinterpret_cast<std::vector<ListedWindow>*>(lp)->push_back(ListedWindow{hwnd, utf8});
-        return TRUE;
-      },
-      reinterpret_cast<LPARAM>(&windows_));
+  list_capture_windows(windows_, last_window_title_);
+  // Keep the pick while it is open; otherwise the likeliest window.
+  bool still = false;
+  for (const auto& w : windows_) still |= w.hwnd == selected_;
+  if (!still) selected_ = windows_.empty() ? nullptr : windows_.front().hwnd;
 }
 
 namespace {
@@ -1247,11 +1346,56 @@ bool App::start_overlay_capture() {
   load_last_profile();
   status_ = std::string("capturing: ") + detector_->label();
   ShowWindow(view_hwnd_, SW_SHOWNOACTIVATE);
+  for (const auto& w : windows_)
+    if (w.hwnd == selected_) last_window_title_ = w.title;
+  {
+    std::error_code ec;
+    std::filesystem::create_directories("profiles", ec);
+    std::ofstream("profiles/window.txt") << last_window_title_;
+  }
+  seen_team_source_ = 0;
+  seen_dir_ = false;
+  set_menu(false);
+  toast(hotkey_ok_ ? "TouchFC is on. Alt+T opens the menu." : "TouchFC is on. The tray icon opens the menu.", 6.0);
   return true;
 }
 
+// Teardown in run()'s order, then back to the start card.
+void App::stop_capture(const char* why) {
+  if (!pipe_) return;
+  if (held_ >= 0) {
+    pipe_->release_presented(static_cast<std::uint32_t>(held_));
+    held_ = -1;
+  }
+  if (services_) services_->stop();
+  pipe_->join();
+  write_validation();
+  if (sink_) sink_->write_csv(args_.telemetry_path);
+  pipe_->write_spadl("spadl.csv");
+  if (source_) source_->close();
+  services_.reset();
+  pipe_.reset();
+  detector_.reset();
+  sink_.reset();
+  pool_.reset();
+  source_.reset();
+  have_frame_ = false;
+  last_det_count_ = 0;
+  mm_valid_ = false;
+  calib_mode_ = false;
+  set_view_interactive(false);
+  ShowWindow(view_hwnd_, SW_HIDE);
+  status_ = why ? why : "";
+  window_refresh_ = 0;
+  set_menu(true);
+}
+
 void App::track_target() {
-  if (args_.mode != AppArgs::Mode::Overlay || !view_hwnd_ || !selected_ || !IsWindow(selected_)) return;
+  if (shell() && pipe_ && (!selected_ || !IsWindow(selected_))) {
+    stop_capture("That window closed. Pick another one.");
+    return;
+  }
+  if (args_.mode != AppArgs::Mode::Overlay || !view_hwnd_ || !selected_ || !IsWindow(selected_) || !pipe_) return;
   RECT frame{};
   if (FAILED(DwmGetWindowAttribute(selected_, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame)))) {
     GetWindowRect(selected_, &frame);
@@ -1267,6 +1411,7 @@ void App::track_target() {
   if (gap(now.left, frame.left) <= 4 && gap(now.top, frame.top) <= 4 && dw <= 4 && dh <= 4) return;
   SetWindowPos(view_hwnd_, HWND_TOPMOST, frame.left, frame.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
   if (dw > 4 || dh > 4) view_dirty_ = true;
+  raise_menu_ = true;
 }
 
 // The live value each threshold is compared against, so a slider can be moved
@@ -1655,7 +1800,424 @@ void App::start_services() {
   std::snprintf(date_buf_, sizeof(date_buf_), "%s", date);
 }
 
+// ---- Overlay shell: one card over the stream, Alt+T, tray. ----
+
+void App::push_cmd(const UiCommand& cmd) {
+  if (!pipe_) return;
+  if (!pipe_->commands().try_push(cmd)) {
+    pending_ = cmd;
+    pending_cmd_ = true;
+    pipe_->command_warns.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void App::toast(std::string text, double seconds) {
+  toast_ = std::move(text);
+  toast_until_ = now_ns() + static_cast<TimeNs>(seconds * 1.0e9);
+}
+
+void App::set_view_interactive(bool on) {
+  if (!view_hwnd_ || view_interactive_ == on) return;
+  view_interactive_ = on;
+  // Layered with no bitmap hit-tests as empty, so both styles go while open.
+  constexpr LONG_PTR kPass = WS_EX_TRANSPARENT | WS_EX_LAYERED;
+  LONG_PTR ex = GetWindowLongPtrW(view_hwnd_, GWL_EXSTYLE);
+  ex = on ? (ex & ~kPass) : (ex | kPass);
+  SetWindowLongPtrW(view_hwnd_, GWL_EXSTYLE, ex);
+  SetWindowPos(view_hwnd_, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void App::set_menu(bool open) {
+  if (!shell() || !control_hwnd_) return;
+  menu_open_ = open;
+  if (!open) calib_mode_ = false;
+  set_view_interactive(open && pipe_ != nullptr);
+  if (open) {
+    profiles_.clear();
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("profiles", ec))
+      if (e.path().extension() == ".json") profiles_.push_back(e.path().stem().string());
+    window_refresh_ = 0;
+    raise_menu_ = true;
+    place_menu();
+    ShowWindow(control_hwnd_, SW_SHOW);
+    SetForegroundWindow(control_hwnd_);
+  } else {
+    ShowWindow(control_hwnd_, SW_HIDE);
+    if (pipe_ && selected_ && IsWindow(selected_)) SetForegroundWindow(selected_);
+  }
+}
+
+void App::on_close() {
+  if (pipe_) set_menu(false);
+  else quit_ = true;
+}
+
+void App::on_tray(LPARAM lp) {
+  if (lp == WM_LBUTTONUP) toggle_menu();
+  else if (lp == WM_RBUTTONUP) tray_popup(control_hwnd_, pipe_ != nullptr);
+}
+
+void App::on_shell_cmd(UINT id) {
+  if (id == kTrayMenu) set_menu(true);
+  else if (id == kTrayStop) stop_capture(nullptr);
+  else if (id == kTrayQuit) quit_ = true;
+}
+
+// Live: docked top right inside the stream. Before capture: centred on the
+// monitor under the cursor.
+void App::place_menu() {
+  if (!control_hwnd_ || !menu_open_) return;
+  RECT area{};
+  const int m = static_cast<int>(16.f * dpi_);
+  const int w = static_cast<int>(menu_sz_.x + 0.5f), h = static_cast<int>(menu_sz_.y + 0.5f);
+  int x = 0, y = 0;
+  if (pipe_ && selected_ && IsWindow(selected_)) {
+    if (FAILED(DwmGetWindowAttribute(selected_, DWMWA_EXTENDED_FRAME_BOUNDS, &area, sizeof(area))))
+      GetWindowRect(selected_, &area);
+    x = std::max<int>(area.left + m, area.right - w - m);
+    y = area.top + m;
+  } else {
+    RECT now{};
+    GetWindowRect(control_hwnd_, &now);
+    const POINT p = IsWindowVisible(control_hwnd_) ? POINT{(now.left + now.right) / 2, (now.top + now.bottom) / 2}
+                                                   : [] { POINT c{}; GetCursorPos(&c); return c; }();
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY), &mi);
+    area = mi.rcWork;
+    x = (area.left + area.right - w) / 2;
+    y = std::max<int>(area.top + m, (area.top + area.bottom - h) / 2 - static_cast<int>(60.f * dpi_));
+  }
+  RECT now{};
+  GetWindowRect(control_hwnd_, &now);
+  if (!raise_menu_ && now.left == x && now.top == y && now.right - now.left == w && now.bottom - now.top == h) return;
+  raise_menu_ = false;
+  SetWindowPos(control_hwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+}
+
+void App::on_view_click(int x, int y, bool right) {
+  if (!pipe_ || !have_frame_ || view_scale_ <= 0.f) return;
+  const float fx = (static_cast<float>(x) - view_ox_) / view_scale_;
+  const float fy = (static_cast<float>(y) - view_oy_) / view_scale_;
+  if (calib_mode_) {
+    if (right) {
+      calib_pick_ = (calib_pick_ + 1) % kPitchLandmarks;  // skip one not in view
+      return;
+    }
+    UiCommand cmd;
+    cmd.type = CmdType::SetAnchor;
+    cmd.u8a = static_cast<std::uint8_t>(calib_pick_);
+    cmd.f[0] = fx;
+    cmd.f[1] = fy;
+    push_cmd(cmd);
+    sent_anchor_[calib_pick_] = true;
+    sent_ax_[calib_pick_] = fx;
+    sent_ay_[calib_pick_] = fy;
+    calib_pick_ = (calib_pick_ + 1) % kPitchLandmarks;
+    return;
+  }
+  // Smallest player or keeper box under the cursor.
+  int best = -1;
+  float best_area = 0.f;
+  for (std::uint32_t i = 0; i < last_det_count_; ++i) {
+    const Detection& d = last_dets_[i];
+    if (d.track_id == 0 || d.class_id > 1) continue;
+    if (fx < d.x || fy < d.y || fx > d.x + d.w || fy > d.y + d.h) continue;
+    if (best < 0 || d.w * d.h < best_area) {
+      best = static_cast<int>(i);
+      best_area = d.w * d.h;
+    }
+  }
+  if (best < 0) return;
+  UiCommand cmd;
+  cmd.type = CmdType::SetTeamSeed;
+  cmd.u8a = right ? 2 : 1;
+  cmd.u16a = static_cast<std::uint16_t>(last_dets_[best].track_id);
+  push_cmd(cmd);
+  char msg[64];
+  std::snprintf(msg, sizeof(msg), "Player #%u is now team %s.", static_cast<unsigned>(cmd.u16a), right ? "B" : "A");
+  toast(msg, 2.5);
+}
+
+namespace {
+bool accent_button(const char* label, const ImVec2& size) {
+  ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.72f, 0.42f, 1.f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.82f, 0.50f, 1.f));
+  ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.13f, 0.62f, 0.36f, 1.f));
+  ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.03f, 0.08f, 0.05f, 1.f));
+  const bool hit = ImGui::Button(label, size);
+  ImGui::PopStyleColor(4);
+  return hit;
+}
+
+void status_dot(bool ok) {
+  const float r = ImGui::GetFontSize() * 0.22f;
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + r, p.y + ImGui::GetFontSize() * 0.55f), r,
+                                              ok ? IM_COL32(46, 200, 110, 255) : IM_COL32(240, 170, 40, 255));
+  ImGui::Dummy(ImVec2(2.f * r, ImGui::GetFontSize()));
+  ImGui::SameLine();
+}
+
+std::string clip_text(const std::string& s, std::size_t n) {
+  if (s.size() <= n) return s;
+  std::size_t k = n;
+  while (k > 0 && (static_cast<unsigned char>(s[k]) & 0xC0) == 0x80) --k;  // utf-8 boundary
+  return s.substr(0, k) + "...";
+}
+}  // namespace
+
+void App::draw_start_card() {
+  if (title_font_) ImGui::PushFont(title_font_);
+  ImGui::TextUnformatted("TouchFC");
+  if (title_font_) ImGui::PopFont();
+  ImGui::TextDisabled("Live stats and tracking over any football stream.");
+  ImGui::Spacing();
+  refresh_windows();
+  ImGui::TextUnformatted("What are you watching?");
+  bool go = false;
+  if (ImGui::BeginChild("##windows", ImVec2(0, 210.f * dpi_), ImGuiChildFlags_FrameStyle)) {
+    if (windows_.empty()) ImGui::TextDisabled("Open the match in a browser or video player first.");
+    for (const auto& w : windows_) {
+      ImGui::PushID(w.hwnd);
+      const std::string t = clip_text(w.title, 52);
+      if (ImGui::Selectable(t.c_str(), w.hwnd == selected_, ImGuiSelectableFlags_AllowDoubleClick)) {
+        selected_ = w.hwnd;
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) go = true;
+      }
+      if (!w.app.empty()) {
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() -
+                        ImGui::CalcTextSize(w.app.c_str()).x - 4.f * dpi_);
+        ImGui::TextDisabled("%s", w.app.c_str());
+      }
+      ImGui::PopID();
+    }
+  }
+  ImGui::EndChild();
+
+  ImGui::Spacing();
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Settings");
+  ImGui::SameLine(110.f * dpi_);
+  std::string pick;
+  {
+    std::ifstream in("profiles/last.txt");
+    in >> pick;
+  }
+  ImGui::SetNextItemWidth(-1);
+  if (ImGui::BeginCombo("##profile", pick.empty() ? "Default" : pick.c_str())) {
+    auto choose = [&](const std::string& name) {
+      std::error_code ec;
+      std::filesystem::create_directories("profiles", ec);
+      std::ofstream("profiles/last.txt") << name;
+    };
+    if (ImGui::Selectable("Default", pick.empty())) choose("");
+    for (const auto& p : profiles_)
+      if (ImGui::Selectable(p.c_str(), p == pick)) choose(p);
+    ImGui::EndCombo();
+  }
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Model");
+  ImGui::SameLine(110.f * dpi_);
+  draw_detector_pick();
+
+  ImGui::Spacing();
+  ImGui::BeginDisabled(selected_ == nullptr);
+  go |= accent_button("Start", ImVec2(-1, 42.f * dpi_));
+  go |= selected_ && ImGui::IsKeyPressed(ImGuiKey_Enter, false);
+  ImGui::EndDisabled();
+  if (go && start_overlay_capture()) return;
+  if (!status_.empty()) ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f), "%s", status_.c_str());
+  ImGui::Spacing();
+  ImGui::TextDisabled(hotkey_ok_ ? "Teams and attack direction are found for you. Alt+T opens the menu."
+                                 : "Teams and attack direction are found for you. The tray icon opens the menu.");
+  if (ImGui::SmallButton("Quit")) quit_ = true;
+}
+
+void App::draw_live_card() {
+  Config cfg = pipe_->config().load();
+  const char* win = last_window_title_.c_str();
+  if (title_font_) ImGui::PushFont(title_font_);
+  ImGui::TextUnformatted("TouchFC");
+  if (title_font_) ImGui::PopFont();
+  ImGui::SameLine();
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6.f * dpi_);
+  status_dot(true);
+  ImGui::TextDisabled("Live  %s", clip_text(win, 30).c_str());
+
+  if (ImGui::BeginTabBar("pages")) {
+    if (ImGui::BeginTabItem("Home")) {
+      const bool named = match_.teams_ok != 0;
+      const char* na = named ? match_.team[0].name : "Team A";
+      const char* nb = named ? match_.team[1].name : "Team B";
+      const std::uint8_t src = pipe_->team_source.load(std::memory_order_relaxed);
+      const bool dir = pipe_->dir_found.load(std::memory_order_relaxed);
+      ImGui::Spacing();
+      {
+        // Same colours as the boxes.
+        const float s = ImGui::GetFontSize() * 0.7f;
+        auto chip = [&](ImU32 col, const char* name) {
+          const ImVec2 p = ImGui::GetCursorScreenPos();
+          const float y = p.y + 0.5f * (ImGui::GetFontSize() - s) + 1.f;
+          ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, y), ImVec2(p.x + s, y + s), col, 3.f * dpi_);
+          ImGui::Dummy(ImVec2(s, ImGui::GetFontSize()));
+          ImGui::SameLine();
+          ImGui::TextUnformatted(name);
+        };
+        chip(IM_COL32(40, 140, 255, 255), na);
+        ImGui::SameLine();
+        ImGui::TextDisabled(" vs ");
+        ImGui::SameLine();
+        chip(IM_COL32(255, 70, 70, 255), nb);
+      }
+      static constexpr const char* kSource[] = {"Finding the two kits (needs a few seconds of wide play)",
+                                                "Kits found from the shirts", "Kits from the match data",
+                                                "Kits set by your click"};
+      status_dot(src != 0);
+      ImGui::TextUnformatted(kSource[src < 4 ? src : 0]);
+      status_dot(dir);
+      ImGui::Text("%s attacks %s%s", na, pipe_->attack_dir.load() > 0 ? "right  >" : "left  <",
+                  dir ? "" : "  (not sure yet)");
+      status_dot(last_pitch_valid_ != 0);
+      ImGui::TextUnformatted(last_pitch_valid_ ? "Pitch lines locked" : "Looking for the pitch lines");
+      ImGui::Spacing();
+      const float bw = (ImGui::GetContentRegionAvail().x - 2.f * ImGui::GetStyle().ItemSpacing.x) / 3.f;
+      UiCommand c;
+      if (ImGui::Button("Swap teams", ImVec2(bw, 0))) {
+        c.type = CmdType::SwapTeams;
+        push_cmd(c);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Flip direction", ImVec2(bw, 0))) {
+        c.type = CmdType::ApplyAttackDir;
+        c.u8a = static_cast<std::uint8_t>(pipe_->attack_dir.load() > 0 ? 0 : 1);
+        push_cmd(c);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Find again", ImVec2(bw, 0))) {
+        c.type = CmdType::AutoTeams;
+        push_cmd(c);
+        toast("Looking for the kits again.");
+      }
+      ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+      ImGui::TextWrapped("Player on the wrong team? Left-click them on the video for %s, right-click for %s.", na, nb);
+      ImGui::PopStyleColor();
+      ImGui::Separator();
+      bool boxes = cfg.show_boxes != 0, mini = cfg.mini_replay != 0;
+      bool hide_map = cfg.minimap_dead_mode == static_cast<std::uint8_t>(MinimapDeadMode::Hide);
+      bool changed = false;
+      changed |= ImGui::Checkbox("Player boxes", &boxes);
+      ImGui::SameLine();
+      changed |= ImGui::Checkbox("Mini replay", &mini);
+      ImGui::SameLine();
+      changed |= ImGui::Checkbox("Hide map when paused", &hide_map);
+      if (changed) {
+        cfg.show_boxes = boxes ? 1 : 0;
+        cfg.mini_replay = mini ? 1 : 0;
+        cfg.minimap_dead_mode = static_cast<std::uint8_t>(hide_map ? MinimapDeadMode::Hide : MinimapDeadMode::Freeze);
+        ++cfg.version;
+        pipe_->config().store(cfg);
+      }
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Match")) {
+      if (ImGui::BeginChild("##match", ImVec2(0, 380.f * dpi_))) draw_match();
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Advanced")) {
+      if (ImGui::BeginChild("##adv", ImVec2(0, 420.f * dpi_))) {
+        if (ImGui::CollapsingHeader("Pitch calibration")) {
+          ImGui::Text("%s, fit error %.2f m", last_pitch_valid_ ? (last_pitch_manual_ ? "manual" : "automatic")
+                                                                : "not calibrated",
+                      last_reproj_m_);
+          if (ImGui::Button(calib_mode_ ? "Done clicking" : "Calibrate by clicking the video")) calib_mode_ = !calib_mode_;
+          ImGui::SameLine();
+          if (ImGui::Button("Clear")) {
+            UiCommand c;
+            c.type = CmdType::ResetHomography;
+            push_cmd(c);
+            for (bool& a : sent_anchor_) a = false;
+          }
+          ImGui::SetNextItemWidth(-1);
+          ImGui::Combo("##landmark", &calib_pick_, kPitchLandmarkName, kPitchLandmarks);
+          ImGui::TextDisabled("Pause the stream first. Click 4 or more landmarks; right-click skips one.");
+          ImGui::Checkbox("Show the fitted lines", &debug_reproj_);
+        }
+        if (ImGui::CollapsingHeader("Diagnostics")) {
+          ImGui::Checkbox("Performance overlay", &show_diag_);
+          ImGui::Text("detector: %s", detector_ ? detector_->label() : "-");
+          ImGui::Text("capture to screen p50 %.1f ms, p99 %.1f ms",
+                      static_cast<double>(pipe_->present_p50_ns.load()) / 1.0e6,
+                      static_cast<double>(pipe_->present_p99_ns.load()) / 1.0e6);
+          if (ImGui::Button("Test mini replay")) {
+            UiCommand c;
+            c.type = CmdType::TestReplay;
+            push_cmd(c);
+          }
+          if (pending_cmd_) ImGui::TextDisabled("command queue full; will retry");
+        }
+        if (ImGui::CollapsingHeader("Thresholds and profiles")) draw_tuning(cfg);
+      }
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+  }
+  ImGui::Separator();
+  const float bw = (ImGui::GetContentRegionAvail().x - 2.f * ImGui::GetStyle().ItemSpacing.x) / 3.f;
+  if (ImGui::Button(hotkey_ok_ ? "Hide  (Alt+T)" : "Hide", ImVec2(bw, 0))) set_menu(false);
+  ImGui::SameLine();
+  if (ImGui::Button("Change window", ImVec2(bw, 0))) {
+    stop_capture(nullptr);
+    return;
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Quit", ImVec2(bw, 0))) quit_ = true;
+  if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+    if (calib_mode_) calib_mode_ = false;
+    else set_menu(false);
+  }
+}
+
+void App::draw_menu() {
+  if (!menu_open_ || !control_swap_) return;
+  place_menu();
+  if (control_dirty_) {
+    control_rtv_.Reset();
+    control_swap_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+    recreate_rtv(control_swap_.Get(), control_rtv_);
+    control_dirty_ = false;
+  }
+  const ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];
+  const float clear[4] = {bg.x, bg.y, bg.z, 1.f};
+  gpu_.context->OMSetRenderTargets(1, control_rtv_.GetAddressOf(), nullptr);
+  gpu_.context->ClearRenderTargetView(control_rtv_.Get(), clear);
+  imgui_begin(control_binding_);
+  // The window fills the card; the card then takes the content's height.
+  // (Auto-resize would clamp to the card itself and shrink it to nothing.)
+  ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(1.f);
+  ImGui::Begin("TouchFC", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+  if (pipe_) draw_live_card();
+  else draw_start_card();
+  const ImGuiStyle& st = ImGui::GetStyle();
+  const float content_h = ImGui::GetCursorPosY() - st.ItemSpacing.y + st.WindowPadding.y;
+  menu_sz_ = ImVec2(470.f * dpi_, std::max(80.f * dpi_, std::ceil(content_h)));
+  ImGui::End();
+  imgui_end(control_rtv_.Get());
+  control_swap_->Present(view_hwnd_ && IsWindowVisible(view_hwnd_) ? 0u : 1u, 0);
+}
+
 void App::draw_control() {
+  if (shell()) {
+    draw_menu();
+    return;
+  }
   if (control_dirty_ && control_swap_) {
     control_rtv_.Reset();
     control_swap_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
@@ -1862,10 +2424,16 @@ int App::run() {
   wc.hInstance = GetModuleHandleW(nullptr);
   wc.lpszClassName = L"TouchFCWindow";
   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  wc.hIcon = shell_icon();
+  wc.hIconSm = shell_icon();
   if (!RegisterClassExW(&wc)) return 1;
 
+  // Overlay mode: the control window is a borderless card over the stream,
+  // off the taskbar, out of captures, opened with Alt+T or the tray.
   control_binding_.control = true;
-  if (!create_window(control_hwnd_, L"TouchFC control", WS_OVERLAPPEDWINDOW, 0, 440, 720, control_binding_))
+  const bool sh = shell();
+  if (!create_window(control_hwnd_, sh ? L"TouchFC" : L"TouchFC control", sh ? WS_POPUP : WS_OVERLAPPEDWINDOW,
+                     sh ? (WS_EX_TOPMOST | WS_EX_TOOLWINDOW) : 0, sh ? 470 : 440, sh ? 300 : 720, control_binding_))
     return 1;
   if (!create_hwnd_swap(control_hwnd_, control_swap_, false)) return 1;
   recreate_rtv(control_swap_.Get(), control_rtv_);
@@ -1874,7 +2442,28 @@ int App::run() {
   ImGui::GetIO().IniFilename = nullptr;
   ImGui_ImplWin32_Init(control_hwnd_);
   ImGui_ImplDX11_Init(gpu_.device.Get(), gpu_.context.Get());
-  ShowWindow(control_hwnd_, SW_SHOW);
+  if (sh) {
+    dpi_ = static_cast<float>(GetDpiForWindow(control_hwnd_)) / 96.f;
+    if (dpi_ <= 0.f) dpi_ = 1.f;
+    title_font_ = apply_shell_style(dpi_);
+    ImGui::GetStyle().WindowRounding = 0.f;  // DWM rounds the window itself
+    const DWORD round = 2;                   // DWMWCP_ROUND
+    DwmSetWindowAttribute(control_hwnd_, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &round, sizeof(round));
+    if (!args_.recordable) SetWindowDisplayAffinity(control_hwnd_, WDA_EXCLUDEFROMCAPTURE);
+    hotkey_ok_ = RegisterHotKey(control_hwnd_, 1, MOD_ALT | MOD_NOREPEAT, 'T') == TRUE;
+    if (!hotkey_ok_) log_line("Alt+T is taken by another app; use the tray icon");
+    tray_ok_ = tray_add(control_hwnd_);
+    std::ifstream in("profiles/window.txt");
+    std::getline(in, last_window_title_);
+    if (args_.keypoints_path.empty()) {
+      std::error_code ec;
+      constexpr const char* kKeypoints = "third_party/models/football-pitch-detection.onnx";
+      if (std::filesystem::is_regular_file(kKeypoints, ec)) args_.keypoints_path = kKeypoints;
+    }
+    show_diag_ = false;
+  } else {
+    ShowWindow(control_hwnd_, SW_SHOW);
+  }
 
   if (args_.mode != AppArgs::Mode::Overlay) {
     std::string error;
@@ -1935,9 +2524,11 @@ int App::run() {
     ImGui::GetIO().IniFilename = nullptr;
     ImGui_ImplWin32_Init(view_hwnd_);
     ImGui_ImplDX11_Init(gpu_.device.Get(), gpu_.context.Get());
-    affinity_ok_ = SetWindowDisplayAffinity(view_hwnd_, WDA_EXCLUDEFROMCAPTURE) == TRUE;
+    apply_shell_style(dpi_);
+    affinity_ok_ = args_.recordable || SetWindowDisplayAffinity(view_hwnd_, WDA_EXCLUDEFROMCAPTURE) == TRUE;
     if (!affinity_ok_) log_line("SetWindowDisplayAffinity failed");
-    status_ = "pick a window, then Start capture";
+    status_.clear();
+    set_menu(true);
   }
 
   const TimeNs t_end = args_.seconds > 0 ? now_ns() + static_cast<TimeNs>(args_.seconds * 1.0e9) : 0;
@@ -1950,11 +2541,17 @@ int App::run() {
       DispatchMessageW(&msg);
     }
     if (t_end != 0 && now_ns() >= t_end) quit = true;
+    if (quit_) quit = true;
     track_target();
     pump_pipeline();
-    if (view_hwnd_ && view_swap_ && IsWindowVisible(view_hwnd_)) draw_view();
-    draw_control();
+    const bool view_on = view_hwnd_ && view_swap_ && IsWindowVisible(view_hwnd_);
+    if (view_on) draw_view();
+    if (!shell() || menu_open_) draw_control();
+    // Nothing on screen to pace the loop: wait for input instead of spinning.
+    else if (!view_on) MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
   }
+  if (tray_ok_) tray_remove(control_hwnd_);
+  if (hotkey_ok_) UnregisterHotKey(control_hwnd_, 1);
 
     if (held_ >= 0 && pipe_) {
       pipe_->release_presented(static_cast<std::uint32_t>(held_));

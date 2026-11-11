@@ -188,7 +188,7 @@ struct Config {
   std::uint16_t roi_frames = 75;     // wide frames to find the scorebug
   std::uint16_t flip_react_ms = 150;  // a panel hit this long moves
   std::uint8_t det_interval = 1;
-  std::uint8_t show_boxes = 1;
+  std::uint8_t show_boxes = 0;       // the menu shows them while open, for team clicks
   std::uint8_t attack_dir = 1;
   std::uint8_t ball_tiling = 0;
   std::uint8_t kp_interval = 4;      // keypoint model every Nth wide frame

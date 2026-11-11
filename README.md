@@ -77,33 +77,30 @@ Steps, in PowerShell:
 
 ## Run it
 
-Run from the repo root. The app reads `data\` and writes `profiles\`, `cache\` and `telemetry.csv` there.
+The app finds the repo root itself (it looks up from the exe for `config\detectors.json`). It reads `data\` and writes `profiles\`, `cache\` and `telemetry.csv` there.
 
-On a recorded match:
+On a live stream, open `build\windows-msvc\app\Release\touchfc.exe` (double-click, or run it with no arguments). There is no main window; TouchFC works like a game overlay:
+1. A card opens over your screen. Pick what you're watching (the likeliest window is preselected and the last one is remembered), optionally a settings profile and the model, then **Start**. Play the stream full screen or large.
+2. The card goes away and the stats draw over the stream. Teams come from the shirts after a few seconds of wide play and the attack direction after about 15 s; a short message on the overlay says when each is found. The change of ends at half time is followed too.
+3. **Alt+T** (or the tray icon) opens the menu, docked top right of the stream:
+   - **Home:** what has been found so far, **Swap teams**, **Flip direction**, **Find again**. While the menu is open the video takes clicks: left-click a player for team A, right-click for team B, and the rest follow that colour.
+   - **Match:** league, date, home and away teams. This fetches lineups, form and kit colours, and makes A the home team. `--match eng.1:YYYYMMDD:home:away` does it from the command line.
+   - **Advanced:** pitch calibration by clicking the video, a performance overlay, and every threshold with profile save and load.
+   - **Hide** (or Esc), **Change window**, **Quit**. Quit is also on the tray icon's right-click menu.
+
+The pitch keypoint model is found at `third_party\models\football-pitch-detection.onnx`; without it the pitch is never calibrated, so the minimap, possession and every event stay empty. `--keypoints`, `--detector "<name>"` and `--model file.onnx` override from the command line.
+
+On a recorded match (developer view, with the old control window):
 ```
 build\windows-msvc\app\Release\touchfc.exe --replay match.mp4 --detector "Light: D-FINE-N" --keypoints third_party\models\football-pitch-detection.onnx
 ```
-
-On a live stream:
-```
-build\windows-msvc\app\Release\touchfc.exe --overlay --keypoints third_party\models\football-pitch-detection.onnx
-```
-In overlay mode, pick the detector in the Main tab before **Start capture**: Light for a CPU, Balanced or Quality with a GPU. Presets whose file is missing are greyed out, and the last pick is remembered. `--detector "<name>"` or `--model file.onnx` choose one from the command line.
-Without `--keypoints` the pitch is never calibrated, so the minimap, possession and every event stay empty.
-
-First run on a match:
-1. Choose the window showing the stream (a browser or player) and the detector, then **Start capture**. Play the stream full screen or large.
-2. **Match tab:** choose the league, date, home and away teams. This fetches the lineups, form and kit colours. You can also start with `--match eng.1:YYYYMMDD:home:away`.
-3. Teams and attack direction are automatic. After a few seconds of wide play the Main tab shows `teams: kits found from the players`, and after about 15 s `team A attacks ... (from positions)`; the change of ends at half time is followed too. With a fixture in the Match tab, A is the home team. If the order is wrong, press **swap A/B**; if a player is on the wrong team, press their **A** or **B** (the rest follow that colour). **find teams again** undoes clicks and starts over.
-4. Wait for a wide shot. The HUD should show `pitch wide ... kp` with a small fit error, and dots on the minimap.
-5. **Tuning tab:** adjust thresholds, for example player and ball confidence, and the pass and shot sliders in Events. Then **save profile**. The last profile used loads on the next start.
-6. The stats panel, the on-ball card and the mini replay appear on the overlay. **mini replay: last 5 s** in the Main tab tests the replay.
 
 Useful flags:
 - `--pin`: puts pipeline threads on one L3 cache. Lower present latency on the dev box.
 - `--mini-replay 0|1`: overrides the profile.
 - `--telemetry file.csv`: writes per-stage latency on exit.
 - `--seconds N`: quits after N seconds.
+- `--recordable`: the overlay and menu show in screen recordings and screenshots (hidden by default).
 
 Optional profile-guided build, which makes a smaller exe with the same latency (see `docs/bench/final_report.md`):
 ```

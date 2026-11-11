@@ -13,6 +13,7 @@ struct AppArgs {
   std::string keypoints_path;
   double seconds = 0;
   bool pin = false;
+  bool recordable = false;  // overlay shows in screen recordings and screenshots
   std::string telemetry_path = "telemetry.csv";
   std::string pitch_dump_path;
   std::string match_spec;  // league:YYYYMMDD:home_id:away_id, as if confirmed in the Match tab
