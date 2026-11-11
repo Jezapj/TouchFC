@@ -1,6 +1,14 @@
 {
   "detectors": [
     {
+      "name": "TouchFC v1 (RF-DETR-S)",
+      "file": "third_party/models/TouchFC_v1.onnx",
+      "resize": "stretch",
+      "norm": "imagenet",
+      "classes": ["", "ball", "goalkeeper", "referee", "player"],
+      "note": "Own model: RF-DETR-Small (Apache 2.0) on CC BY data, 512 px. Slots 1 ball, 3 referee, 4 player checked on the test clips; 2 assumed goalkeeper; 5-8 unused. The ONNX class_names metadata is the stale COCO list."
+    },
+    {
       "name": "Light: D-FINE-N",
       "file": "third_party/models/dfine_n_soccer.onnx",
       "resize": "stretch",
