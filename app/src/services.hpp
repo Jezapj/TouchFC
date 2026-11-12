@@ -19,7 +19,7 @@ class Pipeline;
 struct ServiceCmd {
   enum class Kind : std::uint8_t { SetLeague, SetTeams, ClearTeams, Refresh, Sub };
   Kind kind = Kind::Refresh;
-  char league[16]{};
+  char league[24]{};
   char date[10]{};          // YYYYMMDD
   std::uint32_t home = 0;   // provider team ids
   std::uint32_t away = 0;

@@ -1533,7 +1533,18 @@ void App::draw_tuning(Config& cfg) {
 }
 
 namespace {
-constexpr const char* kLeagues[] = {"eng.1", "esp.1", "uefa.champions", "ger.1", "ita.1", "fra.1", "usa.1"};
+// Provider slug and the name shown. Clubs, then national teams.
+constexpr const char* kLeagues[] = {"eng.1", "esp.1", "uefa.champions", "ger.1", "ita.1", "fra.1", "usa.1",
+                                    "fifa.world", "fifa.friendly", "uefa.nations", "uefa.euro", "uefa.euroq",
+                                    "fifa.worldq.uefa", "conmebol.america", "fifa.worldq.conmebol",
+                                    "concacaf.gold", "concacaf.nations.league", "caf.nations", "afc.asian.cup"};
+constexpr const char* kLeagueName[] = {"Premier League", "La Liga", "Champions League", "Bundesliga", "Serie A",
+                                       "Ligue 1", "MLS",
+                                       "World Cup", "International friendly", "UEFA Nations League", "Euros",
+                                       "Euro qualifying", "World Cup qualifying (UEFA)", "Copa America",
+                                       "World Cup qualifying (CONMEBOL)", "Gold Cup", "CONCACAF Nations League",
+                                       "Africa Cup of Nations", "Asian Cup"};
+static_assert(IM_ARRAYSIZE(kLeagues) == IM_ARRAYSIZE(kLeagueName));
 
 bool contains_ci(const std::string& hay, const char* needle) {
   if (!needle[0]) return true;
@@ -1554,8 +1565,8 @@ bool contains_ci(const std::string& hay, const char* needle) {
 void App::draw_match() {
   if (!services_ || !pipe_) return;
   ImGui::TextWrapped("%s", match_.status);
-  ImGui::SetNextItemWidth(160.f);
-  if (ImGui::Combo("league", &league_idx_, kLeagues, IM_ARRAYSIZE(kLeagues))) {
+  ImGui::SetNextItemWidth(240.f);
+  if (ImGui::Combo("league", &league_idx_, kLeagueName, IM_ARRAYSIZE(kLeagueName))) {
     ServiceCmd c;
     c.kind = ServiceCmd::Kind::SetLeague;
     std::snprintf(c.league, sizeof(c.league), "%s", kLeagues[league_idx_]);
@@ -1782,9 +1793,9 @@ void App::start_services() {
   services_ = std::make_unique<Services>(*pipe_);
   services_->start();
   if (args_.match_spec.empty()) return;
-  char league[16]{}, date[9]{};
+  char league[24]{}, date[9]{};
   unsigned home = 0, away = 0;
-  if (std::sscanf(args_.match_spec.c_str(), "%15[^:]:%8[0-9]:%u:%u", league, date, &home, &away) != 4) {
+  if (std::sscanf(args_.match_spec.c_str(), "%23[^:]:%8[0-9]:%u:%u", league, date, &home, &away) != 4) {
     log_line("--match: expected league:YYYYMMDD:home_id:away_id");
     return;
   }

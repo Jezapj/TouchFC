@@ -50,7 +50,7 @@ enum class MatchSource : std::uint8_t { None = 0, Scorebug = 1, Manual = 2, File
 struct MatchInfo {
   std::uint32_t version = 0;
   std::uint32_t event_id = 0;   // provider fixture id, 0 until found
-  char league[16]{};            // provider slug, e.g. "eng.1"
+  char league[24]{};            // provider slug, e.g. "eng.1", "concacaf.nations.league"
   char date[10]{};              // YYYYMMDD
   MatchSource source = MatchSource::None;
   std::uint8_t teams_ok = 0;    // both sides identified
