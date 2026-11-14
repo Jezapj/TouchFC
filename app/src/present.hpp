@@ -18,6 +18,7 @@ struct AppArgs {
   std::string pitch_dump_path;
   std::string match_spec;  // league:YYYYMMDD:home_id:away_id, as if confirmed in the Match tab
   int mini_replay = -1;  // 0 or 1 over the profile, for before/after telemetry
+  bool demo_flow = false;  // made-up match data cycling through the M18 overlay pieces, to see them without a match
 };
 
 int run_app(const AppArgs& args);

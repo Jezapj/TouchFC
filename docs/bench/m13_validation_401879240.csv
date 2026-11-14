@@ -1,0 +1,9 @@
+team,metric,vision,provider
+MAN,passes,266,2
+MAN,pass_pct,61.3,50.0
+MAN,possession_pct,56.3,6.9
+MAN,shots,13,0
+AVL,passes,189,26
+AVL,pass_pct,46.6,92.3
+AVL,possession_pct,43.7,93.1
+AVL,shots,9,3

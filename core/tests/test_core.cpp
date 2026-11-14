@@ -18,6 +18,7 @@
 #include "touchfc/kalman.hpp"
 #include "touchfc/line_fit.hpp"
 #include "touchfc/mailbox.hpp"
+#include "touchfc/match_flow.hpp"
 #include "touchfc/nms.hpp"
 #include "touchfc/pitch.hpp"
 #include "touchfc/pitch_control.hpp"
@@ -47,8 +48,10 @@
 #include <cstring>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
 #include <cstring>
 #include <thread>
 #include <string>
@@ -1716,4 +1719,223 @@ TEST_CASE("events: a struck ball lost at once, then a dead ball, is a shot") {
   }
   w.d.stop(w.t, out, w.p);
   REQUIRE(w.d.team_stats().shots[0] == 0);
+}
+
+// ---- M18 match flow ----
+
+TEST_CASE("events: a back-pass toward the team's own goal is never a shot") {
+  // Team A attacks +x. A hard ball from 25 m out, straight at A's own goal
+  // mouth, gathered by A's keeper: a pass, and nobody's shot.
+  Sim s;
+  for (int k = 0; k < 10; ++k) s.frame(-28.f, 2.f, 4, 1);
+  s.fly(-28.f, 2.f, -50.f, 0.5f, 20.f);
+  for (int k = 0; k < 5; ++k) s.frame(-50.f, 0.5f, 1, 1);
+  REQUIRE(s.d.team_stats().shots[0] == 0);
+  REQUIRE(s.d.team_stats().shots[1] == 0);
+  REQUIRE(s.d.team_stats().passes_ok[0] == 1);
+
+  // The same ball running loose over the goal line and dead: still no shot.
+  Sim d;
+  for (int k = 0; k < 10; ++k) d.frame(-28.f, 2.f, 4, 1);
+  d.fly(-28.f, 2.f, -52.f, 0.5f, 20.f);
+  d.n += d.d.stop(d.t, d.log + d.n, d.p);
+  REQUIRE(d.d.team_stats().shots[0] == 0);
+  REQUIRE(d.d.team_stats().shots[1] == 0);
+
+  // Team B attacks -x, so the mirror image is a shot by B at that goal.
+  Sim b;
+  for (int k = 0; k < 10; ++k) b.frame(-28.f, 2.f, 14, 2);
+  b.fly(-28.f, 2.f, -52.f, 0.5f, 20.f);
+  for (int k = 0; k < 3; ++k) b.frame(-52.f, 0.5f, 1, 1);
+  REQUIRE(b.d.team_stats().shots[1] == 1);
+  REQUIRE(b.d.team_stats().shots[0] == 0);
+}
+
+TEST_CASE("config: no implicit padding after the M18 fields") {
+  REQUIRE(offsetof(Config, pad) + sizeof(Config::pad) == sizeof(Config));
+  const Config d{};
+  REQUIRE((d.layers & kLayerHeat) != 0);
+  REQUIRE(d.replay_log_n == 8);
+}
+
+TEST_CASE("match flow: momentum bins, smoothing, goals and team swap") {
+  MatchFlow f;
+  f.set_bin(10);
+  // Team A (attacking +x) holds the ball in B's box for 10 s; B in its own half.
+  for (int k = 0; k < 250; ++k) f.possession(0.04f, 1, 48.f, 0.f, 1);
+  f.set_bin(12);
+  for (int k = 0; k < 250; ++k) f.possession(0.04f, 2, 30.f, 0.f, 1);  // B attacks -x: deep in its own half
+  const FlowSnapshot& s = f.snapshot();
+  REQUIRE(s.threat[0][10] > 10.f * s.threat[1][12]);  // the box is worth far more
+  REQUIRE(s.max_bin == 12);
+  REQUIRE(flow_value(s, 10) > 0.f);
+  REQUIRE(flow_value(s, 9) > 0.f);  // smoothed into the neighbours
+  REQUIRE(flow_value(s, 12) < 0.f);
+  REQUIRE(flow_value(s, 40) == 0.f);
+
+  const float before = s.threat[1][12];
+  f.shot(2, 0.3f);
+  REQUIRE(s.threat[1][12] == before + kFlowShotBase + kFlowShotXg * 0.3f);
+  f.key_pass(2);
+  f.goal(2);
+  REQUIRE(s.goal_n == 1);
+  REQUIRE(s.goals[0].bin == 12);
+  f.second_half();
+  REQUIRE(s.half2_bin == 12);
+
+  f.swap_teams();
+  REQUIRE(s.goals[0].team == 1);
+  REQUIRE(flow_value(s, 10) < 0.f);
+
+  f.set_bin(999);  // clamps
+  REQUIRE(s.cur_bin == kFlowBins - 1);
+  f.possession(5.f, 1, 0.f, 0.f, 1);  // a gap, not a frame: ignored
+  REQUIRE(s.max_bin == 12);
+}
+
+TEST_CASE("match flow: back line height needs the line in view") {
+  // Team 1 attacks +x: keeper on the line, back four 30 m out, others ahead.
+  LinePlayer p[] = {{-51.f, 0.f, 1, 1},  {-22.f, -20.f, 1, 0}, {-23.f, -7.f, 1, 0}, {-22.f, 7.f, 1, 0},
+                    {-23.f, 20.f, 1, 0}, {-5.f, 0.f, 1, 0},    {10.f, 5.f, 1, 0},   {-20.f, 3.f, 2, 0},
+                    {0.f, 0.f, 2, 0},    {15.f, -5.f, 2, 0},   {20.f, 8.f, 2, 0}};
+  const int n = static_cast<int>(std::size(p));
+  float h = 0.f;
+  REQUIRE(def_line_m(p, n, 1, 1, -45.f, 15.f, h));
+  REQUIRE(std::abs(h - 29.7f) < 0.5f);  // mean of the three deepest outfielders
+
+  // The picture stops at x = -22: the deepest on screen may not be the line.
+  REQUIRE_FALSE(def_line_m(p, n, 1, 1, -22.f, 30.f, h));
+
+  // A keeper the detector calls a player is dropped (alone, near the line).
+  p[0].keeper = 0;
+  REQUIRE(def_line_m(p, n, 1, 1, -52.5f, 15.f, h));
+  REQUIRE(std::abs(h - 29.7f) < 0.5f);
+
+  // Team 2 attacks -x: its line is measured from x = +52.5.
+  REQUIRE(def_line_m(p, n, 2, -1, -30.f, 40.f, h));
+  REQUIRE(std::abs(h - 35.f) < 0.1f);  // 52.5 - mean(20, 15), two of four
+  REQUIRE_FALSE(def_line_m(p, 6, 2, -1, -30.f, 40.f, h));  // no team 2 players
+
+  MatchFlow f;
+  for (int k = 0; k < 100; ++k) f.line(0.04f, p, n, 1, -52.5f, 40.f, 33.f);
+  const LineStats& l = f.snapshot().line;
+  REQUIRE(std::abs(l.avg_m(0) - 29.7f) < 0.5f);
+  REQUIRE(l.high_pct(0) == 0.f);
+  REQUIRE(l.high_pct(1) == 100.f);  // 35 m against a 33 m mark
+  REQUIRE(std::abs(l.play_s - 4.f) < 0.01f);
+  REQUIRE(l.box_pct(0) == 0.f);
+}
+
+TEST_CASE("half time: one long break after the 40th minute swaps ends once") {
+  HalfTime ht;
+  float t = 0.f;
+  auto play = [&](float seconds, int clock0_ms) {
+    bool hit = false;
+    for (float e = 0.f; e < seconds; e += 1.f, t += 1.f)
+      hit = ht.step(t, false, clock0_ms + static_cast<int>(e * 1000.f), 300.f) || hit;
+    return hit;
+  };
+  REQUIRE_FALSE(play(600.f, 0));
+  t += 400.f;  // a long injury stoppage in the 10th minute: not half time
+  REQUIRE_FALSE(play(600.f, 10 * 60000));
+  REQUIRE_FALSE(ht.step(t, true, 45 * 60000, 300.f));  // dead frames never trigger
+  t += 120.f;                                          // a short break late in the half
+  REQUIRE_FALSE(play(60.f, 44 * 60000));
+  t += 900.f;  // the interval
+  REQUIRE(ht.step(t, false, 45 * 60000, 300.f));
+  REQUIRE(ht.second_half());
+  t += 900.f;
+  REQUIRE_FALSE(ht.step(t, false, 60 * 60000, 300.f));  // only once
+
+  // No scorebug: needs 25 minutes of match and a break twice as long.
+  HalfTime blind;
+  REQUIRE_FALSE(blind.step(0.f, false, -1, 300.f));
+  REQUIRE_FALSE(blind.step(700.f, false, -1, 300.f));   // early
+  REQUIRE_FALSE(blind.step(1800.f, false, -1, 300.f));  // a long gap, but it is the first after 25'
+  REQUIRE_FALSE(blind.step(2200.f, false, -1, 300.f));  // 400 s: under twice the gap
+  REQUIRE(blind.step(2900.f, false, -1, 300.f));
+
+  HalfTime off;
+  REQUIRE_FALSE(off.step(0.f, false, 44 * 60000, 0.f));
+  REQUIRE_FALSE(off.step(5000.f, false, 45 * 60000, 0.f));
+}
+
+TEST_CASE("scorer names from OCR text, lineup layout and provider scoring plays") {
+  MatchInfo m{};
+  auto add = [](TeamInfo& t, const char* name, const char* pos, int jersey, int starter, int place) {
+    PlayerInfo& p = t.squad[t.n++];
+    std::snprintf(p.name, sizeof(p.name), "%s", name);
+    std::snprintf(p.pos, sizeof(p.pos), "%s", pos);
+    p.jersey = static_cast<std::uint8_t>(jersey);
+    p.starter = static_cast<std::uint8_t>(starter);
+    p.place = static_cast<std::uint8_t>(place);
+  };
+  TeamInfo& a = m.team[0];
+  std::snprintf(a.formation, sizeof(a.formation), "4-3-3");
+  add(a, "Bench Player", "M", 30, 0, 0);
+  add(a, "David Raya", "G", 22, 1, 1);
+  add(a, "Ben White", "RB", 4, 1, 2);
+  add(a, "Jurrien Timber", "LB", 12, 1, 3);
+  add(a, "William Saliba", "CD-R", 2, 1, 4);
+  add(a, "Gabriel Magalhaes", "CD-L", 6, 1, 5);
+  add(a, "Declan Rice", "CM-L", 41, 1, 6);
+  add(a, "Martin Odegaard", "CM-R", 8, 1, 7);
+  add(a, "Thomas Partey", "CM", 5, 1, 8);
+  add(a, "Bukayo Saka", "RF", 7, 1, 9);
+  add(a, "Gabriel Martinelli", "LF", 11, 1, 10);
+  add(a, "Kai Havertz", "F", 29, 1, 11);
+  add(m.team[1], "Son Heung-Min", "F", 7, 1, 11);
+  add(m.team[1], "Jed Rice", "M", 40, 0, 0);
+
+  int side = -1, idx = -1;
+  REQUIRE(find_player("ARS 1 - 0 TOT 23:10 SAKA 23'", m, side, idx));
+  REQUIRE(side == 0);
+  REQUIRE(std::string(m.team[0].squad[idx].name) == "Bukayo Saka");
+  REQUIRE(find_player("goal heung-min", m, side, idx));  // case-insensitive
+  REQUIRE(side == 1);
+  REQUIRE_FALSE(find_player("ARS 1 - 0 TOT 23:10", m, side, idx));
+  REQUIRE_FALSE(find_player("PRICELESS SAKAMOTO", m, side, idx));  // whole words only
+  REQUIRE(find_player("RICE 60'", m, side, idx));  // two Rices: the starter
+  REQUIRE(side == 0);
+
+  XiSpot s[11];
+  REQUIRE(layout_xi(a, s) == 11);
+  REQUIRE(std::string(a.squad[s[0].idx].name) == "David Raya");
+  REQUIRE(s[0].depth == 0.f);
+  // Back four, left to right: Timber (LB), Magalhaes (CD-L), Saliba (CD-R), White (RB).
+  REQUIRE(a.squad[s[1].idx].jersey == 12);
+  REQUIRE(a.squad[s[2].idx].jersey == 6);
+  REQUIRE(a.squad[s[3].idx].jersey == 2);
+  REQUIRE(a.squad[s[4].idx].jersey == 4);
+  REQUIRE(s[1].lat < s[4].lat);
+  REQUIRE(a.squad[s[8].idx].jersey == 11);  // front three: Martinelli, Havertz, Saka
+  REQUIRE(a.squad[s[10].idx].jersey == 7);
+  REQUIRE(s[10].depth == 1.f);
+  std::snprintf(a.formation, sizeof(a.formation), "5-4-2");  // does not add up to 11: falls back
+  REQUIRE(layout_xi(a, s) == 11);
+  REQUIRE(layout_xi(m.team[1], s) == 1);
+  REQUIRE(layout_xi(TeamInfo{}, s) == 0);
+
+  m.team[0].provider_id = 359;
+  m.team[1].provider_id = 367;
+  const std::string sum = R"({"header":{"competitions":[{"details":[
+      {"clock":{"value":3700.0},"scoringPlay":true,"ownGoal":true,"team":{"id":"359"},
+       "participants":[{"athlete":{"displayName":"Own Goaler"}}]},
+      {"clock":{"value":500.0},"scoringPlay":false,"team":{"id":"359"}},
+      {"clock":{"value":856.0,"displayValue":"15'"},"scoringPlay":true,"ownGoal":false,"team":{"id":"367"},
+       "participants":[{"athlete":{"displayName":"Son Heung-Min"}},{"athlete":{"displayName":"An Assister"}}]}]}]}})";
+  const auto goals = espn::parse_goals(sum, m);
+  REQUIRE(goals.size() == 2);
+  REQUIRE(std::string(goals[0].name) == "Son Heung-Min");  // sorted by the clock
+  REQUIRE(goals[0].side == 1);
+  REQUIRE(goals[0].minute == 15);
+  REQUIRE(goals[1].own_goal == 1);
+  REQUIRE(espn::parse_goals("{bad", m).empty());
+  REQUIRE(espn::parse_goals("{}", m).empty());
+
+  const std::string roster = R"({"rosters":[{"homeAway":"home","roster":[
+      {"starter":true,"jersey":"1","formationPlace":"1","athlete":{"displayName":"A Keeper"}}]}]})";
+  MatchInfo r{};
+  REQUIRE(espn::parse_summary(roster, r));
+  REQUIRE(r.team[0].squad[0].place == 1);
 }

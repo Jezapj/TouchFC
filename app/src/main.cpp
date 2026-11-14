@@ -9,7 +9,7 @@ namespace {
 
 void print_usage() {
   std::fputs(
-      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--detector name] [--keypoints path.onnx] [--seconds N] [--pin] [--recordable] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away] [--mini-replay 0|1]\n"
+      "touchfc [--selftest] [--replay file] [--overlay] [--model path.onnx] [--detector name] [--keypoints path.onnx] [--seconds N] [--pin] [--recordable] [--telemetry path] [--pitch-dump path.csv] [--match league:YYYYMMDD:home:away] [--mini-replay 0|1] [--demo-flow]\n"
       "  --selftest   synthetic 50 fps clip\n"
       "  --replay     pace a video file through the same pipeline\n"
       "  --overlay    the app: pick a window, stats over it (default)\n"
@@ -19,7 +19,8 @@ void print_usage() {
       "  --seconds    exit after N seconds (useful for a smoke run)\n"
       "  --pin        pin pipeline threads to one L3 cache\n"
       "  --recordable  overlay and menu show in screen recordings (hidden by default)\n"
-      "  --mini-replay  0 or 1, over the profile (before/after telemetry)\n",
+      "  --mini-replay  0 or 1, over the profile (before/after telemetry)\n"
+      "  --demo-flow  with --selftest: made-up match data to preview the pop-ups, banner, flames and dead-ball panels\n",
       stderr);
 }
 
@@ -57,6 +58,8 @@ int main(int argc, char** argv) {
       args.match_spec = argv[++i];
     } else if (a == "--mini-replay" && i + 1 < argc) {
       args.mini_replay = std::atoi(argv[++i]);
+    } else if (a == "--demo-flow") {
+      args.demo_flow = true;
     } else if (a == "--pitch-dump" && i + 1 < argc) {
       args.pitch_dump_path = argv[++i];
     } else if (a == "--telemetry" && i + 1 < argc) {

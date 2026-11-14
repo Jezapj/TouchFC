@@ -12,6 +12,7 @@
 #include "touchfc/pitch_calib.hpp"
 #include "touchfc/play_state.hpp"
 #include "touchfc/events.hpp"
+#include "touchfc/match_flow.hpp"
 #include "touchfc/match_info.hpp"
 #include "touchfc/mini_replay.hpp"
 #include "touchfc/scorebug.hpp"
@@ -78,6 +79,12 @@ class Pipeline {
   const ThumbRing& thumb_ring() const noexcept { return thumb_ring_; }
   BlockingSpsc<ClipReq, 8>& clip_requests() noexcept { return clip_req_; }
   ClipBuffer& clip(int i) noexcept { return clips_[i & 1]; }
+  // M18: a replay-log clip T7 decoded for the user (allocated on first use).
+  ClipBuffer& log_clip() noexcept { return log_clip_; }
+  // M18: momentum and line heights (T3 writes, present reads), pop-up news.
+  TripleBuffer<FlowSnapshot>& flow() noexcept { return flow_buf_; }
+  BlockingSpsc<FeedItem, 16>& feed() noexcept { return feed_; }
+  std::atomic<std::uint8_t> dir_by_user{0};  // attack direction picked in the menu
   std::atomic<std::int64_t> thumb_ns{0};          // EMA of the thumbnail cost on T3
   std::atomic<bool> replay_over_budget{false};    // set once; the mini replay stays off
   void write_thumb(const FrameSlot& slot);         // present thread only
@@ -230,7 +237,22 @@ class Pipeline {
   ThumbScaler thumb_scaler_{};
   ThumbRing thumb_ring_{};
   ClipBuffer clips_[2]{};
+  ClipBuffer log_clip_{};
   BlockingSpsc<ClipReq, 8> clip_req_{};
+  // M18 match flow.
+  void update_flow(const FrameSlot& slot, const Config& cfg, float dt, std::uint8_t team, bool have, float bx,
+                   float by);
+  void push_feed(FeedKind kind, std::uint8_t team, float xg = 0.f) noexcept;
+  int flow_bin() const noexcept;
+  MatchFlow flow_{};
+  HalfTime half_{};
+  TripleBuffer<FlowSnapshot> flow_buf_{};
+  BlockingSpsc<FeedItem, 16> feed_{};
+  float flow_pub_t_ = -1e9f;
+  bool flow_dirty_ = false;
+  std::int32_t clock_ref_ms_ = -1;  // last scorebug clock and the play clock when it changed
+  float clock_ref_t_ = 0.f;
+  TimeNs ocr_fast_until_ = 0;       // after a shot or a goal: read the scorebug every 2 s
   float last_thumb_t_ = -1e9f;
   TimeNs budget_t_ = 0;
   std::uint64_t budget_frames_ = 0;

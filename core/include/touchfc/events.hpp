@@ -271,6 +271,10 @@ class EventDetector {
  private:
   float moved() const noexcept { return std::hypot(cur_x_ - rel_x_, cur_y_ - rel_y_); }
   int dir_of(std::uint8_t team, const EventParams& p) const noexcept { return team == 2 ? -p.attack_dir : p.attack_dir; }
+  // The goal at gx is the one the releasing team attacks. Only that goal can
+  // take a shot: toward the other one it is a back-pass, never the other
+  // team's shot.
+  bool attacks(float gx, const EventParams& p) const noexcept { return (gx > 0.f) == (dir_of(rel_team_, p) >= 0); }
 
   void push_ball(float t, float x, float y) noexcept {
     hist_[hist_i_] = {t, x, y};
@@ -378,6 +382,7 @@ class EventDetector {
     float vx, vy;
     if (!ball_vel(vx, vy) || std::fabs(vx) < 1e-3f) return false;
     const float gx = vx > 0.f ? 52.5f : -52.5f;
+    if (!attacks(gx, p)) return false;  // a back-pass toward the team's own goal
     const float k = (gx - cur_x_) / vx;
     if (k <= 0.f) return false;
     const float y_at = cur_y_ + k * vy;
@@ -395,6 +400,7 @@ class EventDetector {
   // the wings are left out (crosses).
   bool shot_end(float t, const EventParams& p) noexcept {
     const float gx = cur_x_ > 0.f ? 52.5f : -52.5f;
+    if (!attacks(gx, p)) return false;  // a ball played back to the team's own keeper
     const float to_goal = std::fabs(gx - cur_x_);
     if (std::fabs(rel_y_) > 24.f || std::hypot(gx - rel_x_, rel_y_) > p.shot_zone_m) return false;
     if (std::fabs(cur_x_) < 52.5f - p.shot_end_m || std::fabs(cur_y_) > 3.66f + p.shot_end_m) return false;

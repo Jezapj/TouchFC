@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -147,6 +148,7 @@ inline bool parse_summary(const std::string& text, MatchInfo& m) {
       detail::copy(pi.pos, sizeof(pi.pos), p.value("position", detail::json::object()), "abbreviation");
       pi.jersey = static_cast<std::uint8_t>(detail::to_u32(p, "jersey"));
       pi.starter = p.value("starter", false) ? 1 : 0;
+      pi.place = static_cast<std::uint8_t>(detail::to_u32(p, "formationPlace"));
       lineup = lineup || pi.starter;
     }
     if (n > 0) t.n = static_cast<std::uint8_t>(n);
@@ -171,6 +173,36 @@ inline bool parse_summary(const std::string& text, MatchInfo& m) {
     }
   }
   return true;
+}
+
+// Scoring plays of a summary (header.competitions[0].details), in match
+// order. side follows m's provider ids; an own goal is listed under the team
+// the provider credits, so callers match by order, not by side.
+inline std::vector<GoalInfo> parse_goals(const std::string& text, const MatchInfo& m) {
+  std::vector<GoalInfo> out;
+  const auto j = detail::parse(text);
+  if (j.is_discarded()) return out;
+  const auto& comps = j.value("header", detail::json::object()).value("competitions", detail::json::array());
+  if (!comps.is_array() || comps.empty()) return out;
+  std::vector<std::pair<double, GoalInfo>> plays;
+  for (const auto& d : comps[0].value("details", detail::json::array())) {
+    if (!d.is_object() || !d.value("scoringPlay", false)) continue;
+    GoalInfo g;
+    const auto& clock = d.value("clock", detail::json::object());
+    const double secs = clock.is_object() ? clock.value("value", 0.0) : 0.0;
+    g.minute = static_cast<std::uint8_t>(std::min(250.0, secs / 60.0 + 1.0));
+    g.own_goal = d.value("ownGoal", false) ? 1 : 0;
+    g.source = 2;
+    const std::uint32_t id = detail::to_u32(d.value("team", detail::json::object()), "id");
+    g.side = id && id == m.team[1].provider_id ? 1 : 0;
+    const auto& ps = d.value("participants", detail::json::array());
+    if (ps.is_array() && !ps.empty() && ps[0].is_object())
+      detail::copy(g.name, sizeof(g.name), ps[0].value("athlete", detail::json::object()), "displayName");
+    plays.emplace_back(secs, g);
+  }
+  std::stable_sort(plays.begin(), plays.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+  for (const auto& p : plays) out.push_back(p.second);
+  return out;
 }
 
 // Season stats and availability from a team roster. Fills the squad when the
@@ -205,6 +237,7 @@ inline bool parse_roster(const std::string& text, TeamInfo& t) {
       if (dst) {
         tmp.starter = dst->starter;
         tmp.subbed = dst->subbed;
+        tmp.place = dst->place;
         if (!tmp.pos[0]) std::memcpy(tmp.pos, dst->pos, sizeof(tmp.pos));
       }
     } else if (t.n < kSquadMax) {

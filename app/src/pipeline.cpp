@@ -330,15 +330,31 @@ void Pipeline::update_possession(FrameSlot& slot) {
     const float dt = last_event_t_s_ >= 0.f ? play_t_s_ - last_event_t_s_ : 0.f;
     last_event_t_s_ = play_t_s_;
     Event evs[4];
-    const int key_before = events_.team_stats().key_passes[0] + events_.team_stats().key_passes[1];
+    const TeamStats before = events_.team_stats();
     const int n = events_.step(f, dt, evs, ep);
-    const bool key = events_.team_stats().key_passes[0] + events_.team_stats().key_passes[1] != key_before;
+    const TeamStats& after = events_.team_stats();
+    const bool key = after.key_passes[0] + after.key_passes[1] != before.key_passes[0] + before.key_passes[1];
+    flow_.set_bin(flow_bin());
     for (int k = 0; k < n; ++k) {
       log_event(evs[k]);
-      if (evs[k].type == EventType::Shot) request_clip(play_t_s_, &evs[k], 1);
-      else if (key && evs[k].type == EventType::Pass && evs[k].result == EventResult::Success)
+      if (evs[k].type == EventType::Shot) {
+        request_clip(play_t_s_, &evs[k], 1);
+        const float xg = shot_xg(evs[k].sx, evs[k].sy, evs[k].ex);
+        flow_.shot(evs[k].team, xg);
+        push_feed(FeedKind::Shot, evs[k].team, xg);
+        ocr_fast_until_ = last_track_t_ns_ + 40000000000LL;  // a goal may follow
+      } else if (key && evs[k].type == EventType::Pass && evs[k].result == EventResult::Success) {
         request_clip(play_t_s_, &evs[k], 0);
+      }
     }
+    for (std::uint8_t t = 1; t <= 2; ++t) {
+      if (after.key_passes[t - 1] != before.key_passes[t - 1]) {
+        flow_.key_pass(t);
+        push_feed(FeedKind::KeyPass, t);
+      }
+      if (after.recoveries[t - 1] != before.recoveries[t - 1]) push_feed(FeedKind::Turnover, t);
+    }
+    update_flow(slot, cfg, dt, f.holder ? f.team : 0, have, bx, by);
   }
   slot.team_stats = events_.team_stats();
   const TrackStats* hs = slot.poss_track ? events_.track(slot.poss_track) : nullptr;
@@ -352,6 +368,47 @@ void Pipeline::update_possession(FrameSlot& slot) {
   slot.poss_team = poss_.held ? poss_.team : 0;
   slot.poss_track = poss_.held ? poss_.track : 0;
   slot.poss_spell_s = poss_.held ? static_cast<float>(last_track_t_ns_ - poss_.start_ns) * 1e-9f : 0.f;
+}
+
+// M18. The minute on the momentum chart: the scorebug clock, carried forward
+// on the play clock between reads (at most 15 s, so a hidden scorebug or half
+// time does not run it on); without a scorebug, minutes since the first frame.
+int Pipeline::flow_bin() const noexcept {
+  if (clock_ref_ms_ < 0) return static_cast<int>(play_t_s_ / 60.f);
+  const float ahead = std::clamp(play_t_s_ - clock_ref_t_, 0.f, 15.f);
+  return static_cast<int>((static_cast<float>(clock_ref_ms_) + ahead * 1000.f) / 60000.f);
+}
+
+void Pipeline::push_feed(FeedKind kind, std::uint8_t team, float xg) noexcept {
+  FeedItem it;
+  it.kind = kind;
+  it.team = team;
+  it.xg = xg;
+  feed_.try_push(it);  // full: present is not drawing; the news is dropped
+}
+
+// In play only. Possession weighted by xT into the minute's bin, and the two
+// back lines from the players the picture shows.
+void Pipeline::update_flow(const FrameSlot& slot, const Config& cfg, float dt, std::uint8_t team, bool have,
+                           float bx, float by) {
+  const int dir = attack_dir.load(std::memory_order_relaxed) >= 0 ? 1 : -1;
+  if (have && team) flow_.possession(dt, team, bx, by, dir);
+  if (!slot.pitch_valid) return;
+  // Pitch x range in view, from the picture's left and right edges at 60% height.
+  const float W = static_cast<float>(slot.meta.width), H = static_cast<float>(slot.meta.height);
+  float x0, y0, x1, y1;
+  if (!apply_homography(calib_.current(), 0.f, 0.6f * H, x0, y0) ||
+      !apply_homography(calib_.current(), W, 0.6f * H, x1, y1))
+    return;
+  if (x0 > x1) std::swap(x0, x1);
+  LinePlayer ps[32];
+  int n = 0;
+  for (std::uint32_t i = 0; i < slot.det_count && n < 32; ++i) {
+    const std::uint8_t t = slot.det_team[i];
+    if ((t != 1 && t != 2) || !slot.pitch_ok[i] || slot.dets[i].class_id >= 2) continue;
+    ps[n++] = {slot.pitch_x[i], slot.pitch_y[i], t, static_cast<std::uint8_t>(slot.dets[i].class_id == 1 ? 1 : 0)};
+  }
+  flow_.line(dt, ps, n, dir, x0, x1, cfg.line_high_m);
 }
 
 void Pipeline::write_spadl(const char* path) const {
@@ -653,6 +710,8 @@ void Pipeline::swap_teams() {
   for (int i = 0; i < prev_n_; ++i) flip(prev_[i].team);
   for (int i = 0; i < lost_n_; ++i) flip(lost_[i].team);
   events_.swap_teams();
+  flow_.swap_teams();
+  flow_dirty_ = true;
   dir_ema_ = -dir_ema_;
   // The kits still run the same way; A is now the other one.
   attack_dir.store(-attack_dir.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -946,7 +1005,14 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
       const int n = events_.stop(play_t_s_, evs, ep);
       for (int k = 0; k < n; ++k) {
         log_event(evs[k]);
-        if (evs[k].type == EventType::Shot) request_clip(play_t_s_, &evs[k], 1);  // shot ending in a dead ball
+        if (evs[k].type != EventType::Shot) continue;
+        request_clip(play_t_s_, &evs[k], 1);  // shot ending in a dead ball
+        const float xg = shot_xg(evs[k].sx, evs[k].sy, evs[k].ex);
+        flow_.set_bin(flow_bin());
+        flow_.shot(evs[k].team, xg);
+        flow_dirty_ = true;
+        push_feed(FeedKind::Shot, evs[k].team, xg);
+        ocr_fast_until_ = now + 40000000000LL;
       }
       last_event_t_s_ = -1.f;
       dead_start_ns_ = now;
@@ -962,6 +1028,17 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
   }
   slot.play_dead = play_dead_ ? 1 : 0;
   slot.play_reasons = play_.reasons();
+
+  // M18: the teams change ends at half time, whoever set the direction.
+  if (cfg.half_gap_s && half_.step(play_t_s_, play_dead_, match_.clock_ms, static_cast<float>(cfg.half_gap_s))) {
+    attack_dir.store(-attack_dir.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    dir_ema_ = -dir_ema_;
+    flow_.set_bin(flow_bin());
+    flow_.second_half();
+    flow_dirty_ = true;
+    push_feed(FeedKind::SecondHalf, 0);
+    log_line("second half: attack direction swapped");
+  }
 }
 
 // Provider kit colours seed team A (home) and B (away) when no click seed is
@@ -1011,6 +1088,10 @@ void Pipeline::seed_kits(const Config& cfg) {
 void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
   if (const MatchInfo* m = match_t3_.try_read()) {
     match_ = *m;
+    if (match_.clock_ms != clock_ref_ms_) {
+      clock_ref_ms_ = match_.clock_ms;
+      clock_ref_t_ = play_t_s_;
+    }
     for (int s = 0; s < 2; ++s) {
       const std::int16_t sc = match_.team[s].score;
       if (last_score_[s] >= 0 && sc > last_score_[s]) {
@@ -1032,6 +1113,11 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
         EventParams ep;
         ep.rating_goal = cfg.rating_goal;
         events_.goal(play_t_s_, ep);
+        flow_.set_bin(flow_bin());
+        flow_.goal(e.team);
+        flow_dirty_ = true;
+        push_feed(FeedKind::Goal, e.team);
+        ocr_fast_until_ = last_track_t_ns_ + 40000000000LL;  // the scorer's caption
       }
       if (sc >= 0) last_score_[s] = sc;
     }
@@ -1055,7 +1141,9 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
   if (!roi || roi[2] <= 0 || roi[3] <= 0) return;
 
   const TimeNs now = last_track_t_ns_;
-  const TimeNs every = match_.teams_ok ? 10000000000LL : 1000000000LL;
+  // 5 s once the teams are known; 2 s after a shot or a goal, when the
+  // broadcaster's scorer caption is up for a few seconds.
+  const TimeNs every = !match_.teams_ok ? 1000000000LL : now < ocr_fast_until_ ? 2000000000LL : 5000000000LL;
   if (now - last_ocr_ns_ < every) return;
   for (std::uint32_t i = 0; i < 2; ++i) {
     OcrCrop& c = crops_[i];
@@ -1085,6 +1173,7 @@ void Pipeline::run_t3() {
       if (command.type == CmdType::ApplyAttackDir) {
         attack_dir.store(command.u8a == 0 ? -1 : 1, std::memory_order_relaxed);
         dir_manual_ = true;
+        dir_by_user.store(1, std::memory_order_relaxed);
         dir_found.store(false, std::memory_order_relaxed);
       } else if (command.type == CmdType::SwapTeams) {
         swap_teams();
@@ -1099,6 +1188,7 @@ void Pipeline::run_t3() {
           t.team_lock = false;
         }
         dir_manual_ = false;
+        dir_by_user.store(0, std::memory_order_relaxed);
         dir_ema_ = dir_w_ = 0.f;
         team_source.store(0, std::memory_order_relaxed);
         dir_found.store(false, std::memory_order_relaxed);
@@ -1165,6 +1255,14 @@ void Pipeline::run_t3() {
     update_play(slot, cfg);
     update_match(slot, cfg);
     assign_teams(slot, cfg);
+    // M18: momentum and line heights to present, once a second.
+    if (flow_dirty_ || play_t_s_ - flow_pub_t_ >= 1.f) {
+      flow_.set_bin(flow_bin());
+      flow_buf_.write_slot() = flow_.snapshot();
+      flow_buf_.publish();
+      flow_pub_t_ = play_t_s_;
+      flow_dirty_ = false;
+    }
     slot.draw.box_x = marker.x;
     slot.draw.box_y = marker.y;
     slot.draw.box_w = marker.w;

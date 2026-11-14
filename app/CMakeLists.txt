@@ -60,6 +60,7 @@ add_executable(touchfc
   src/ort_detector.cpp
   src/http_win.cpp
   src/ocr_win.cpp
+  src/jpeg_win.cpp
   src/services.cpp
   src/shell_win.cpp)
 target_include_directories(touchfc PRIVATE
@@ -78,6 +79,8 @@ target_link_libraries(touchfc PRIVATE
   winhttp
   avrt
   ole32
+  oleaut32
+  windowscodecs
   uuid)
 target_compile_definitions(touchfc PRIVATE
   WIN32_LEAN_AND_MEAN

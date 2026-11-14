@@ -117,6 +117,12 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(minimap_dead_mode, Overlay, "dead ball minimap (freeze/hide)", 0, 1),
     TOUCHFC_CFG(mini_replay, Overlay, "mini replay", 0, 1),
     TOUCHFC_CFG(replay_budget_pct, Overlay, "mini replay budget % (0 off)", 0, 100),
+    TOUCHFC_CFG(replay_log_n, Overlay, "replay log size (0 off)", 0, 20),
+    TOUCHFC_CFG(popup_s, Overlay, "pop-up seconds", 1.f, 10.f),
+    TOUCHFC_CFG(goal_banner_s, Overlay, "goal banner seconds", 10.f, 180.f),
+    TOUCHFC_CFG(dead_panel_s, Overlay, "dead ball panel after s", 0.5f, 30.f),
+    TOUCHFC_CFG(line_high_m, Events, "high back line m", 25.f, 60.f),
+    TOUCHFC_CFG(half_gap_s, PlayState, "half time gap s (0 off)", 0, 1200),
 
     TOUCHFC_CFG(version, Hidden, "version", 0, 0),
     TOUCHFC_CFG(layers, Hidden, "layers", 0, 0),

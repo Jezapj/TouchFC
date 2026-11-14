@@ -179,7 +179,13 @@ struct Config {
   // Overlay
   float delay_margin_ms = 0.f;
   float flip_margin_px = 24.f;
-  std::uint32_t layers = 0xffffffffu;
+  // Match flow (M18)
+  float line_high_m = 40.f;          // a back line this far from its own goal is high
+  float dead_panel_s = 3.f;          // dead this long: a lineup / line / momentum panel shows
+  float goal_banner_s = 90.f;        // scorer banner stays this long
+  float popup_s = 3.f;               // shot / key pass / turnover pop-ups
+  std::uint32_t layers = 0xffffffffu;  // Layer bits
+  std::uint16_t half_gap_s = 300;    // a break in play this long after 40' is half time (0: never swap ends)
   std::uint16_t h_holdover = 50;     // frames a fit lives on camera motion alone
   std::uint16_t team_min_px = 8;     // non-grass torso samples for a kit colour
   std::uint16_t dead_enter_ms = 400;
@@ -203,7 +209,20 @@ struct Config {
   std::uint8_t team_force = 1;  // every box on a team but one (the referee)
   std::uint8_t team_auto = 1;   // find the two kits from the players, no click
   std::uint8_t dir_auto = 1;    // attack direction from where each team stands
-  std::uint8_t pad[2]{};        // explicit, so profiles round-trip byte for byte
+  std::uint8_t replay_log_n = 8;  // key moments kept for the replay log (0 off)
+  std::uint8_t pad[7]{};        // explicit, so profiles round-trip byte for byte
+};
+
+// Config.layers: overlay pieces the user can switch off.
+enum Layer : std::uint32_t {
+  kLayerEventPopups = 1u << 0,  // shot and key pass pop-ups
+  kLayerTurnover = 1u << 1,     // possession turnover pop-up
+  kLayerLineup = 1u << 2,       // both XIs on a dead ball
+  kLayerDefLine = 1u << 3,      // back line heights on a dead ball
+  kLayerMomentum = 1u << 4,     // momentum chart on a dead ball
+  kLayerHeat = 1u << 5,         // flames as a team nears the other goal
+  kLayerGoalBanner = 1u << 6,   // scorer banner
+  kLayerReplayAuto = 1u << 7,   // key moments play by themselves (they are logged either way)
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };

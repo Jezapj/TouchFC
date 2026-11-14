@@ -241,6 +241,41 @@ class App {
   int replay_frame_ = -1;
   TimeNs replay_t0_ = 0;
   ImVec2 replay_sz_{};
+  // M18 match flow: pop-ups, goal banner, flames, dead-ball panels, replay log.
+  void pump_flow();
+  void draw_heat(float cw, float ch);
+  void draw_news(float cw);
+  void draw_dead_panel(float cw, float ch);
+  void draw_lineup(float w);
+  void draw_lines(float w);
+  void draw_momentum(float w);
+  void draw_layer_toggles(Config& cfg);
+  void draw_replays_tab(Config& cfg);
+  void demo_flow();
+  TimeNs demo_t0_ = 0;
+  int demo_step_ = -1;
+  bool layer(std::uint32_t bit) const { return (layers_ & bit) != 0; }
+  const char* code(int t) const { return match_.teams_ok ? match_.team[t].code : (t == 0 ? "A" : "B"); }
+  ImU32 kit_color(int t) const;
+  FlowSnapshot flow_{};
+  std::uint32_t layers_ = 0xffffffffu;
+  float popup_s_ = 3.f, goal_banner_s_ = 90.f, dead_panel_s_ = 3.f, line_high_m_ = 40.f;
+  struct Popup {
+    char text[64]{};
+    std::uint8_t team = 0;
+    FeedKind kind = FeedKind::Shot;
+    TimeNs until = 0;
+  };
+  Popup popups_[3]{};
+  std::uint32_t seen_goal_n_ = 0;
+  int banner_goal_ = -1;
+  TimeNs banner_t0_ = 0;
+  float heat_ = 0.f;
+  std::uint8_t heat_team_ = 0;
+  TimeNs heat_t_ = 0;
+  int dead_rot_ = 0, dead_panel_ = -1;
+  TimeNs dead_panel_t0_ = 0;
+  bool stop_log_ = false;
   MatchInfo match_{};
   int league_idx_ = 0;
   char date_buf_[9] = "";
@@ -668,6 +703,7 @@ void App::draw_view() {
   view_ox_ = ox;
   view_oy_ = oy;
   view_scale_ = scale;
+  if (args_.demo_flow) demo_flow();
 
   const bool overlay = args_.mode == AppArgs::Mode::Overlay;
   ID3D11RenderTargetView* imgui_target = view_rtv_.Get();
@@ -756,6 +792,7 @@ void App::draw_view() {
       }
     }
     layout_panels(ox, oy, scale, cw, ch);
+    draw_heat(cw, ch);  // on the background list, under every panel
     if (pipe_) minimap_dead_mode_ = pipe_->config().load().minimap_dead_mode;
     const bool dead = last_play_dead_ != 0;
     if (!(dead && minimap_dead_mode_ == static_cast<std::uint8_t>(MinimapDeadMode::Hide))) {
@@ -799,7 +836,10 @@ void App::draw_view() {
     }
   }
   if (pipe_)
-    if (const MatchInfo* m = pipe_->match_ui().try_read()) match_ = *m;
+    if (const MatchInfo* m = pipe_->match_ui().try_read())
+      if (!args_.demo_flow) match_ = *m;
+  pump_flow();
+  if (have_frame_) draw_news(cw);
   if (shell() && pipe_) {
     // First-run news, once each: kits, then direction.
     const std::uint8_t src = pipe_->team_source.load(std::memory_order_relaxed);
@@ -904,6 +944,7 @@ void App::draw_view() {
     draw_stats_panel();
     draw_card();
     draw_replay();
+    draw_dead_panel(cw, ch);
   }
   imgui_end(imgui_target);
 
@@ -1129,34 +1170,48 @@ void App::draw_card() {
 void App::draw_replay() {
   if (!pipe_) return;
   constexpr float kFadeS = 0.5f;
+  constexpr int kLog = 2;  // M18: the clip the user picked from the replay log
   const bool on = pipe_->config().load().mini_replay != 0;
+  const bool autoplay = on && layer(kLayerReplayAuto);
   const TimeNs now = now_ns();
+  auto clip_at = [&](int i) -> ClipBuffer& { return i == kLog ? pipe_->log_clip() : pipe_->clip(i); };
   int next = -1;
-  for (int i = 0; i < 2; ++i)
-    if (i != replay_clip_ && pipe_->clip(i).state.load(std::memory_order_acquire) == ClipState::Ready &&
-        (next < 0 || pipe_->clip(i).seq < pipe_->clip(next).seq))
-      next = i;
+  for (int i = 0; i < 2; ++i) {
+    if (i == replay_clip_ || pipe_->clip(i).state.load(std::memory_order_acquire) != ClipState::Ready) continue;
+    if (!autoplay) {  // logged by T7 already; not shown
+      ClipState s = ClipState::Ready;
+      pipe_->clip(i).state.compare_exchange_strong(s, ClipState::Free);
+      continue;
+    }
+    if (next < 0 || pipe_->clip(i).seq < pipe_->clip(next).seq) next = i;
+  }
   auto length = [&](const ClipBuffer& c) {
     return std::max(0.5f, 2.f * (c.meta[c.n - 1].t_s - c.meta[0].t_s));
   };
+  // A pick from the log plays at once, over whatever is on.
+  const bool log_ready = replay_clip_ != kLog && pipe_->log_clip().state.load(std::memory_order_acquire) == ClipState::Ready;
   if (replay_clip_ >= 0) {
-    ClipBuffer& c = pipe_->clip(replay_clip_);
+    ClipBuffer& c = clip_at(replay_clip_);
     const float loops = static_cast<float>(now - replay_t0_) * 1e-9f / length(c);
-    if (!on || (next >= 0 && loops >= 1.f) || loops * length(c) >= 2.f * length(c) + kFadeS) {
+    const bool is_log = replay_clip_ == kLog;
+    if ((is_log ? stop_log_ : !autoplay || log_ready || (next >= 0 && loops >= 1.f)) ||
+        loops * length(c) >= 2.f * length(c) + kFadeS) {
       c.state.store(ClipState::Free, std::memory_order_release);
       replay_clip_ = -1;
     }
   }
-  if (on && replay_clip_ < 0 && next >= 0) {
+  stop_log_ = false;
+  if (replay_clip_ < 0 && (log_ready || next >= 0)) {
+    const int pick = log_ready ? kLog : next;
     ClipState s = ClipState::Ready;
-    if (pipe_->clip(next).state.compare_exchange_strong(s, ClipState::Playing)) {
-      replay_clip_ = next;
+    if (clip_at(pick).state.compare_exchange_strong(s, ClipState::Playing)) {
+      replay_clip_ = pick;
       replay_t0_ = now;
       replay_frame_ = -1;
     }
   }
   if (replay_clip_ < 0) return;
-  const ClipBuffer& c = pipe_->clip(replay_clip_);
+  const ClipBuffer& c = clip_at(replay_clip_);
   const float len = length(c);
   const float el = static_cast<float>(now - replay_t0_) * 1e-9f;
   const float alpha = el < 2.f * len ? 1.f : std::max(0.f, 1.f - (el - 2.f * len) / kFadeS);
@@ -1187,7 +1242,7 @@ void App::draw_replay() {
   ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
   ImGui::Begin("Mini replay", nullptr, kPanelFlags);
   const char* what = c.req.kind == 1 ? "shot" : c.req.kind == 0 ? "key pass" : "replay";
-  ImGui::Text("%s   x0.5", what);
+  ImGui::Text("%s   x0.5%s", what, replay_clip_ == kLog ? "   from the replay log" : "");
   const ImVec2 p = ImGui::GetCursorScreenPos();
   ImGui::Image(static_cast<ImTextureID>(reinterpret_cast<std::uintptr_t>(replay_srv_.Get())), replay_sz_,
                ImVec2(0, 0), ImVec2(1, 1), ImVec4(1, 1, 1, alpha), ImVec4(0, 0, 0, 0));
@@ -1209,6 +1264,669 @@ void App::draw_replay() {
   }
   ImGui::End();
   ImGui::PopStyleVar();
+}
+
+// ---- M18: match flow overlay ----
+
+namespace {
+ImU32 with_alpha(ImU32 c, float a) {
+  const ImU32 al = static_cast<ImU32>(static_cast<float>((c >> IM_COL32_A_SHIFT) & 0xff) * std::clamp(a, 0.f, 1.f));
+  return (c & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+}
+
+// Black or white, whichever reads on the colour.
+ImU32 ink_on(ImU32 c) {
+  const float l = 0.299f * static_cast<float>((c >> IM_COL32_R_SHIFT) & 0xff) +
+                  0.587f * static_cast<float>((c >> IM_COL32_G_SHIFT) & 0xff) +
+                  0.114f * static_cast<float>((c >> IM_COL32_B_SHIFT) & 0xff);
+  return l > 150.f ? IM_COL32(10, 10, 12, 255) : IM_COL32(250, 250, 250, 255);
+}
+
+// A quad with one colour along the top edge and another along the bottom.
+void grad_quad(ImDrawList* dl, ImVec2 tl, ImVec2 tr, ImVec2 br, ImVec2 bl, ImU32 top, ImU32 bot) {
+  const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+  dl->PrimReserve(6, 4);
+  const auto i = static_cast<ImDrawIdx>(dl->_VtxCurrentIdx);
+  dl->PrimWriteIdx(i);
+  dl->PrimWriteIdx(static_cast<ImDrawIdx>(i + 1));
+  dl->PrimWriteIdx(static_cast<ImDrawIdx>(i + 2));
+  dl->PrimWriteIdx(i);
+  dl->PrimWriteIdx(static_cast<ImDrawIdx>(i + 2));
+  dl->PrimWriteIdx(static_cast<ImDrawIdx>(i + 3));
+  dl->PrimWriteVtx(tl, uv, top);
+  dl->PrimWriteVtx(tr, uv, top);
+  dl->PrimWriteVtx(br, uv, bot);
+  dl->PrimWriteVtx(bl, uv, bot);
+}
+
+void pitch_bg(ImDrawList* dl, ImVec2 p, float w, float h, float alpha) {
+  dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), with_alpha(IM_COL32(22, 78, 36, 235), alpha), 4.f);
+  draw_pitch_lines(
+      dl,
+      [&](float X, float Y, ImVec2& out) {
+        out = ImVec2(p.x + (X + 52.5f) / 105.f * w, p.y + (34.f - Y) / 68.f * h);
+        return true;
+      },
+      with_alpha(IM_COL32(235, 235, 235, 150), alpha), 1.f);
+}
+}  // namespace
+
+// The away kit when the two club colours are too alike to tell apart.
+ImU32 App::kit_color(int t) const {
+  const ImU32 c = team_color(match_, t);
+  if (t == 0 || !match_.teams_ok || !match_.team[1].alt_color) return c;
+  const ImU32 h = team_color(match_, 0);
+  int d = 0;
+  for (const int sh : {IM_COL32_R_SHIFT, IM_COL32_G_SHIFT, IM_COL32_B_SHIFT})
+    d += std::abs(static_cast<int>((c >> sh) & 0xff) - static_cast<int>((h >> sh) & 0xff));
+  if (d >= 90) return c;
+  const std::uint32_t a = match_.team[1].alt_color;
+  return IM_COL32((a >> 16) & 0xff, (a >> 8) & 0xff, a & 0xff, 255);
+}
+
+// T3's news and the flow snapshot; the goal banner follows MatchInfo.
+void App::pump_flow() {
+  if (!pipe_) return;
+  const Config cfg = pipe_->config().load();
+  layers_ = cfg.layers;
+  popup_s_ = cfg.popup_s;
+  goal_banner_s_ = cfg.goal_banner_s;
+  dead_panel_s_ = args_.demo_flow ? 0.3f : cfg.dead_panel_s;
+  line_high_m_ = cfg.line_high_m;
+  if (const FlowSnapshot* f = pipe_->flow().try_read())
+    if (!args_.demo_flow) flow_ = *f;
+  const TimeNs now = now_ns();
+  FeedItem it;
+  while (pipe_->feed().try_pop(it)) {
+    if (args_.demo_flow) continue;
+    if (it.kind == FeedKind::SecondHalf) {
+      toast("Second half: the teams have swapped ends. Wrong? Use Flip direction in the menu.", 8.0);
+      continue;
+    }
+    if (it.kind == FeedKind::Goal || (it.team != 1 && it.team != 2)) continue;  // goals: the banner
+    const bool turn = it.kind == FeedKind::Turnover;
+    if (!layer(turn ? kLayerTurnover : kLayerEventPopups)) continue;
+    // A turnover replaces the last one; otherwise the slot that ends first.
+    Popup* dst = nullptr;
+    for (auto& p : popups_)
+      if (turn && p.kind == FeedKind::Turnover && p.until > now) dst = &p;
+    if (!dst) {
+      dst = &popups_[0];
+      for (auto& p : popups_)
+        if (p.until < dst->until) dst = &p;
+    }
+    const char* c = code(it.team - 1);
+    if (it.kind == FeedKind::Shot)
+      std::snprintf(dst->text, sizeof(dst->text), "Shot   %s   xG %.2f", c, static_cast<double>(it.xg));
+    else if (it.kind == FeedKind::KeyPass)
+      std::snprintf(dst->text, sizeof(dst->text), "Key pass   %s", c);
+    else
+      std::snprintf(dst->text, sizeof(dst->text), "%s win the ball", c);
+    dst->team = it.team;
+    dst->kind = it.kind;
+    dst->until = now + static_cast<TimeNs>(static_cast<double>(turn ? std::min(popup_s_, 2.f) : popup_s_) * 1.0e9);
+  }
+  if (match_.goal_n > seen_goal_n_) {
+    banner_goal_ = static_cast<int>(match_.goal_n) - 1;
+    banner_t0_ = now;
+  } else if (banner_goal_ >= static_cast<int>(match_.goal_n)) {
+    banner_goal_ = -1;  // the read that added it was corrected
+  }
+  seen_goal_n_ = match_.goal_n;
+}
+
+// Flames along the bottom edge that grow as the team in possession nears the
+// other goal: nothing before the attacking half, full height in the box.
+void App::draw_heat(float cw, float ch) {
+  const TimeNs now = now_ns();
+  const float dt = heat_t_ ? std::min(0.1f, static_cast<float>(now - heat_t_) * 1e-9f) : 0.f;
+  heat_t_ = now;
+  float target = 0.f;
+  const std::uint8_t team = last_poss_team_;
+  if (pipe_ && layer(kLayerHeat) && !last_play_dead_ && last_pitch_valid_ && last_ball_ok_ && (team == 1 || team == 2)) {
+    const int ad = pipe_->attack_dir.load(std::memory_order_relaxed) >= 0 ? 1 : -1;
+    const float prog = (last_ball_x_ * static_cast<float>(team == 1 ? ad : -ad) + 52.5f) / 105.f;
+    const float u = std::clamp((prog - 0.55f) / 0.37f, 0.f, 1.f);  // 58 m to 97 m from the team's own goal
+    target = u * u * (3.f - 2.f * u);
+    // The other team took over: burn down before the new fire starts.
+    if (heat_team_ != team) {
+      if (heat_ > 0.03f) target = 0.f;
+      else heat_team_ = team;
+    }
+  }
+  heat_ += std::clamp(target - heat_, -1.2f * dt, 2.5f * dt);
+  if (heat_ < 0.01f || (heat_team_ != 1 && heat_team_ != 2)) return;
+
+  auto* bg = ImGui::GetBackgroundDrawList();
+  const float t = static_cast<float>(static_cast<double>(now % 600000000000LL) * 1e-9);
+  const float hmax = ch * 0.17f * heat_;
+  const float a = 0.35f + 0.6f * heat_;
+  const float step = std::max(6.f, cw / 240.f);
+  auto height = [&](float x, float speed, float seed) {
+    const float n = 0.5f + 0.25f * std::sin(x * 0.021f + t * 5.1f * speed + seed) +
+                    0.15f * std::sin(x * 0.057f - t * 8.3f * speed + 2.f * seed) +
+                    0.10f * std::sin(x * 0.131f + t * 13.7f * speed);
+    return 0.3f + 0.7f * n;
+  };
+  const ImU32 clear_red = IM_COL32(255, 60, 0, 0), clear_yel = IM_COL32(255, 200, 40, 0);
+  const ImU32 base_red = with_alpha(IM_COL32(255, 90, 0, 255), 0.75f * a);
+  const ImU32 base_yel = with_alpha(IM_COL32(255, 225, 90, 255), 0.8f * a);
+  for (float x = 0.f; x < cw; x += step) {
+    const float x1 = std::min(cw, x + step);
+    const float h0 = hmax * height(x, 1.f, 0.f), h1 = hmax * height(x1, 1.f, 0.f);
+    grad_quad(bg, ImVec2(x, ch - h0), ImVec2(x1, ch - h1), ImVec2(x1, ch), ImVec2(x, ch), clear_red, base_red);
+    const float g0 = 0.55f * hmax * height(x, 1.4f, 1.7f), g1 = 0.55f * hmax * height(x1, 1.4f, 1.7f);
+    grad_quad(bg, ImVec2(x, ch - g0), ImVec2(x1, ch - g1), ImVec2(x1, ch), ImVec2(x, ch), clear_yel, base_yel);
+  }
+  // Whose attack it is.
+  bg->AddRectFilled(ImVec2(0.f, ch - 4.f * dpi_), ImVec2(cw, ch), with_alpha(kit_color(heat_team_ - 1), a));
+}
+
+// Top centre, under the toast: the goal banner, then the event pop-ups.
+void App::draw_news(float cw) {
+  auto* fg = ImGui::GetForegroundDrawList();
+  ImFont* font = ImGui::GetFont();
+  const float fs = ImGui::GetFontSize();
+  const TimeNs now = now_ns();
+  float y = 18.f * dpi_ + fs + 28.f * dpi_;
+  if (banner_goal_ >= 0 && banner_goal_ < static_cast<int>(match_.goal_n) && layer(kLayerGoalBanner)) {
+    const float el = static_cast<float>(now - banner_t0_) * 1e-9f;
+    if (el >= goal_banner_s_) {
+      banner_goal_ = -1;
+    } else {
+      const float a = std::min(1.f, el / 0.3f) * std::min(1.f, goal_banner_s_ - el);
+      const GoalInfo& g = match_.goals[banner_goal_];
+      const int t = g.side & 1;
+      char l1[64], l2[96], min[12] = "";
+      if (match_.teams_ok)
+        std::snprintf(l1, sizeof(l1), "GOAL   %s %d - %d %s", match_.team[0].code, std::max<int>(0, match_.team[0].score),
+                      std::max<int>(0, match_.team[1].score), match_.team[1].code);
+      else
+        std::snprintf(l1, sizeof(l1), "GOAL");
+      if (g.minute) std::snprintf(min, sizeof(min), "   %u'", g.minute);
+      const char* team = match_.teams_ok ? match_.team[t].name : (t == 0 ? "Team A" : "Team B");
+      if (g.name[0] && g.jersey)
+        std::snprintf(l2, sizeof(l2), "%u  %s%s   %s%s", g.jersey, g.name, g.own_goal ? " (OG)" : "", team, min);
+      else if (g.name[0])
+        std::snprintf(l2, sizeof(l2), "%s%s   %s%s", g.name, g.own_goal ? " (OG)" : "", team, min);
+      else
+        std::snprintf(l2, sizeof(l2), "%s%s", team, min);
+      const float big = fs * 1.6f, mid = fs * 1.2f;
+      const ImVec2 s1 = font->CalcTextSizeA(big, FLT_MAX, 0.f, l1), s2 = font->CalcTextSizeA(mid, FLT_MAX, 0.f, l2);
+      const float px = 18.f * dpi_, py = 10.f * dpi_, bar = 8.f * dpi_;
+      const float w = std::max(s1.x, s2.x) + 2.f * px + bar, h = s1.y + s2.y + 2.5f * py;
+      const ImVec2 p(0.5f * (cw - w), y);
+      fg->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(14, 16, 20, static_cast<int>(235 * a)), 8.f * dpi_);
+      fg->AddRectFilled(p, ImVec2(p.x + bar, p.y + h), with_alpha(kit_color(t), a), 8.f * dpi_,
+                        ImDrawFlags_RoundCornersLeft);
+      fg->AddText(font, big, ImVec2(p.x + bar + px, p.y + py), IM_COL32(255, 255, 255, static_cast<int>(255 * a)), l1);
+      fg->AddText(font, mid, ImVec2(p.x + bar + px, p.y + py * 1.5f + s1.y),
+                  IM_COL32(225, 228, 232, static_cast<int>(255 * a)), l2);
+      y += h + 8.f * dpi_;
+    }
+  }
+  for (const Popup& p : popups_) {
+    if (p.until <= now) continue;
+    const float a = std::min(1.f, static_cast<float>(p.until - now) / 4.0e8f);
+    const ImVec2 sz = ImGui::CalcTextSize(p.text);
+    const float px = 12.f * dpi_, py = 6.f * dpi_, dot = 5.f * dpi_;
+    const float w = sz.x + 2.f * px + 2.f * dot + 6.f * dpi_, h = sz.y + 2.f * py;
+    const ImVec2 o(0.5f * (cw - w), y);
+    fg->AddRectFilled(o, ImVec2(o.x + w, o.y + h), IM_COL32(16, 18, 22, static_cast<int>(215 * a)), 0.5f * h);
+    fg->AddCircleFilled(ImVec2(o.x + px + dot, o.y + 0.5f * h), dot, with_alpha(kit_color(p.team - 1), a));
+    fg->AddCircle(ImVec2(o.x + px + dot, o.y + 0.5f * h), dot, IM_COL32(255, 255, 255, static_cast<int>(140 * a)));
+    fg->AddText(ImVec2(o.x + px + 2.f * dot + 6.f * dpi_, o.y + py), IM_COL32(240, 242, 245, static_cast<int>(255 * a)),
+                p.text);
+    y += h + 6.f * dpi_;
+  }
+}
+
+// One panel per stoppage, in turn: lineups, back lines, momentum. A long
+// break (half time) moves on every 20 s.
+void App::draw_dead_panel(float cw, float ch) {
+  const TimeNs now = now_ns();
+  auto next_panel = [&](int from) {
+    const bool ok[3] = {layer(kLayerLineup) && match_.lineup_ok != 0,
+                        layer(kLayerDefLine) && flow_.line.seen_s[0] + flow_.line.seen_s[1] >= 20.f,
+                        layer(kLayerMomentum) && flow_.max_bin >= 0};
+    for (int k = 0; k < 3; ++k)
+      if (ok[(from + k) % 3]) return (from + k) % 3;
+    return -1;
+  };
+  if (!last_play_dead_) {
+    if (dead_panel_ >= 0) dead_rot_ = (dead_panel_ + 1) % 3;
+    dead_panel_ = -1;
+    return;
+  }
+  const float dead_s = static_cast<float>(now - dead_since_) * 1e-9f;
+  if (dead_s < dead_panel_s_) return;
+  if (dead_panel_ < 0 || now - dead_panel_t0_ > 20000000000LL) {
+    const int pick = next_panel(dead_panel_ < 0 ? dead_rot_ : dead_panel_ + 1);
+    // The only one available stays, without fading in again.
+    dead_panel_t0_ = pick == dead_panel_ ? now - 1000000000LL : now;
+    dead_panel_ = pick;
+  }
+  static constexpr std::uint32_t kBit[3] = {kLayerLineup, kLayerDefLine, kLayerMomentum};
+  if (dead_panel_ < 0 || !layer(kBit[dead_panel_])) {
+    dead_panel_ = -1;
+    return;
+  }
+  const float alpha = std::min(1.f, static_cast<float>(now - dead_panel_t0_) * 1e-9f / 0.3f);
+  // Between the minimap and the on-ball card when there is room.
+  const float mw = std::clamp(cw * 0.22f, 160.f, 420.f);
+  float w = std::clamp(cw * (dead_panel_ == 0 ? 0.3f : 0.34f), 360.f, dead_panel_ == 0 ? 560.f : 700.f);
+  if (cw - 2.f * (mw + 40.f) >= 360.f) w = std::min(w, cw - 2.f * (mw + 40.f));
+  w = std::min(w, cw - 32.f);
+  ImGui::SetNextWindowPos(ImVec2(0.5f * cw, ch - 16.f), ImGuiCond_Always, ImVec2(0.5f, 1.f));
+  ImGui::SetNextWindowBgAlpha(0.78f * alpha);
+  ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+  ImGui::Begin("Dead ball", nullptr, kPanelFlags);
+  if (dead_panel_ == 0) draw_lineup(w);
+  else if (dead_panel_ == 1) draw_lines(w);
+  else draw_momentum(w);
+  ImGui::End();
+  ImGui::PopStyleVar();
+}
+
+// Both XIs on one pitch: home on the left half, away on the right.
+void App::draw_lineup(float w) {
+  const float alpha = ImGui::GetStyle().Alpha;
+  ImGui::TextUnformatted("Starting XI");
+  ImGui::SameLine();
+  ImGui::TextDisabled("%s %s   v   %s %s", match_.team[0].name, match_.team[0].formation, match_.team[1].name,
+                      match_.team[1].formation);
+  const float h = w * 68.f / 105.f;
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::Dummy(ImVec2(w, h));
+  auto* dl = ImGui::GetWindowDrawList();
+  pitch_bg(dl, p, w, h, alpha);
+  ImFont* font = ImGui::GetFont();
+  const float fs = ImGui::GetFontSize();
+  const float r = std::max(8.f, h * 0.042f);
+  const float num_fs = std::min(fs, r * 1.25f), name_fs = std::clamp(h * 0.045f, 10.f, fs);
+  dl->PushClipRect(p, ImVec2(p.x + w, p.y + h), true);
+  for (int t = 0; t < 2; ++t) {
+    const TeamInfo& team = match_.team[t];
+    XiSpot spots[11];
+    const int n = layout_xi(team, spots);
+    const ImU32 col = kit_color(t);
+    for (int k = 0; k < n; ++k) {
+      const PlayerInfo& pl = team.squad[spots[k].idx];
+      // Home attacks right: its left wing is the top of the picture.
+      const float X = (t == 0 ? -1.f : 1.f) * (45.f - spots[k].depth * 38.f);
+      const float Y = (t == 0 ? -1.f : 1.f) * spots[k].lat * 27.f;
+      const ImVec2 c(p.x + (X + 52.5f) / 105.f * w, p.y + (34.f - Y) / 68.f * h - 0.25f * r);
+      const float a = alpha * (pl.subbed == 1 ? 0.4f : 1.f);
+      dl->AddCircleFilled(c, r, with_alpha(col, a));
+      dl->AddCircle(c, r, with_alpha(IM_COL32(255, 255, 255, 230), a), 0, 1.5f);
+      char num[8];
+      std::snprintf(num, sizeof(num), "%u", pl.jersey);
+      const ImVec2 ns = font->CalcTextSizeA(num_fs, FLT_MAX, 0.f, num);
+      dl->AddText(font, num_fs, ImVec2(c.x - 0.5f * ns.x, c.y - 0.5f * ns.y), with_alpha(ink_on(col), a), num);
+      char name[16];
+      std::snprintf(name, sizeof(name), "%.14s", surname(pl.name));
+      const ImVec2 ts = font->CalcTextSizeA(name_fs, FLT_MAX, 0.f, name);
+      const ImVec2 tp(c.x - 0.5f * ts.x, c.y + r + 1.f);
+      dl->AddText(font, name_fs, ImVec2(tp.x + 1.f, tp.y + 1.f), with_alpha(IM_COL32(0, 0, 0, 200), a), name);
+      dl->AddText(font, name_fs, tp, with_alpha(IM_COL32(255, 255, 255, 255), a), name);
+    }
+  }
+  dl->PopClipRect();
+}
+
+// Where each back line has stood: the average (solid) and now (thin).
+void App::draw_lines(float w) {
+  const float alpha = ImGui::GetStyle().Alpha;
+  const LineStats& l = flow_.line;
+  ImGui::TextUnformatted("Back line height");
+  ImGui::SameLine();
+  ImGui::TextDisabled("vision estimate, metres from own goal");
+  const float pw = w * 0.52f, ph = pw * 68.f / 105.f;
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::Dummy(ImVec2(pw, ph));
+  auto* dl = ImGui::GetWindowDrawList();
+  pitch_bg(dl, p, pw, ph, alpha);
+  const int ad = pipe_ && pipe_->attack_dir.load(std::memory_order_relaxed) < 0 ? -1 : 1;
+  for (int t = 0; t < 2; ++t) {
+    const float dir = static_cast<float>(t == 0 ? ad : -ad);
+    const ImU32 col = kit_color(t);
+    auto vline = [&](float m, float thick, float a) {
+      const float x = p.x + (dir * (m - 52.5f) + 52.5f) / 105.f * pw;
+      dl->AddLine(ImVec2(x, p.y + 2.f), ImVec2(x, p.y + ph - 2.f), with_alpha(IM_COL32(255, 255, 255, 220), a * alpha),
+                  thick + 2.f);
+      dl->AddLine(ImVec2(x, p.y + 2.f), ImVec2(x, p.y + ph - 2.f), with_alpha(col, a * alpha), thick);
+      return x;
+    };
+    if (l.cur_m[t] >= 0.f) {  // now: a thin dashed line
+      const float x = p.x + (dir * (l.cur_m[t] - 52.5f) + 52.5f) / 105.f * pw;
+      for (float y = p.y + 3.f; y < p.y + ph - 3.f; y += 9.f)
+        dl->AddLine(ImVec2(x, y), ImVec2(x, std::min(y + 5.f, p.y + ph - 3.f)), with_alpha(IM_COL32(255, 255, 255, 230), alpha),
+                    1.5f);
+    }
+    if (l.avg_m(t) >= 0.f) {
+      const float x = vline(l.avg_m(t), 3.f, 1.f);
+      const ImVec2 ts = ImGui::CalcTextSize(code(t));
+      const ImVec2 tp(x - 0.5f * ts.x, t == 0 ? p.y + 4.f : p.y + ph - ts.y - 4.f);
+      dl->AddRectFilled(ImVec2(tp.x - 3.f, tp.y - 1.f), ImVec2(tp.x + ts.x + 3.f, tp.y + ts.y + 1.f),
+                        with_alpha(IM_COL32(14, 16, 20, 220), alpha), 3.f);
+      dl->AddText(tp, with_alpha(IM_COL32(255, 255, 255, 255), alpha), code(t));
+    }
+  }
+  ImGui::SameLine();
+  ImGui::BeginGroup();
+  if (ImGui::BeginTable("lines", 3, ImGuiTableFlags_SizingFixedFit)) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    for (int t = 0; t < 2; ++t) {
+      ImGui::TableNextColumn();
+      const ImVec2 q = ImGui::GetCursorScreenPos();
+      const float s = ImGui::GetTextLineHeight();
+      dl->AddRectFilled(ImVec2(q.x, q.y + 0.2f * s), ImVec2(q.x + 0.6f * s, q.y + 0.8f * s), with_alpha(kit_color(t), alpha),
+                        2.f);
+      ImGui::Dummy(ImVec2(0.6f * s, s));
+      ImGui::SameLine();
+      ImGui::TextUnformatted(code(t));
+    }
+    auto row = [&](const char* name, auto cell) {
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(name);
+      for (int t = 0; t < 2; ++t) {
+        ImGui::TableNextColumn();
+        cell(t);
+      }
+    };
+    auto metres = [](float m) {
+      if (m < 0.f) ImGui::TextDisabled("-");
+      else ImGui::Text("%.0f m", static_cast<double>(m));
+    };
+    row("average", [&](int t) { metres(l.avg_m(t)); });
+    row("now", [&](int t) { metres(l.cur_m[t]); });
+    row("high line", [&](int t) { ImGui::Text("%.0f%%", static_cast<double>(l.high_pct(t))); });
+    row("2+ in the box", [&](int t) { ImGui::Text("%.0f%%", static_cast<double>(l.box_pct(t))); });
+    ImGui::EndTable();
+  }
+  ImGui::TextDisabled("solid: average   dashed: now");
+  ImGui::TextDisabled("high: %.0f m or more", static_cast<double>(line_high_m_));
+  ImGui::EndGroup();
+}
+
+// Attacking threat per minute, team A up and team B down, with the goals.
+void App::draw_momentum(float w) {
+  const float alpha = ImGui::GetStyle().Alpha;
+  ImGui::TextUnformatted("Match momentum");
+  for (int t = 0; t < 2; ++t) {  // legend: which way each team's threat points
+    ImGui::SameLine(0.f, 14.f);
+    const ImVec2 q = ImGui::GetCursorScreenPos();
+    const float s = ImGui::GetTextLineHeight();
+    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(q.x, q.y + 0.2f * s), ImVec2(q.x + 0.6f * s, q.y + 0.8f * s),
+                                              with_alpha(kit_color(t), alpha), 2.f);
+    ImGui::Dummy(ImVec2(0.6f * s, s));
+    ImGui::SameLine(0.f, 4.f);
+    ImGui::Text("%s %s", code(t), t == 0 ? "up" : "down");
+  }
+  ImGui::SameLine(0.f, 14.f);
+  ImGui::TextDisabled("vision estimate");
+  ImFont* font = ImGui::GetFont();
+  const float fs = ImGui::GetFontSize(), sm_fs = std::max(10.f, fs * 0.85f);
+  const float h = std::clamp(w * 0.32f, 120.f, 210.f);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  ImGui::Dummy(ImVec2(w, h));
+  auto* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), with_alpha(IM_COL32(10, 12, 16, 210), alpha), 4.f);
+  const float x0 = p.x + 8.f, x1 = p.x + w - 8.f, y0 = p.y + 6.f, y1 = p.y + h - sm_fs - 6.f;
+  const float mid = 0.5f * (y0 + y1), half = 0.5f * (y1 - y0);
+  const int nb = std::clamp(static_cast<int>(flow_.max_bin) + 1, 1, kFlowBins);
+  const int xmax = nb <= 45 ? 45 : nb <= 90 ? 90 : (nb + 4) / 5 * 5;
+  float scale = 1.f;
+  for (int b = 0; b < nb; ++b) scale = std::max(scale, std::fabs(flow_value(flow_, b)));
+  auto X = [&](float minute) { return x0 + minute / static_cast<float>(xmax) * (x1 - x0); };
+  auto Y = [&](float v) { return mid - v / scale * half * 0.92f; };
+  const ImU32 col[2] = {with_alpha(kit_color(0), 0.9f * alpha), with_alpha(kit_color(1), 0.9f * alpha)};
+  const ImU32 grid = with_alpha(IM_COL32(255, 255, 255, 40), alpha), ink = with_alpha(IM_COL32(200, 204, 210, 255), alpha);
+  for (int m = 0; m <= xmax; m += 15) {
+    dl->AddLine(ImVec2(X(static_cast<float>(m)), y0), ImVec2(X(static_cast<float>(m)), y1), grid);
+    char lab[8];
+    std::snprintf(lab, sizeof(lab), "%d'", m);
+    const ImVec2 ls = font->CalcTextSizeA(sm_fs, FLT_MAX, 0.f, lab);
+    dl->AddText(font, sm_fs, ImVec2(std::clamp(X(static_cast<float>(m)) - 0.5f * ls.x, p.x + 2.f, p.x + w - ls.x - 2.f), y1 + 3.f),
+                ink, lab);
+  }
+  // Area between the curve and the axis, split where it crosses.
+  const ImDrawListFlags flags = dl->Flags;
+  dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;  // mixed winding below
+  auto side = [&](float v) { return col[v >= 0.f ? 0 : 1]; };
+  if (nb == 1) {
+    const float v = flow_value(flow_, 0);
+    dl->AddRectFilled(ImVec2(X(0.f), std::min(mid, Y(v))), ImVec2(X(1.f), std::max(mid, Y(v))), side(v));
+  }
+  for (int b = 0; b + 1 < nb; ++b) {
+    const float v0 = flow_value(flow_, b), v1 = flow_value(flow_, b + 1);
+    const float xa = X(static_cast<float>(b) + 0.5f), xb = X(static_cast<float>(b) + 1.5f);
+    if (v0 * v1 >= 0.f) {
+      dl->AddQuadFilled(ImVec2(xa, mid), ImVec2(xa, Y(v0)), ImVec2(xb, Y(v1)), ImVec2(xb, mid), side(v0 + v1));
+    } else {
+      const float xz = xa + (xb - xa) * std::fabs(v0) / (std::fabs(v0) + std::fabs(v1));
+      dl->AddTriangleFilled(ImVec2(xa, mid), ImVec2(xa, Y(v0)), ImVec2(xz, mid), side(v0));
+      dl->AddTriangleFilled(ImVec2(xz, mid), ImVec2(xb, Y(v1)), ImVec2(xb, mid), side(v1));
+    }
+    dl->AddLine(ImVec2(xa, Y(v0)), ImVec2(xb, Y(v1)), with_alpha(IM_COL32(255, 255, 255, 150), alpha), 1.f);
+  }
+  dl->Flags = flags;
+  dl->AddLine(ImVec2(x0, mid), ImVec2(x1, mid), with_alpha(IM_COL32(255, 255, 255, 170), alpha), 1.f);
+  if (flow_.half2_bin >= 0) {
+    const float x = X(static_cast<float>(flow_.half2_bin));
+    dl->AddLine(ImVec2(x, y0), ImVec2(x, y1), with_alpha(IM_COL32(255, 255, 255, 150), alpha), 1.5f);
+    dl->AddText(font, sm_fs, ImVec2(x + 3.f, y0), ink, "HT");
+  }
+  for (int i = 0; i < flow_.goal_n; ++i) {
+    const auto& g = flow_.goals[i];
+    const float x = X(static_cast<float>(g.bin) + 0.5f);
+    const float y = g.team == 1 ? y0 + 6.f : y1 - 6.f;
+    dl->AddLine(ImVec2(x, y), ImVec2(x, mid), with_alpha(IM_COL32(255, 255, 255, 110), alpha), 1.f);
+    dl->AddCircleFilled(ImVec2(x, y), 5.f, with_alpha(IM_COL32(255, 255, 255, 255), alpha));
+    dl->AddCircle(ImVec2(x, y), 5.f, with_alpha(kit_color(g.team - 1), alpha), 0, 2.f);
+  }
+}
+
+// --demo-flow: a made-up match, so the M18 pieces can be seen (and checked)
+// without one. Four seconds each: an attack with pop-ups and the goal banner,
+// then the three dead-ball panels with play between them.
+void App::demo_flow() {
+  const TimeNs now = now_ns();
+  if (demo_t0_ == 0) {
+    demo_t0_ = now;
+    MatchInfo& m = match_;
+    m = {};
+    m.teams_ok = m.lineup_ok = 1;
+    m.clock_ms = 63 * 60000;
+    struct P {
+      const char* name;
+      const char* pos;
+      int jersey;
+    };
+    static constexpr P kHome[11] = {{"Alex Keeper", "G", 1},     {"Rui Rightback", "RB", 2},  {"Leo Leftback", "LB", 3},
+                                    {"Carl Stopper", "CD-R", 5}, {"Dan Marker", "CD-L", 6},   {"Max Anchor", "DM", 4},
+                                    {"Tom Runner", "CM-R", 8},   {"Sam Passer", "CM-L", 10},  {"Rob Winger", "RF", 7},
+                                    {"Lee Flyer", "LF", 11},     {"Joe Striker", "F", 9}};
+    static constexpr P kAway[11] = {{"Ivan Gloves", "G", 13},    {"Nico Right", "RB", 22},    {"Otto Left", "LB", 33},
+                                    {"Paul Tower", "CD-R", 15},  {"Quin Rock", "CD-L", 16},   {"Raul Wide", "RM", 17},
+                                    {"Stan Engine", "CM-R", 18}, {"Theo Link", "CM-L", 20},   {"Ugo Flank", "LM", 21},
+                                    {"Vic Second", "F-R", 19},   {"Will Target", "F-L", 29}};
+    const char* names[2] = {"Northfield", "Eastbrook"};
+    const char* codes[2] = {"NOR", "EAS"};
+    const char* forms[2] = {"4-3-3", "4-4-2"};
+    const std::uint32_t cols[2] = {0xD01C2Au, 0x1E4FB4u};
+    for (int t = 0; t < 2; ++t) {
+      TeamInfo& ti = m.team[t];
+      std::snprintf(ti.name, sizeof(ti.name), "%s", names[t]);
+      std::snprintf(ti.code, sizeof(ti.code), "%s", codes[t]);
+      std::snprintf(ti.formation, sizeof(ti.formation), "%s", forms[t]);
+      ti.color = cols[t];
+      ti.has_color = 1;
+      ti.score = static_cast<std::int16_t>(t == 0 ? 2 : 1);
+      ti.n = 11;
+      for (int i = 0; i < 11; ++i) {
+        const P& src = (t == 0 ? kHome : kAway)[i];
+        PlayerInfo& pl = ti.squad[i];
+        std::snprintf(pl.name, sizeof(pl.name), "%s", src.name);
+        std::snprintf(pl.pos, sizeof(pl.pos), "%s", src.pos);
+        pl.jersey = static_cast<std::uint8_t>(src.jersey);
+        pl.starter = 1;
+        pl.place = static_cast<std::uint8_t>(i + 1);
+      }
+    }
+    FlowSnapshot& f = flow_;
+    f = {};
+    for (int b = 0; b < 63; ++b) {
+      const float x = static_cast<float>(b);
+      const float v = 2.2f * std::sin(x * 0.21f) + 1.4f * std::sin(x * 0.57f + 1.f) + 0.8f * std::sin(x * 1.3f);
+      f.threat[v >= 0.f ? 0 : 1][b] = std::fabs(v) + 0.3f;
+      f.threat[v >= 0.f ? 1 : 0][b] = 0.3f;
+    }
+    f.max_bin = f.cur_bin = 62;
+    f.half2_bin = 45;
+    f.goal_n = 3;
+    f.goals[0] = {8, 1};
+    f.goals[1] = {50, 2};
+    f.goals[2] = {62, 1};
+    f.line.sum_m[0] = 43.f * 900.f;
+    f.line.sum_m[1] = 31.f * 900.f;
+    f.line.seen_s[0] = f.line.seen_s[1] = 900.f;
+    f.line.high_s[0] = 560.f;
+    f.line.high_s[1] = 130.f;
+    f.line.cur_m[0] = 47.f;
+    f.line.cur_m[1] = 27.f;
+    f.line.box_s[0] = 260.f;
+    f.line.box_s[1] = 90.f;
+    f.line.play_s = 2400.f;
+  }
+  const float el = static_cast<float>(now - demo_t0_) * 1e-9f;
+  const int step = static_cast<int>(el / 4.f) % 6;
+  const bool dead = step == 1 || step == 3 || step == 5;
+  if (step != demo_step_) {
+    demo_step_ = step;
+    if (dead) dead_since_ = now;
+    if (step == 0) {
+      // The score goes up; the name arrives a second later.
+      match_.goal_n = 1;
+      match_.goals[0] = {};
+      match_.goals[0].minute = 63;
+      seen_goal_n_ = 0;
+      static constexpr const char* kNews[3] = {"NOR win the ball", "Key pass   NOR", "Shot   NOR   xG 0.31"};
+      static constexpr FeedKind kKind[3] = {FeedKind::Turnover, FeedKind::KeyPass, FeedKind::Shot};
+      for (int k = 0; k < 3; ++k) {
+        std::snprintf(popups_[k].text, sizeof(popups_[k].text), "%s", kNews[k]);
+        popups_[k].team = 1;
+        popups_[k].kind = kKind[k];
+        popups_[k].until = now + 3500000000LL;
+      }
+    }
+  }
+  if (step == 0 && el - 4.f * std::floor(el / 4.f) > 1.f && !match_.goals[0].name[0]) {
+    std::snprintf(match_.goals[0].name, sizeof(match_.goals[0].name), "Joe Striker");
+    match_.goals[0].jersey = 9;
+  }
+  dead_panel_s_ = 0.3f;
+  last_play_dead_ = dead ? 1 : 0;
+  last_pitch_valid_ = 1;
+  last_ball_ok_ = 1;
+  last_poss_team_ = 1;
+  // Team A works the ball from halfway into the box over each live spell.
+  const float u = el / 4.f - std::floor(el / 4.f);
+  const int ad = pipe_ && pipe_->attack_dir.load(std::memory_order_relaxed) < 0 ? -1 : 1;
+  last_ball_x_ = static_cast<float>(ad) * (5.f + 44.f * std::min(1.f, u * 1.6f));
+}
+
+// Menu: what the overlay shows.
+void App::draw_layer_toggles(Config& cfg) {
+  struct Item {
+    const char* label;
+    std::uint32_t bit;
+    const char* tip;
+  };
+  static constexpr Item kItems[] = {
+      {"Shot / key pass pop-ups", kLayerEventPopups, "A sm_fs note at the top when a shot or key pass is seen."},
+      {"Turnover pop-up", kLayerTurnover, "A note when the ball changes team."},
+      {"Goal banner", kLayerGoalBanner, "Scorer, number and team after the scorebug's score changes."},
+      {"Flames", kLayerHeat, "Fire along the bottom edge as the team on the ball nears the other goal."},
+      {"Lineups", kLayerLineup, "Both starting XIs when the ball is out of play."},
+      {"Back lines", kLayerDefLine, "How high each defence has stood, when the ball is out of play."},
+      {"Momentum", kLayerMomentum, "Match momentum chart when the ball is out of play."},
+      {"Auto-play key moments", kLayerReplayAuto, "Off: shots and key passes still go to the replay log."},
+  };
+  bool changed = false;
+  if (ImGui::BeginTable("layers", 2)) {
+    for (const Item& it : kItems) {
+      ImGui::TableNextColumn();
+      bool on = (cfg.layers & it.bit) != 0;
+      if (ImGui::Checkbox(it.label, &on)) {
+        cfg.layers = on ? cfg.layers | it.bit : cfg.layers & ~it.bit;
+        changed = true;
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", it.tip);
+    }
+    ImGui::EndTable();
+  }
+  if (changed) {
+    ++cfg.version;
+    pipe_->config().store(cfg);
+  }
+}
+
+// Menu: the saved key moments, newest first.
+void App::draw_replays_tab(Config& cfg) {
+  if (!services_) {
+    ImGui::TextDisabled("Not available.");
+    return;
+  }
+  int keep = cfg.replay_log_n;
+  ImGui::SetNextItemWidth(160.f * dpi_);
+  if (ImGui::SliderInt("moments kept", &keep, 0, 20)) {
+    cfg.replay_log_n = static_cast<std::uint8_t>(keep);
+    ++cfg.version;
+    pipe_->config().store(cfg);
+  }
+  if (!cfg.mini_replay) ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "Mini replay is off, so nothing is being saved.");
+  else if (pipe_->replay_over_budget.load(std::memory_order_relaxed))
+    ImGui::TextColored(ImVec4(1.f, 0.6f, 0.2f, 1.f), "Paused: the PC is over its frame budget.");
+  const std::vector<LogEntry> log = services_->replay_log();
+  if (log.empty()) {
+    ImGui::TextDisabled("No key moments yet. Shots and key passes are saved here as they happen.");
+    return;
+  }
+  const bool playing = replay_clip_ == 2;
+  if (playing) {
+    if (ImGui::Button("Stop")) stop_log_ = true;
+    ImGui::SameLine();
+    ImGui::TextDisabled("playing on the overlay");
+  }
+  std::uint32_t kb = 0;
+  if (ImGui::BeginTable("log", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg)) {
+    for (auto it = log.rbegin(); it != log.rend(); ++it) {
+      kb += it->kbytes;
+      ImGui::PushID(static_cast<int>(it->id));
+      ImGui::TableNextRow();
+      ImGui::TableNextColumn();
+      if (it->minute) ImGui::Text("%u'", it->minute);
+      else ImGui::TextDisabled("#%u", it->id);
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(it->kind == 1 ? (it->goal ? "Shot (goal)" : "Shot") : it->kind == 0 ? "Key pass" : "Manual");
+      ImGui::TableNextColumn();
+      ImGui::TextUnformatted(it->team == 1 || it->team == 2 ? code(it->team - 1) : "");
+      ImGui::TableNextColumn();
+      if (ImGui::SmallButton("Play")) {
+        stop_log_ = playing;  // the one on screen makes way
+        ServiceCmd c;
+        c.kind = ServiceCmd::Kind::PlayLog;
+        c.log_id = it->id;
+        services_->post(c);
+      }
+      ImGui::PopID();
+    }
+    ImGui::EndTable();
+  }
+  ImGui::TextDisabled("%zu saved, %.1f MB", log.size(), static_cast<double>(kb) / 1024.0);
 }
 
 void App::refresh_windows() {
@@ -1355,6 +2073,13 @@ bool App::start_overlay_capture() {
   }
   seen_team_source_ = 0;
   seen_dir_ = false;
+  flow_ = {};
+  for (auto& p : popups_) p = {};
+  seen_goal_n_ = 0;
+  banner_goal_ = -1;
+  heat_ = 0.f;
+  dead_panel_ = -1;
+  replay_clip_ = -1;
   set_menu(false);
   toast(hotkey_ok_ ? "TouchFC is on. Alt+T opens the menu." : "TouchFC is on. The tray icon opens the menu.", 6.0);
   return true;
@@ -2088,9 +2813,10 @@ void App::draw_live_card() {
                                                 "Kits set by your click"};
       status_dot(src != 0);
       ImGui::TextUnformatted(kSource[src < 4 ? src : 0]);
-      status_dot(dir);
+      const bool dir_user = pipe_->dir_by_user.load(std::memory_order_relaxed) != 0;
+      status_dot(dir || dir_user);
       ImGui::Text("%s attacks %s%s", na, pipe_->attack_dir.load() > 0 ? "right  >" : "left  <",
-                  dir ? "" : "  (not sure yet)");
+                  dir_user ? "  (set by you)" : dir ? "" : "  (not sure yet)");
       status_dot(last_pitch_valid_ != 0);
       ImGui::TextUnformatted(last_pitch_valid_ ? "Pitch lines locked" : "Looking for the pitch lines");
       ImGui::Spacing();
@@ -2131,10 +2857,17 @@ void App::draw_live_card() {
         ++cfg.version;
         pipe_->config().store(cfg);
       }
+      ImGui::Separator();
+      draw_layer_toggles(cfg);
       ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem("Match")) {
       if (ImGui::BeginChild("##match", ImVec2(0, 380.f * dpi_))) draw_match();
+      ImGui::EndChild();
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Replays")) {
+      if (ImGui::BeginChild("##replays", ImVec2(0, 300.f * dpi_))) draw_replays_tab(cfg);
       ImGui::EndChild();
       ImGui::EndTabItem();
     }
@@ -2258,6 +2991,12 @@ void App::draw_control() {
       }
       if (ImGui::BeginTabItem("Tuning")) {
         draw_tuning(cfg);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Extras")) {
+        draw_layer_toggles(cfg);
+        ImGui::Separator();
+        draw_replays_tab(cfg);
         ImGui::EndTabItem();
       }
       ImGui::EndTabBar();

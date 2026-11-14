@@ -84,9 +84,13 @@ On a live stream, open `build\windows-msvc\app\Release\touchfc.exe` (double-clic
 2. The card goes away and the stats draw over the stream. Teams come from the shirts after a few seconds of wide play and the attack direction after about 15 s; a short message on the overlay says when each is found. The change of ends at half time is followed too.
 3. **Alt+T** (or the tray icon) opens the menu, docked top right of the stream:
    - **Home:** what has been found so far, **Swap teams**, **Flip direction**, **Find again**. While the menu is open the video takes clicks: left-click a player for team A, right-click for team B, and the rest follow that colour.
+     Below those, a tick box for each extra on the overlay: shot / key pass pop-ups, turnover pop-up, goal banner, flames, and the three panels that take turns when the ball is out of play (lineups, back line heights, match momentum).
    - **Match:** league, date, home and away teams. This fetches lineups, form and kit colours, and makes A the home team. `--match eng.1:YYYYMMDD:home:away` does it from the command line.
+   - **Replays:** the last few shots and key passes (8 by default). **Play** shows one again over the stream.
    - **Advanced:** pitch calibration by clicking the video, a performance overlay, and every threshold with profile save and load.
    - **Hide** (or Esc), **Change window**, **Quit**. Quit is also on the tray icon's right-click menu.
+
+To see the extras without a match on: `touchfc.exe --selftest --demo-flow` cycles through them with made-up data.
 
 The pitch keypoint model is found at `third_party\models\football-pitch-detection.onnx`; without it the pitch is never calibrated, so the minimap, possession and every event stay empty. `--keypoints`, `--detector "<name>"` and `--model file.onnx` override from the command line.
 
