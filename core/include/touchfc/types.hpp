@@ -223,6 +223,7 @@ enum Layer : std::uint32_t {
   kLayerHeat = 1u << 5,         // flames as a team nears the other goal
   kLayerGoalBanner = 1u << 6,   // scorer banner
   kLayerReplayAuto = 1u << 7,   // key moments play by themselves (they are logged either way)
+  kLayerPassMap = 1u << 8,      // pass direction / distance map on a dead ball
 };
 
 enum class MinimapDeadMode : std::uint8_t { Freeze = 0, Hide = 1 };

@@ -325,6 +325,9 @@ void Pipeline::update_possession(FrameSlot& slot) {
       for (std::uint32_t i = 0; i < slot.det_count; ++i) {
         if (!slot.pitch_ok[i] || slot.det_team[i] == 0 || slot.det_team[i] == team) continue;
         f.opp_dist_m = std::fmin(f.opp_dist_m, std::hypot(slot.pitch_x[i] - hx, slot.pitch_y[i] - hy));
+        if (slot.dets[i].class_id <= 1)
+          f.pressure += xg_pressure(slot.pitch_x[i], slot.pitch_y[i], slot.dets[i].class_id == 1, hx, hy,
+                                    (team == 2 ? -ep.attack_dir : ep.attack_dir) >= 0 ? 52.5f : -52.5f);
       }
     }
     const float dt = last_event_t_s_ >= 0.f ? play_t_s_ - last_event_t_s_ : 0.f;
@@ -339,18 +342,20 @@ void Pipeline::update_possession(FrameSlot& slot) {
       log_event(evs[k]);
       if (evs[k].type == EventType::Shot) {
         request_clip(play_t_s_, &evs[k], 1);
-        const float xg = shot_xg(evs[k].sx, evs[k].sy, evs[k].ex);
+        const float xg = events_.last_shot_xg();
         flow_.shot(evs[k].team, xg);
         push_feed(FeedKind::Shot, evs[k].team, xg);
         ocr_fast_until_ = last_track_t_ns_ + 40000000000LL;  // a goal may follow
-      } else if (key && evs[k].type == EventType::Pass && evs[k].result == EventResult::Success) {
-        request_clip(play_t_s_, &evs[k], 0);
+      } else if (evs[k].type == EventType::Pass) {
+        const bool ok = evs[k].result == EventResult::Success;
+        flow_.pass(evs[k].team, evs[k].sx, evs[k].sy, evs[k].ex, evs[k].ey, ok, ep.attack_dir >= 0 ? 1 : -1);
+        if (key && ok) request_clip(play_t_s_, &evs[k], 0);
       }
     }
     for (std::uint8_t t = 1; t <= 2; ++t) {
       if (after.key_passes[t - 1] != before.key_passes[t - 1]) {
-        flow_.key_pass(t);
-        push_feed(FeedKind::KeyPass, t);
+        flow_.key_pass(t, events_.last_key_xg());
+        push_feed(FeedKind::KeyPass, t, events_.last_key_xg());
       }
       if (after.recoveries[t - 1] != before.recoveries[t - 1]) push_feed(FeedKind::Turnover, t);
     }
@@ -1005,9 +1010,13 @@ void Pipeline::update_play(FrameSlot& slot, const Config& cfg) {
       const int n = events_.stop(play_t_s_, evs, ep);
       for (int k = 0; k < n; ++k) {
         log_event(evs[k]);
+        if (evs[k].type == EventType::Pass) {  // out of play: for the pass map
+          flow_.pass(evs[k].team, evs[k].sx, evs[k].sy, evs[k].ex, evs[k].ey, false, ep.attack_dir >= 0 ? 1 : -1);
+          flow_dirty_ = true;
+        }
         if (evs[k].type != EventType::Shot) continue;
         request_clip(play_t_s_, &evs[k], 1);  // shot ending in a dead ball
-        const float xg = shot_xg(evs[k].sx, evs[k].sy, evs[k].ex);
+        const float xg = events_.last_shot_xg();
         flow_.set_bin(flow_bin());
         flow_.shot(evs[k].team, xg);
         flow_dirty_ = true;

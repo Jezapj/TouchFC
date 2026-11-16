@@ -63,7 +63,7 @@ struct TeamStats {
   std::uint32_t prog[2]{};        // completed passes 10 m forward, or into the final third
   std::uint32_t recoveries[2]{};  // ball won from the other team (not a shot ending)
   std::uint32_t high_rec[2]{};    // ... in the other team's half
-  float xg[2]{};                  // summed shot xG
+  float xg[2]{};                  // summed xG of shots and key passes
   float xt_gain[2]{};             // xT added by completed passes
   float final_third_s[2]{};       // possession seconds in the attacking third
   void swap() noexcept {
@@ -94,25 +94,59 @@ inline TeamRatings team_ratings(const TeamStats& s, int t) noexcept {
     return std::fmin(1.f, std::fmax(0.f, (c - 0.55f) / 0.4f));
   };
   TeamRatings r;
-  r.attack = 10.f * (0.45f * share(s.xg[t], s.xg[o], 0.3f) + 0.2f * share(f(s.shots[t]), f(s.shots[o]), 2.f) +
+  r.attack = 10.f * (0.45f * share(s.xg[t], s.xg[o], 0.6f) + 0.2f * share(f(s.shots[t]), f(s.shots[o]), 2.f) +
                      0.15f * share(f(s.key_passes[t]), f(s.key_passes[o]), 1.f) +
                      0.2f * share(s.final_third_s[t], s.final_third_s[o], 30.f));
   r.build = 10.f * (0.4f * comp(t) + 0.3f * share(f(s.prog[t]), f(s.prog[o]), 3.f) +
                     0.3f * share(s.xt_gain[t], s.xt_gain[o], 0.1f));
   r.defence = 10.f * (0.35f * share(f(s.recoveries[t]), f(s.recoveries[o]), 3.f) +
                       0.25f * share(f(s.high_rec[t]), f(s.high_rec[o]), 2.f) + 0.2f * (1.f - comp(o)) +
-                      0.2f * (1.f - share(s.xg[o], s.xg[t], 0.3f)));
+                      0.2f * (1.f - share(s.xg[o], s.xg[t], 0.6f)));
   r.control = 10.f * (0.7f * share(s.poss_s[t], s.poss_s[o], 30.f) +
                       0.3f * share(f(s.passes[t]), f(s.passes[o]), 5.f));
   r.overall = 0.25f * (r.attack + r.build + r.defence + r.control);
   return r;
 }
 
-// Shot xG from distance and the angle between the posts (logistic).
-inline float shot_xg(float x, float y, float gx) noexcept {
+inline constexpr float kXgMax = 0.99f;
+
+// One opponent's share of the pressure on a shot or final ball from (x, y) at
+// the goal at gx: 1 within 2 m, fading to 0 at 6 m; an outfielder standing in
+// the lane to the goal mouth counts at least 0.5.
+inline float xg_pressure(float ox, float oy, bool keeper, float x, float y, float gx) noexcept {
+  const float d = std::hypot(ox - x, oy - y);
+  float p = std::fmin(1.f, std::fmax(0.f, (6.f - d) / 4.f));
+  const float dx = gx - x;
+  if (!keeper && std::fabs(dx) > 0.5f) {
+    const float u = (ox - x) / dx;  // 0 at the ball, 1 on the goal line
+    if (u > 0.f && u < 1.f) {
+      const float lo = y + u * (-3.66f - y) - 0.5f, hi = y + u * (3.66f - y) + 0.5f;
+      if (oy > lo && oy < hi) p = std::fmax(p, 0.5f);
+    }
+  }
+  return p;
+}
+
+// Chance quality, 0 to kXgMax. Tuned for the overlay, not a fitted model:
+// near kXgMax on the goal line, about 0.4 from the edge of the box and 0.12
+// from 28 m when unopposed, less from a tight angle, and divided down by the
+// pressure (the sum of xg_pressure over the opponents).
+inline float shot_xg(float x, float y, float gx, float pressure = 0.f) noexcept {
   const float dx = std::fabs(gx - x), d = std::hypot(dx, y);
-  const float th = std::atan2(7.32f * dx, dx * dx + y * y - 3.66f * 3.66f);
-  return 1.f / (1.f + std::exp(1.1f + 0.11f * d - 1.6f * th));
+  float v = kXgMax * std::exp(-std::pow(d / 17.5f, 1.6f));
+  if (d > 0.5f) {
+    const float th = std::atan2(7.32f * dx, dx * dx + y * y - 3.66f * 3.66f);  // angle between the posts
+    const float central = 2.f * std::atan(3.66f / d);                          // ... from straight in front
+    v *= 0.3f + 0.7f * std::fmin(1.f, std::fmax(0.f, th / central));
+  }
+  return std::fmin(kXgMax, v / (1.f + 0.35f * std::fmax(0.f, pressure)));
+}
+
+// A key pass is worth a little less than a shot from where it was received;
+// the two meet at the top.
+inline float key_pass_xg(float x, float y, float gx, float pressure = 0.f) noexcept {
+  const float v = shot_xg(x, y, gx, pressure);
+  return v * (0.88f + 0.12f * v);
 }
 
 struct TrackStats {
@@ -138,6 +172,7 @@ struct EventFrame {
   std::uint8_t team = 0;      // holder's team (1 or 2)
   float opp_dist_m = 99.f;    // nearest opponent to the holder
   float nearest_m = 99.f;     // nearest player of either team to the ball
+  float pressure = 0.f;       // sum of xg_pressure over the holder's opponents
   float poss_dist_m = 1.5f;
 };
 
@@ -151,6 +186,9 @@ class EventDetector {
   static constexpr int kTracks = 96;
 
   const TeamStats& team_stats() const noexcept { return stats_; }
+  // xG of the last shot and of the last key pass counted.
+  float last_shot_xg() const noexcept { return last_shot_xg_; }
+  float last_key_xg() const noexcept { return last_key_xg_; }
   // Teams relabelled A <-> B (auto kits ordered late, or the user's swap).
   void swap_teams() noexcept {
     stats_.swap();
@@ -222,6 +260,7 @@ class EventDetector {
         cur_y_ = last_y_;
         rel_t_ = f.t_s;
         rel_opp_ = holder_opp_;
+        rel_press_ = holder_press_;
       }
       holder_ = 0;
     }
@@ -245,6 +284,7 @@ class EventDetector {
         cur_x_ = f.bx;
         cur_y_ = f.by;
         const bool same = f.team == rel_team_;
+        recv_press_ = same ? f.pressure : 0.f;
         if (!same && (shot_cand_ || shot_end(f.t_s, p))) {
           n += emit_shot(f.t_s, out + n, p);
         } else {
@@ -264,6 +304,7 @@ class EventDetector {
       last_x_ = f.bx;
       last_y_ = f.by;
       holder_opp_ = f.opp_dist_m;
+      holder_press_ = f.pressure;
     }
     return n;
   }
@@ -355,10 +396,10 @@ class EventDetector {
       last_ok_t_ = t;
       last_ok_team_ = rel_team_;
       last_ok_counted_ = false;
-      if (in_box(cur_x_, cur_y_, dir)) {
-        ++stats_.key_passes[team_i];
-        last_ok_counted_ = true;
-      }
+      last_ok_x_ = cur_x_;
+      last_ok_y_ = cur_y_;
+      last_ok_press_ = recv_press_;
+      if (in_box(cur_x_, cur_y_, dir)) count_key_pass(team_i, dir >= 0 ? 52.5f : -52.5f);
     } else {
       rate(rel_track_, rel_team_, -(p.rating_loss_k * xt_at(rel_x_, rel_y_, dir) + p.rating_loss_base));
     }
@@ -374,6 +415,14 @@ class EventDetector {
     i.match_ms_start = i.match_ms_end = e.match_ms_end;
     rate(recv, recv_team, p.rating_int);
     return 2;
+  }
+
+  // The last completed pass was a key pass: valued where it was received.
+  void count_key_pass(int team_i, float gx) noexcept {
+    ++stats_.key_passes[team_i];
+    last_ok_counted_ = true;
+    last_key_xg_ = key_pass_xg(last_ok_x_, last_ok_y_, gx, last_ok_press_);
+    stats_.xg[team_i] += last_key_xg_;
   }
 
   // Ball heading for a goal mouth (posts at +-3.66 m, 1 m margin), released
@@ -431,17 +480,16 @@ class EventDetector {
     t = shot_t_;
     const float gx = shot_gx_, y_at = shot_y_;
     ++stats_.shots[team_i];
-    stats_.xg[team_i] += shot_xg(rel_x_, rel_y_, gx);
+    last_shot_xg_ = shot_xg(rel_x_, rel_y_, gx, rel_press_);
+    stats_.xg[team_i] += last_shot_xg_;
     if (TrackStats* ts = slot(rel_track_, rel_team_)) ++ts->shots;
     rate(rel_track_, rel_team_, p.rating_shot);
     last_shot_track_ = rel_track_;
     last_shot_team_ = rel_team_;
     last_shot_t_ = t;
     // Key pass: a completed pass by the same team within the window.
-    if (last_ok_team_ == rel_team_ && t - last_ok_t_ <= p.key_pass_window_s && !last_ok_counted_) {
-      ++stats_.key_passes[team_i];
-      last_ok_counted_ = true;
-    }
+    if (last_ok_team_ == rel_team_ && t - last_ok_t_ <= p.key_pass_window_s && !last_ok_counted_)
+      count_key_pass(team_i, gx);
     Event& e = out[0];
     e = {};
     e.type = EventType::Shot;
@@ -469,6 +517,9 @@ class EventDetector {
   std::uint16_t holder_ = 0;
   std::uint8_t holder_team_ = 0;
   float holder_opp_ = 99.f;
+  float holder_press_ = 0.f, rel_press_ = 0.f, recv_press_ = 0.f;
+  float last_ok_x_ = 0.f, last_ok_y_ = 0.f, last_ok_press_ = 0.f;
+  float last_shot_xg_ = 0.f, last_key_xg_ = 0.f;
   float last_x_ = 0.f, last_y_ = 0.f;
   bool free_ = false, flew_ = false, shot_cand_ = false;
   float shot_gx_ = 0.f, shot_y_ = 0.f, shot_t_ = 0.f;

@@ -215,6 +215,32 @@ class App {
   void draw_card();
   void draw_replay();
   PanelFlip flip_stats_, flip_card_, flip_map_;
+  // A panel that has to move fades out where it is and back in at the new
+  // spot. Small shifts (a panel that grew) follow at once.
+  struct PanelFade {
+    ImVec2 pos{};
+    float a = 1.f;
+    bool init = false;
+    ImVec2 step(ImVec2 target, float dt) {
+      constexpr float kFadeS = 0.18f, kJumpPx = 90.f;
+      if (!init) {
+        pos = target;
+        init = true;
+      }
+      if (std::fabs(target.x - pos.x) + std::fabs(target.y - pos.y) > kJumpPx) {
+        a -= dt / kFadeS;
+        if (a <= 0.f) {
+          a = 0.f;
+          pos = target;
+        }
+      } else {
+        pos = target;
+        a = std::min(1.f, a + dt / kFadeS);
+      }
+      return pos;
+    }
+  };
+  PanelFade fade_stats_, fade_card_, fade_map_;
   ImVec2 stats_sz_{300.f, 120.f};
   ImVec2 card_sz_{220.f, 90.f};
   ImVec2 stats_pos_{}, card_pos_{}, map_pos_{}, replay_pos_{};
@@ -249,6 +275,7 @@ class App {
   void draw_lineup(float w);
   void draw_lines(float w);
   void draw_momentum(float w);
+  void draw_passes(float w);
   void draw_layer_toggles(Config& cfg);
   void draw_replays_tab(Config& cfg);
   void demo_flow();
@@ -368,6 +395,17 @@ class App {
 };
 
 App* g_app = nullptr;
+
+// Scales the alpha of everything a draw list has received since vertex `from`.
+void fade_vtx(ImDrawList* dl, int from, float a) {
+  if (a >= 1.f) return;
+  a = std::max(0.f, a);
+  for (int i = from; i < dl->VtxBuffer.Size; ++i) {
+    ImU32& c = dl->VtxBuffer[i].col;
+    const ImU32 al = static_cast<ImU32>(static_cast<float>((c >> IM_COL32_A_SHIFT) & 0xff) * a);
+    c = (c & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+  }
+}
 
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   auto* binding = reinterpret_cast<Binding*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -805,6 +843,7 @@ void App::draw_view() {
       const float mh = ih + 2.f * pad;
       const float mx = map_pos_.x, my = map_pos_.y;
       const float ix = mx + pad, iy = my + pad;
+      const int map_v0 = dl->VtxBuffer.Size;
       dl->PushClipRect(ImVec2(mx, my), ImVec2(mx + mw, my + mh), true);
       dl->AddRectFilled(ImVec2(mx, my), ImVec2(mx + mw, my + mh), IM_COL32(12, 48, 18, 180));
       if (!dead && last_pitch_valid_ && last_pc_valid_) {
@@ -833,6 +872,7 @@ void App::draw_view() {
         dl->AddText(ImVec2(mx + 0.5f * (mw - sz.x), my + 0.5f * (mh - sz.y)), IM_COL32(255, 255, 255, 230), msg);
       }
       dl->PopClipRect();
+      fade_vtx(dl, map_v0, fade_map_.a);
     }
   }
   if (pipe_)
@@ -972,7 +1012,7 @@ ImU32 team_color(const MatchInfo& m, int t) {
 }  // namespace
 
 // M14: each panel has a home side and flips to the mirror when the ball, the
-// on-ball player or the scorebug sits on it. Top: stats (home right) with the
+// on-ball player or the scorebug sits on it, fading out and back in. Top: stats (home right) with the
 // mini replay under it. Bottom: minimap (home left), on-ball card (home right,
 // stacked above the minimap when both share a side).
 void App::layout_panels(float ox, float oy, float scale, float cw, float ch) {
@@ -1040,14 +1080,14 @@ void App::layout_panels(float ox, float oy, float scale, float cw, float ch) {
   step(flip_card_, 0, card_rect, last_poss_track_ != 0);
 
   auto place = [](const PanelFlip& f, int home_left, auto rect) {
-    const PanelRect a = rect(home_left), b = rect(1 - home_left);
-    const float t = f.pos();
-    return ImVec2(a.x0 + (b.x0 - a.x0) * t, a.y0 + (b.y0 - a.y0) * t);
+    const PanelRect r = rect(f.side() == 0 ? home_left : 1 - home_left);
+    return ImVec2(r.x0, r.y0);
   };
-  stats_pos_ = place(flip_stats_, 0, top_rect);
+  const float fdt = std::min(dt, 0.1f);
+  stats_pos_ = fade_stats_.step(place(flip_stats_, 0, top_rect), fdt);
   replay_pos_ = ImVec2(stats_pos_.x, stats_pos_.y + stats_sz_.y + 6.f);
-  map_pos_ = place(flip_map_, 1, map_rect);
-  card_pos_ = place(flip_card_, 0, card_rect);
+  map_pos_ = fade_map_.step(place(flip_map_, 1, map_rect), fdt);
+  card_pos_ = fade_card_.step(place(flip_card_, 0, card_rect), fdt);
 }
 
 void App::draw_stats_panel() {
@@ -1136,6 +1176,7 @@ void App::draw_stats_panel() {
     }
   }
   stats_sz_ = ImGui::GetWindowSize();
+  fade_vtx(ImGui::GetWindowDrawList(), 0, fade_stats_.a);
   ImGui::End();
 }
 
@@ -1162,6 +1203,7 @@ void App::draw_card() {
     ImGui::TextDisabled("season: %u apps  %u G  %u A", pl->apps, pl->goals, pl->assists);
   }
   card_sz_ = ImGui::GetWindowSize();
+  fade_vtx(ImGui::GetWindowDrawList(), 0, fade_card_.a);
   ImGui::End();
 }
 
@@ -1262,6 +1304,7 @@ void App::draw_replay() {
       dl->PopClipRect();
     }
   }
+  fade_vtx(ImGui::GetWindowDrawList(), 0, fade_stats_.a);  // it moves with the stats panel
   ImGui::End();
   ImGui::PopStyleVar();
 }
@@ -1272,6 +1315,15 @@ namespace {
 ImU32 with_alpha(ImU32 c, float a) {
   const ImU32 al = static_cast<ImU32>(static_cast<float>((c >> IM_COL32_A_SHIFT) & 0xff) * std::clamp(a, 0.f, 1.f));
   return (c & ~IM_COL32_A_MASK) | (al << IM_COL32_A_SHIFT);
+}
+
+// 0..1 from an integer, the same every frame.
+float hash01(int i) {
+  std::uint32_t h = static_cast<std::uint32_t>(i) * 2654435761u;
+  h ^= h >> 15;
+  h *= 2246822519u;
+  h ^= h >> 13;
+  return static_cast<float>(h & 0xffffu) / 65535.f;
 }
 
 // Black or white, whichever reads on the colour.
@@ -1359,7 +1411,7 @@ void App::pump_flow() {
     if (it.kind == FeedKind::Shot)
       std::snprintf(dst->text, sizeof(dst->text), "Shot   %s   xG %.2f", c, static_cast<double>(it.xg));
     else if (it.kind == FeedKind::KeyPass)
-      std::snprintf(dst->text, sizeof(dst->text), "Key pass   %s", c);
+      std::snprintf(dst->text, sizeof(dst->text), "Key pass   %s   xG %.2f", c, static_cast<double>(it.xg));
     else
       std::snprintf(dst->text, sizeof(dst->text), "%s win the ball", c);
     dst->team = it.team;
@@ -1375,8 +1427,9 @@ void App::pump_flow() {
   seen_goal_n_ = match_.goal_n;
 }
 
-// Flames along the bottom edge that grow as the team in possession nears the
-// other goal: nothing before the attacking half, full height in the box.
+// Pixel flames along the bottom edge, in the attacking team's colour, that
+// grow as the team in possession nears the other goal: nothing before the
+// attacking half, full height in the box.
 void App::draw_heat(float cw, float ch) {
   const TimeNs now = now_ns();
   const float dt = heat_t_ ? std::min(0.1f, static_cast<float>(now - heat_t_) * 1e-9f) : 0.f;
@@ -1399,27 +1452,51 @@ void App::draw_heat(float cw, float ch) {
 
   auto* bg = ImGui::GetBackgroundDrawList();
   const float t = static_cast<float>(static_cast<double>(now % 600000000000LL) * 1e-9);
-  const float hmax = ch * 0.17f * heat_;
-  const float a = 0.35f + 0.6f * heat_;
-  const float step = std::max(6.f, cw / 240.f);
-  auto height = [&](float x, float speed, float seed) {
-    const float n = 0.5f + 0.25f * std::sin(x * 0.021f + t * 5.1f * speed + seed) +
-                    0.15f * std::sin(x * 0.057f - t * 8.3f * speed + 2.f * seed) +
-                    0.10f * std::sin(x * 0.131f + t * 13.7f * speed);
-    return 0.3f + 0.7f * n;
+  const float tq = std::floor(t * 12.f) / 12.f;                // stepped, like sprite frames
+  const float cell = std::max(3.f, std::round(ch / 216.f));    // 5 px at 1080p
+  const float hmax = ch * 0.30f * heat_;
+  const float a = 0.45f + 0.5f * heat_;
+  // The team's colour, lifted when the kit is too dark to read as fire.
+  const ImU32 kit = kit_color(heat_team_ - 1);
+  float rgb[3] = {static_cast<float>((kit >> IM_COL32_R_SHIFT) & 0xff), static_cast<float>((kit >> IM_COL32_G_SHIFT) & 0xff),
+                  static_cast<float>((kit >> IM_COL32_B_SHIFT) & 0xff)};
+  const float lum = 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2];
+  if (lum < 80.f)
+    for (float& c : rgb) c += (255.f - c) * (80.f - lum) / 160.f;
+  auto shade = [&](float white, float dark, float alpha) {
+    auto ch8 = [&](float c) { return static_cast<int>((c + (255.f - c) * white) * dark); };
+    return IM_COL32(ch8(rgb[0]), ch8(rgb[1]), ch8(rgb[2]), static_cast<int>(255.f * std::clamp(alpha, 0.f, 1.f)));
   };
-  const ImU32 clear_red = IM_COL32(255, 60, 0, 0), clear_yel = IM_COL32(255, 200, 40, 0);
-  const ImU32 base_red = with_alpha(IM_COL32(255, 90, 0, 255), 0.75f * a);
-  const ImU32 base_yel = with_alpha(IM_COL32(255, 225, 90, 255), 0.8f * a);
-  for (float x = 0.f; x < cw; x += step) {
-    const float x1 = std::min(cw, x + step);
-    const float h0 = hmax * height(x, 1.f, 0.f), h1 = hmax * height(x1, 1.f, 0.f);
-    grad_quad(bg, ImVec2(x, ch - h0), ImVec2(x1, ch - h1), ImVec2(x1, ch), ImVec2(x, ch), clear_red, base_red);
-    const float g0 = 0.55f * hmax * height(x, 1.4f, 1.7f), g1 = 0.55f * hmax * height(x1, 1.4f, 1.7f);
-    grad_quad(bg, ImVec2(x, ch - g0), ImVec2(x1, ch - g1), ImVec2(x1, ch), ImVec2(x, ch), clear_yel, base_yel);
+  const ImU32 core = shade(0.6f, 1.f, a), body = shade(0.12f, 1.f, 0.9f * a), tip = shade(0.f, 0.72f, 0.55f * a);
+  constexpr int kTongue = 3;  // columns per flame: thin and tall
+  const int cols = static_cast<int>(cw / cell) + 1;
+  for (int i = 0; i < cols; ++i) {
+    const int j = i / kTongue;
+    const float r0 = hash01(j), r1 = hash01(j + 7919);
+    // Each flame flickers on its own clock; a slow wave runs along the edge.
+    const float flick = 0.5f + 0.5f * std::sin(tq * (5.f + 9.f * r0) + 6.283f * r1);
+    const float wave = 0.5f + 0.5f * std::sin(static_cast<float>(j) * 0.35f - tq * 2.1f);
+    float h = hmax * (0.25f + 0.75f * r1) * (0.35f + 0.4f * flick + 0.25f * wave);
+    if (i % kTongue != 1) h *= 0.5f + 0.25f * hash01(i + 31);  // the shoulders of the flame
+    const int n = static_cast<int>(h / cell);
+    if (n <= 0) continue;
+    const float x = static_cast<float>(i) * cell;
+    auto band = [&](int from, int to, ImU32 col) {
+      if (to > from)
+        bg->AddRectFilled(ImVec2(x, ch - static_cast<float>(to) * cell), ImVec2(x + cell, ch - static_cast<float>(from) * cell),
+                          col);
+    };
+    const int n_core = n * 3 / 10, n_body = n * 7 / 10;
+    band(0, n_core, core);
+    band(n_core, n_body, body);
+    band(n_body, n, tip);
+    // An ember rising off some of the flames.
+    if (i % kTongue == 1 && r0 > 0.6f) {
+      const float rise = std::fmod(tq * (0.5f + r1) + r0, 1.f);
+      const float ey = ch - (static_cast<float>(n + 1) + std::floor(rise * 8.f)) * cell;
+      bg->AddRectFilled(ImVec2(x, ey - cell), ImVec2(x + cell, ey), with_alpha(body, 1.f - rise));
+    }
   }
-  // Whose attack it is.
-  bg->AddRectFilled(ImVec2(0.f, ch - 4.f * dpi_), ImVec2(cw, ch), with_alpha(kit_color(heat_team_ - 1), a));
 }
 
 // Top centre, under the toast: the goal banner, then the event pop-ups.
@@ -1481,20 +1558,22 @@ void App::draw_news(float cw) {
   }
 }
 
-// One panel per stoppage, in turn: lineups, back lines, momentum. A long
+// One panel per stoppage, in turn: lineups, back lines, momentum, passes. A long
 // break (half time) moves on every 20 s.
 void App::draw_dead_panel(float cw, float ch) {
+  constexpr int kDeadPanels = 4;
   const TimeNs now = now_ns();
   auto next_panel = [&](int from) {
-    const bool ok[3] = {layer(kLayerLineup) && match_.lineup_ok != 0,
-                        layer(kLayerDefLine) && flow_.line.seen_s[0] + flow_.line.seen_s[1] >= 20.f,
-                        layer(kLayerMomentum) && flow_.max_bin >= 0};
-    for (int k = 0; k < 3; ++k)
-      if (ok[(from + k) % 3]) return (from + k) % 3;
+    const bool ok[kDeadPanels] = {layer(kLayerLineup) && match_.lineup_ok != 0,
+                                  layer(kLayerDefLine) && flow_.line.seen_s[0] + flow_.line.seen_s[1] >= 20.f,
+                                  layer(kLayerMomentum) && flow_.max_bin >= 0,
+                                  layer(kLayerPassMap) && flow_.pass_n[0] + flow_.pass_n[1] >= 10};
+    for (int k = 0; k < kDeadPanels; ++k)
+      if (ok[(from + k) % kDeadPanels]) return (from + k) % kDeadPanels;
     return -1;
   };
   if (!last_play_dead_) {
-    if (dead_panel_ >= 0) dead_rot_ = (dead_panel_ + 1) % 3;
+    if (dead_panel_ >= 0) dead_rot_ = (dead_panel_ + 1) % kDeadPanels;
     dead_panel_ = -1;
     return;
   }
@@ -1506,7 +1585,7 @@ void App::draw_dead_panel(float cw, float ch) {
     dead_panel_t0_ = pick == dead_panel_ ? now - 1000000000LL : now;
     dead_panel_ = pick;
   }
-  static constexpr std::uint32_t kBit[3] = {kLayerLineup, kLayerDefLine, kLayerMomentum};
+  static constexpr std::uint32_t kBit[kDeadPanels] = {kLayerLineup, kLayerDefLine, kLayerMomentum, kLayerPassMap};
   if (dead_panel_ < 0 || !layer(kBit[dead_panel_])) {
     dead_panel_ = -1;
     return;
@@ -1514,7 +1593,8 @@ void App::draw_dead_panel(float cw, float ch) {
   const float alpha = std::min(1.f, static_cast<float>(now - dead_panel_t0_) * 1e-9f / 0.3f);
   // Between the minimap and the on-ball card when there is room.
   const float mw = std::clamp(cw * 0.22f, 160.f, 420.f);
-  float w = std::clamp(cw * (dead_panel_ == 0 ? 0.3f : 0.34f), 360.f, dead_panel_ == 0 ? 560.f : 700.f);
+  float w = std::clamp(cw * (dead_panel_ == 0 ? 0.3f : dead_panel_ == 3 ? 0.44f : 0.34f), 360.f,
+                       dead_panel_ == 0 ? 560.f : dead_panel_ == 3 ? 880.f : 700.f);
   if (cw - 2.f * (mw + 40.f) >= 360.f) w = std::min(w, cw - 2.f * (mw + 40.f));
   w = std::min(w, cw - 32.f);
   ImGui::SetNextWindowPos(ImVec2(0.5f * cw, ch - 16.f), ImGuiCond_Always, ImVec2(0.5f, 1.f));
@@ -1523,7 +1603,8 @@ void App::draw_dead_panel(float cw, float ch) {
   ImGui::Begin("Dead ball", nullptr, kPanelFlags);
   if (dead_panel_ == 0) draw_lineup(w);
   else if (dead_panel_ == 1) draw_lines(w);
-  else draw_momentum(w);
+  else if (dead_panel_ == 2) draw_momentum(w);
+  else draw_passes(w);
   ImGui::End();
   ImGui::PopStyleVar();
 }
@@ -1729,9 +1810,84 @@ void App::draw_momentum(float w) {
   }
 }
 
+// Each team's last passes as arrows on its own pitch, both attacking left to
+// right: where they start, how far they go and which way.
+void App::draw_passes(float w) {
+  const float alpha = ImGui::GetStyle().Alpha;
+  ImGui::TextUnformatted("Pass map");
+  ImGui::SameLine();
+  ImGui::TextDisabled("vision estimate, both teams attacking left to right");
+  auto* dl = ImGui::GetWindowDrawList();
+  const ImU32 col_ok = IM_COL32(255, 165, 30, 255), col_bad = IM_COL32(150, 110, 240, 255);
+  const float s = ImGui::GetTextLineHeight();
+  const float gap = 12.f, pw = 0.5f * (w - gap), ph = pw * 68.f / 105.f;
+  const float thick = std::max(1.2f, pw / 320.f), head = std::max(6.f, pw / 55.f);
+  for (int t = 0; t < 2; ++t) {
+    if (t) ImGui::SameLine(0.f, gap);
+    ImGui::BeginGroup();
+    const ImVec2 q = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(ImVec2(q.x, q.y + 0.2f * s), ImVec2(q.x + 0.6f * s, q.y + 0.8f * s), with_alpha(kit_color(t), alpha), 2.f);
+    ImGui::Dummy(ImVec2(0.6f * s, s));
+    ImGui::SameLine(0.f, 4.f);
+    ImGui::TextUnformatted(code(t));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(pw, ph));
+    dl->AddRectFilled(p, ImVec2(p.x + pw, p.y + ph), with_alpha(IM_COL32(28, 32, 38, 235), alpha), 4.f);
+    auto M = [&](float X, float Y) { return ImVec2(p.x + (X + 52.5f) / 105.f * pw, p.y + (34.f - Y) / 68.f * ph); };
+    draw_pitch_lines(
+        dl,
+        [&](float X, float Y, ImVec2& out) {
+          out = M(X, Y);
+          return true;
+        },
+        with_alpha(IM_COL32(235, 235, 235, 120), alpha), 1.f);
+    const int n = flow_.pass_count(t);
+    int ok = 0, fwd = 0;
+    float len = 0.f;
+    dl->PushClipRect(p, ImVec2(p.x + pw, p.y + ph), true);
+    // Completed first: the misses are fewer and stay readable on top.
+    for (int pass = 0; pass < 2; ++pass)
+      for (int i = 0; i < n; ++i) {
+        const PassMark& m = flow_.passes[t][i];
+        if ((m.ok != 0) != (pass == 0)) continue;
+        if (m.ok) ++ok;
+        if (m.x1() > m.x0()) ++fwd;
+        len += std::hypot(m.x1() - m.x0(), m.y1() - m.y0());
+        const ImVec2 a = M(m.x0(), m.y0()), b = M(m.x1(), m.y1());
+        const float dx = b.x - a.x, dy = b.y - a.y, d = std::hypot(dx, dy);
+        if (d < 1.f) continue;
+        const ImU32 c = with_alpha(m.ok ? col_ok : col_bad, 0.8f * alpha);
+        const float ux = dx / d, uy = dy / d, hd = std::min(head, 0.5f * d);
+        const ImVec2 base(b.x - ux * hd, b.y - uy * hd);
+        dl->AddLine(a, base, c, thick);
+        dl->AddTriangleFilled(b, ImVec2(base.x - uy * 0.45f * hd, base.y + ux * 0.45f * hd),
+                              ImVec2(base.x + uy * 0.45f * hd, base.y - ux * 0.45f * hd), c);
+      }
+    dl->PopClipRect();
+    if (n > 0)
+      ImGui::TextDisabled("%d/%d completed   avg %.0f m   forward %.0f%%", ok, n, static_cast<double>(len / static_cast<float>(n)),
+                          100.0 * fwd / n);
+    else
+      ImGui::TextDisabled("no passes yet");
+    ImGui::EndGroup();
+  }
+  auto key = [&](ImU32 c, const char* name) {
+    const ImVec2 q = ImGui::GetCursorScreenPos();
+    dl->AddCircleFilled(ImVec2(q.x + 0.4f * s, q.y + 0.5f * s), 0.3f * s, with_alpha(c, alpha));
+    ImGui::Dummy(ImVec2(0.8f * s, s));
+    ImGui::SameLine(0.f, 4.f);
+    ImGui::TextUnformatted(name);
+  };
+  key(col_ok, "Completed");
+  ImGui::SameLine(0.f, 16.f);
+  key(col_bad, "Not completed");
+  ImGui::SameLine(0.f, 16.f);
+  ImGui::TextDisabled("last %d passes per team", kFlowPasses);
+}
+
 // --demo-flow: a made-up match, so the M18 pieces can be seen (and checked)
 // without one. Four seconds each: an attack with pop-ups and the goal banner,
-// then the three dead-ball panels with play between them.
+// then the four dead-ball panels with play between them.
 void App::demo_flow() {
   const TimeNs now = now_ns();
   if (demo_t0_ == 0) {
@@ -1800,10 +1956,21 @@ void App::demo_flow() {
     f.line.box_s[0] = 260.f;
     f.line.box_s[1] = 90.f;
     f.line.play_s = 2400.f;
+    for (int t = 0; t < 2; ++t) {
+      for (int i = 0; i < 120; ++i) {
+        auto rnd = [&](int k) { return hash01(i * 8 + k + t * 4000); };
+        const float x = -42.f + 80.f * rnd(0), y = -30.f + 60.f * rnd(1);
+        const float ang = 6.283f * rnd(2) * (rnd(4) < 0.5f ? 0.3f : 1.f), d = 6.f + 26.f * rnd(3) * rnd(3);
+        auto q = [](float m) { return static_cast<std::int8_t>(std::clamp(std::round(2.f * m), -127.f, 127.f)); };
+        f.passes[t][i] = {q(x), q(y), q(std::clamp(x + d * std::cos(ang), -52.f, 52.f)),
+                          q(std::clamp(y + d * std::sin(ang), -33.f, 33.f)), static_cast<std::uint8_t>(rnd(5) > 0.18f ? 1 : 0)};
+      }
+      f.pass_n[t] = 120;
+    }
   }
   const float el = static_cast<float>(now - demo_t0_) * 1e-9f;
-  const int step = static_cast<int>(el / 4.f) % 6;
-  const bool dead = step == 1 || step == 3 || step == 5;
+  const int step = static_cast<int>(el / 4.f) % 8;
+  const bool dead = step % 2 == 1;
   if (step != demo_step_) {
     demo_step_ = step;
     if (dead) dead_since_ = now;
@@ -1813,7 +1980,7 @@ void App::demo_flow() {
       match_.goals[0] = {};
       match_.goals[0].minute = 63;
       seen_goal_n_ = 0;
-      static constexpr const char* kNews[3] = {"NOR win the ball", "Key pass   NOR", "Shot   NOR   xG 0.31"};
+      static constexpr const char* kNews[3] = {"NOR win the ball", "Key pass   NOR   xG 0.27", "Shot   NOR   xG 0.31"};
       static constexpr FeedKind kKind[3] = {FeedKind::Turnover, FeedKind::KeyPass, FeedKind::Shot};
       for (int k = 0; k < 3; ++k) {
         std::snprintf(popups_[k].text, sizeof(popups_[k].text), "%s", kNews[k]);
@@ -1849,10 +2016,11 @@ void App::draw_layer_toggles(Config& cfg) {
       {"Shot / key pass pop-ups", kLayerEventPopups, "A sm_fs note at the top when a shot or key pass is seen."},
       {"Turnover pop-up", kLayerTurnover, "A note when the ball changes team."},
       {"Goal banner", kLayerGoalBanner, "Scorer, number and team after the scorebug's score changes."},
-      {"Flames", kLayerHeat, "Fire along the bottom edge as the team on the ball nears the other goal."},
+      {"Flames", kLayerHeat, "Pixel fire in the attacking team's colour as it nears the other goal."},
       {"Lineups", kLayerLineup, "Both starting XIs when the ball is out of play."},
       {"Back lines", kLayerDefLine, "How high each defence has stood, when the ball is out of play."},
       {"Momentum", kLayerMomentum, "Match momentum chart when the ball is out of play."},
+      {"Pass map", kLayerPassMap, "Each team's passes as arrows, when the ball is out of play."},
       {"Auto-play key moments", kLayerReplayAuto, "Off: shots and key passes still go to the replay log."},
   };
   bool changed = false;
@@ -2080,8 +2248,9 @@ bool App::start_overlay_capture() {
   heat_ = 0.f;
   dead_panel_ = -1;
   replay_clip_ = -1;
-  set_menu(false);
-  toast(hotkey_ok_ ? "TouchFC is on. Alt+T opens the menu." : "TouchFC is on. The tray icon opens the menu.", 6.0);
+  set_menu(true);  // the menu stays up after the start; Alt+T hides it
+  toast(hotkey_ok_ ? "TouchFC is on. Alt+T hides and shows the menu." : "TouchFC is on. The tray icon hides and shows the menu.",
+        6.0);
   return true;
 }
 

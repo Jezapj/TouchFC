@@ -1525,6 +1525,10 @@ TEST_CASE("events: completed pass, interception, out of play, shot and key pass"
   REQUIRE(s.d.team_stats().shots[0] == 1);
   REQUIRE(s.log[s.n - 1].type == EventType::Shot);
   REQUIRE(s.d.team_stats().key_passes[0] == 1);  // that pass is not counted twice
+  // The team's xG is the key pass (valued where it was received) plus the shot.
+  REQUIRE(s.d.last_key_xg() > 0.3f);
+  REQUIRE(s.d.last_shot_xg() > s.d.last_key_xg());
+  REQUIRE(std::fabs(s.d.team_stats().xg[0] - s.d.last_key_xg() - s.d.last_shot_xg()) < 1e-5f);
   const float before = s.d.track(9)->rating;
   s.d.goal(s.t + 2.f, s.p);
   REQUIRE(s.d.track(9)->rating > before + 0.9f);
@@ -1680,7 +1684,28 @@ TEST_CASE("team ratings: level at the start, xG favours the shooting side") {
   REQUIRE(std::fabs(a0.attack - 5.f) < 1e-4f);
   REQUIRE(shot_xg(41.5f, 0.f, 52.5f) > shot_xg(27.5f, 0.f, 52.5f));  // 11 m beats 25 m
   REQUIRE(shot_xg(46.5f, 0.f, 52.5f) > 0.3f);
-  REQUIRE(shot_xg(27.5f, 0.f, 52.5f) < 0.08f);
+  REQUIRE(shot_xg(27.5f, 0.f, 52.5f) < 0.2f);
+  // The overlay's scale: a final ball into the six-yard box against one
+  // defender, a contested shot from the edge of the box, a crowded long shot.
+  const float kp = key_pass_xg(48.5f, 1.f, 52.5f, 1.f);
+  REQUIRE(kp > 0.6f);
+  REQUIRE(kp < 0.8f);
+  REQUIRE(kp < shot_xg(48.5f, 1.f, 52.5f, 1.f));  // a shot from there is worth a little more
+  const float edge = shot_xg(36.f, 0.f, 52.5f, 1.5f);
+  REQUIRE(edge > 0.2f);
+  REQUIRE(edge < 0.4f);
+  const float far = shot_xg(24.5f, 5.f, 52.5f, 3.f);
+  REQUIRE(far > 0.02f);
+  REQUIRE(far < 0.1f);
+  REQUIRE(shot_xg(52.4f, 0.f, 52.5f) <= kXgMax);
+  REQUIRE(shot_xg(52.4f, 0.f, 52.5f) > 0.95f);
+  REQUIRE(key_pass_xg(52.4f, 0.f, 52.5f) > 0.95f);                     // the same top
+  REQUIRE(shot_xg(46.f, 18.f, 52.5f) < shot_xg(34.5f, 0.f, 52.5f));    // a tight angle costs
+  // Pressure: a marker at 1 m, one 10 m away in the shooting lane, the keeper, one far off.
+  REQUIRE(xg_pressure(41.f, 0.f, false, 40.f, 0.f, 52.5f) == 1.f);
+  REQUIRE(xg_pressure(50.f, 0.5f, false, 40.f, 0.f, 52.5f) == 0.5f);
+  REQUIRE(xg_pressure(52.f, 0.f, true, 40.f, 0.f, 52.5f) == 0.f);
+  REQUIRE(xg_pressure(30.f, 0.f, false, 40.f, 0.f, 52.5f) == 0.f);
   s.shots[0] = 4;
   s.xg[0] = 1.2f;
   s.recoveries[1] = 6;
@@ -1777,14 +1802,38 @@ TEST_CASE("match flow: momentum bins, smoothing, goals and team swap") {
   f.shot(2, 0.3f);
   REQUIRE(s.threat[1][12] == before + kFlowShotBase + kFlowShotXg * 0.3f);
   f.key_pass(2);
+  const float pre_goal = s.threat[1][12];
   f.goal(2);
   REQUIRE(s.goal_n == 1);
   REQUIRE(s.goals[0].bin == 12);
+  REQUIRE(s.threat[1][12] == pre_goal + kFlowGoal);  // a goal moves the chart too
+
+  // Passes: all of them go to the map, turned to attack +x; a completed one
+  // into the attacking third adds a little threat, one in midfield none.
+  const float pre_pass = s.threat[1][12];
+  f.pass(2, 10.f, 4.f, -5.f, 6.f, true, 1);  // B attacks -x: midfield
+  REQUIRE(s.threat[1][12] == pre_pass);
+  f.pass(2, -15.f, 4.f, -30.f, 6.f, true, 1);  // into B's attacking third
+  REQUIRE(s.threat[1][12] > pre_pass + kFlowPass - 1e-4f);
+  REQUIRE(s.threat[1][12] < pre_pass + 1.f);
+  f.pass(2, -30.f, 6.f, -45.f, 0.f, false, 1);  // a miss: mapped, no threat
+  REQUIRE(s.pass_n[1] == 3);
+  REQUIRE(s.pass_count(1) == 3);
+  REQUIRE(s.passes[1][1].x0() == 15.f);
+  REQUIRE(s.passes[1][1].x1() == 30.f);
+  REQUIRE(s.passes[1][1].y1() == -6.f);
+  REQUIRE(s.passes[1][1].ok == 1);
+  REQUIRE(s.passes[1][2].ok == 0);
+  // Possession in the attacking third outweighs the same xT elsewhere.
+  MatchFlow g;
+  g.possession(0.04f, 1, 20.f, 30.f, 1);
+  REQUIRE(g.snapshot().threat[0][0] == xt_at(20.f, 30.f, 1) * kFlowThirdMult * 0.04f);
   f.second_half();
   REQUIRE(s.half2_bin == 12);
 
   f.swap_teams();
   REQUIRE(s.goals[0].team == 1);
+  REQUIRE(s.pass_n[0] == 3);
   REQUIRE(flow_value(s, 10) < 0.f);
 
   f.set_bin(999);  // clamps

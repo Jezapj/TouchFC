@@ -24,13 +24,29 @@ struct FeedItem {
   FeedKind kind = FeedKind::Shot;
   std::uint8_t team = 0;  // 1 A, 2 B: the team that shot, passed, won the ball or scored
   std::uint8_t pad[2]{};
-  float xg = 0.f;         // shots
+  float xg = 0.f;         // shots and key passes
 };
 
 inline constexpr int kFlowBins = 130;  // one per match minute
 inline constexpr float kFlowShotBase = 1.f;
-inline constexpr float kFlowShotXg = 10.f;
+inline constexpr float kFlowShotXg = 4.f;
 inline constexpr float kFlowKeyPass = 0.5f;
+inline constexpr float kFlowKeyPassXg = 2.f;
+inline constexpr float kFlowGoal = 3.f;
+inline constexpr float kFlowThirdMult = 2.5f;  // possession in the attacking third counts this much more
+inline constexpr float kFlowPass = 0.12f;      // a completed pass ending in the attacking third
+inline constexpr float kFlowPassXt = 3.f;      // ... plus this times the xT it gained
+inline constexpr int kFlowPasses = 160;        // passes kept per team for the pass map
+
+// A pass in half metres, turned so the passing team attacks +x.
+struct PassMark {
+  std::int8_t sx = 0, sy = 0, ex = 0, ey = 0;
+  std::uint8_t ok = 0;
+  float x0() const noexcept { return 0.5f * static_cast<float>(sx); }
+  float y0() const noexcept { return 0.5f * static_cast<float>(sy); }
+  float x1() const noexcept { return 0.5f * static_cast<float>(ex); }
+  float y1() const noexcept { return 0.5f * static_cast<float>(ey); }
+};
 
 // Back line height is metres from the team's own goal line.
 struct LineStats {
@@ -65,6 +81,12 @@ struct FlowSnapshot {
     std::uint8_t bin = 0;
     std::uint8_t team = 0;  // 1 or 2
   } goals[16]{};
+  // The last kFlowPasses passes per team, a ring: pass_n counts every pass.
+  PassMark passes[2][kFlowPasses]{};
+  std::uint32_t pass_n[2]{};
+  int pass_count(int t) const noexcept {
+    return pass_n[t] < static_cast<std::uint32_t>(kFlowPasses) ? static_cast<int>(pass_n[t]) : kFlowPasses;
+  }
 };
 
 static_assert(std::is_trivially_copyable_v<FlowSnapshot>);
@@ -118,16 +140,37 @@ class MatchFlow {
 
   // A frame in play with a holder: possession weighted by how dangerous the
   // ball's position is for that team (xT), so a spell in the box counts for
-  // far more than one in the team's own half.
+  // far more than one in the team's own half. The attacking third counts
+  // extra, so sustained pressure shows without a shot.
   void possession(float dt, std::uint8_t team, float bx, float by, int attack_dir) noexcept {
     if ((team != 1 && team != 2) || dt <= 0.f || dt > 0.5f) return;
-    add(team, xt_at(bx, by, team == 2 ? -attack_dir : attack_dir) * dt);
+    const int dir = team == 2 ? -attack_dir : attack_dir;
+    const bool third = bx * static_cast<float>(dir) > 17.5f;
+    add(team, xt_at(bx, by, dir) * (third ? kFlowThirdMult : 1.f) * dt);
   }
   void shot(std::uint8_t team, float xg) noexcept { add(team, kFlowShotBase + kFlowShotXg * xg); }
-  void key_pass(std::uint8_t team) noexcept { add(team, kFlowKeyPass); }
+  void key_pass(std::uint8_t team, float xg = 0.f) noexcept { add(team, kFlowKeyPass + kFlowKeyPassXg * xg); }
+  // Every pass goes to the pass map; a completed one that ends in the
+  // attacking third adds a little threat. attack_dir: team A's.
+  void pass(std::uint8_t team, float sx, float sy, float ex, float ey, bool ok, int attack_dir) noexcept {
+    if (team != 1 && team != 2) return;
+    const int dir = team == 2 ? -attack_dir : attack_dir;
+    const float f = static_cast<float>(dir);
+    auto q = [&](float m) {
+      const float v = std::round(2.f * f * m);
+      return static_cast<std::int8_t>(v < -127.f ? -127.f : v > 127.f ? 127.f : v);
+    };
+    const int t = team - 1;
+    s_.passes[t][s_.pass_n[t] % kFlowPasses] = {q(sx), q(sy), q(ex), q(ey), static_cast<std::uint8_t>(ok ? 1 : 0)};
+    ++s_.pass_n[t];
+    if (ok && ex * f > 17.5f)
+      add(team, kFlowPass + kFlowPassXt * std::fmax(0.f, xt_at(ex, ey, dir) - xt_at(sx, sy, dir)));
+  }
+  // The mark on the chart, and a jump for the scoring team.
   void goal(std::uint8_t team) noexcept {
-    if ((team != 1 && team != 2) || s_.goal_n >= 16) return;
-    s_.goals[s_.goal_n++] = {static_cast<std::uint8_t>(s_.cur_bin), team};
+    if (team != 1 && team != 2) return;
+    add(team, kFlowGoal);
+    if (s_.goal_n < 16) s_.goals[s_.goal_n++] = {static_cast<std::uint8_t>(s_.cur_bin), team};
   }
   void second_half() noexcept { s_.half2_bin = s_.cur_bin; }
 
@@ -160,6 +203,8 @@ class MatchFlow {
     for (int b = 0; b < kFlowBins; ++b) std::swap(s_.threat[0][b], s_.threat[1][b]);
     for (int i = 0; i < s_.goal_n; ++i) s_.goals[i].team = static_cast<std::uint8_t>(3 - s_.goals[i].team);
     s_.line.swap();
+    std::swap(s_.passes[0], s_.passes[1]);
+    std::swap(s_.pass_n[0], s_.pass_n[1]);
   }
 
  private:
