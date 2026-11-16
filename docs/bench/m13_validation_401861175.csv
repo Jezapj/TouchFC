@@ -1,0 +1,9 @@
+team,metric,vision,provider
+ESP,passes,20,540
+ESP,pass_pct,55.0,85.6
+ESP,possession_pct,72.5,64.2
+ESP,shots,1,23
+ENG,passes,10,298
+ENG,pass_pct,10.0,81.5
+ENG,possession_pct,27.5,35.8
+ENG,shots,0,9

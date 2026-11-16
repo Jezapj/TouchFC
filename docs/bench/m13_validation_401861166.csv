@@ -1,0 +1,9 @@
+team,metric,vision,provider
+SWE,passes,8,362
+SWE,pass_pct,87.5,83.4
+SWE,possession_pct,97.1,42.2
+SWE,shots,0,13
+BIH,passes,2,482
+BIH,pass_pct,50.0,86.5
+BIH,possession_pct,2.9,57.8
+BIH,shots,0,16
