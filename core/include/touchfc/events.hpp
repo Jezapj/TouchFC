@@ -198,6 +198,7 @@ class EventDetector {
     flip(holder_team_);
     flip(rel_team_);
     flip(last_shot_team_);
+    std::swap(touch_[0], touch_[1]);
   }
   const TrackStats* track(std::uint16_t id) const noexcept {
     for (const auto& t : tracks_)
@@ -217,12 +218,47 @@ class EventDetector {
     return n;
   }
 
-  // A goal on the scorebug credits the last shot within 15 s.
+  // A goal on the scorebug credits the last shot within 45 s (the bug changes
+  // well after the ball goes in).
   void goal(float t_s, const EventParams& p) noexcept {
-    if (last_shot_track_ && t_s - last_shot_t_ < 15.f) {
+    if (last_shot_track_ && t_s - last_shot_t_ < 45.f) {
       rate(last_shot_track_, last_shot_team_, p.rating_goal);
       last_shot_track_ = 0;
     }
+  }
+
+  // A goal on the scorebug with no shot seen: one is added from where the
+  // scoring team last had the ball inside shot_zone_m of that goal in the
+  // last minute, else from the penalty spot under some pressure.
+  int goal_shot(float t_s, std::uint8_t team, Event* out, const EventParams& p) noexcept {
+    const int team_i = team - 1;
+    if (team_i < 0 || team_i > 1) return 0;
+    const float gx = dir_of(team, p) >= 0 ? 52.5f : -52.5f;
+    const Touch& k = touch_[team_i];
+    const bool seen = k.track && t_s - k.t <= 60.f && std::hypot(gx - k.x, k.y) <= p.shot_zone_m;
+    const float x = seen ? k.x : (gx > 0.f ? gx - 11.f : gx + 11.f), y = seen ? k.y : 0.f;
+    const float t = seen ? k.t : t_s;
+    ++stats_.shots[team_i];
+    last_shot_xg_ = shot_xg(x, y, gx, seen ? k.press : 1.f);
+    stats_.xg[team_i] += last_shot_xg_;
+    if (seen) {
+      if (TrackStats* ts = slot(k.track, team)) ++ts->shots;
+      rate(k.track, team, p.rating_shot + p.rating_goal);
+    }
+    if (last_ok_team_ == team && !last_ok_counted_ && t >= last_ok_t_ && t - last_ok_t_ <= p.key_pass_window_s)
+      count_key_pass(team_i, gx);
+    Event& e = out[0];
+    e = {};
+    e.type = EventType::Shot;
+    e.result = EventResult::Goal;
+    e.team = team;
+    e.track = seen ? k.track : 0;
+    e.sx = x;
+    e.sy = y;
+    e.ex = gx;
+    e.ey = 0.f;
+    e.match_ms_start = e.match_ms_end = static_cast<std::int32_t>(t * 1000.f);
+    return 1;
   }
 
   int step(const EventFrame& in, float dt, Event* out, const EventParams& p) noexcept {
@@ -305,6 +341,7 @@ class EventDetector {
       last_y_ = f.by;
       holder_opp_ = f.opp_dist_m;
       holder_press_ = f.pressure;
+      if (holder_team_ == 1 || holder_team_ == 2) touch_[holder_team_ - 1] = {f.bx, f.by, f.pressure, f.t_s, holder_};
     }
     return n;
   }
@@ -317,7 +354,14 @@ class EventDetector {
   // team's shot.
   bool attacks(float gx, const EventParams& p) const noexcept { return (gx > 0.f) == (dir_of(rel_team_, p) >= 0); }
 
+  // A jump no ball makes (a false hit, or another ball) starts the speed
+  // history again, so it never reads as a struck ball.
   void push_ball(float t, float x, float y) noexcept {
+    if (hist_n_ > 0) {
+      const Sample& b = hist_[(hist_i_ + 4) % 5];
+      const float dt = t - b.t;
+      if (dt > 1.5f || std::hypot(x - b.x, y - b.y) > kBallMaxMps * std::fmax(dt, 0.02f) + 1.f) hist_n_ = 0;
+    }
     hist_[hist_i_] = {t, x, y};
     hist_i_ = (hist_i_ + 1) % 5;
     if (hist_n_ < 5) ++hist_n_;
@@ -507,6 +551,12 @@ class EventDetector {
 
   static constexpr float kHoldMissS = 0.4f;
   static constexpr float kMouthMarginM = 2.5f;
+  static constexpr float kBallMaxMps = 60.f;
+  struct Touch {
+    float x = 0.f, y = 0.f, press = 0.f, t = -1e9f;
+    std::uint16_t track = 0;
+  };
+  Touch touch_[2]{};  // each team's last touch with the ball in sight
   struct Sample {
     float t, x, y;
   };

@@ -50,6 +50,9 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(iou_match_thresh, Detection, "track match overlap", 0.05f, 0.9f),
     TOUCHFC_CFG(det_interval, Detection, "detect every Nth frame", 1, 4),
     TOUCHFC_CFG(ball_tiling, Detection, "ball tiling", 0, 1),
+    TOUCHFC_CFG(ball_confirm, Detection, "new ball: frames to confirm (0 off)", 0, 8),
+    TOUCHFC_CFG(ball_max_speed, Detection, "ball max speed, widths/s", 0.5f, 4.f),
+    TOUCHFC_CFG(ball_park_s, Detection, "spare ball after s alone", 0.5f, 10.f),
 
     TOUCHFC_CFG(conf_keypoint, Pitch, "keypoint confidence", 0.05f, 0.95f),
     TOUCHFC_CFG(kp_interval, Pitch, "keypoint interval", 1, 16),

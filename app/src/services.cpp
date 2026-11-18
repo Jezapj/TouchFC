@@ -276,7 +276,8 @@ void Services::resolve_goals() {
   }
 }
 
-void Services::on_read(const char* text) {
+// False when the text holds no score pattern.
+bool Services::on_read(const char* text) {
   {
     int side = 0, idx = 0;
     if (find_player(text, m_, side, idx)) {
@@ -286,13 +287,8 @@ void Services::on_read(const char* text) {
     }
   }
   ScorebugRead r;
-  if (!parse_scorebug(text, r)) {
-    if (last_unparsed_ != text) {
-      last_unparsed_ = text;
-      status(std::string("scorebug text not understood: ") + text);
-    }
-    return;
-  }
+  if (!parse_scorebug(text, r, m_.teams_ok ? m_.team[0].code : nullptr, m_.teams_ok ? m_.team[1].code : nullptr))
+    return false;
   if (r.clock_ms >= 0 && r.clock_ms != m_.clock_ms) {
     m_.clock_ms = r.clock_ms;
     dirty_ = true;
@@ -300,7 +296,10 @@ void Services::on_read(const char* text) {
   // Left is home; map by code when both are known, so a swapped bug still scores right.
   int hs = 0, as = 1;
   if (m_.teams_ok && std::strcmp(r.home, m_.team[1].code) == 0) std::swap(hs, as);
-  if (m_.team[hs].score != r.home_score || m_.team[as].score != r.away_score) {
+  // A changed score is read again at once and counts when the reads agree.
+  const bool changed = score_vote_.add(m_.team[hs].score, m_.team[as].score, r.home_score, r.away_score);
+  if (score_vote_.pending()) pipe_.ocr_again();
+  if (changed) {
     const int was[2] = {m_.team[hs].score, m_.team[as].score}, is[2] = {r.home_score, r.away_score};
     const int sides[2] = {hs, as};
     for (int k = 0; k < 2; ++k) {
@@ -311,7 +310,7 @@ void Services::on_read(const char* text) {
     m_.team[as].score = static_cast<std::int16_t>(r.away_score);
     dirty_ = true;
   }
-  if (!vote_.add(r) || m_.source == MatchSource::Manual || m_.source == MatchSource::Scorebug) return;
+  if (!vote_.add(r) || m_.source == MatchSource::Manual || m_.source == MatchSource::Scorebug) return true;
   // Codes to provider ids: data/team_codes.json overrides, then abbreviations.
   const std::string league = this->league();
   std::uint32_t ids[2] = {0, 0};
@@ -322,17 +321,31 @@ void Services::on_read(const char* text) {
       const auto it = lg->find(codes[s]);
       if (it != lg->end() && it->is_string()) ids[s] = static_cast<std::uint32_t>(std::stoul(it->get<std::string>()));
     }
+    const auto list = teams();
     if (!ids[s])
-      for (const auto& t : teams())
+      for (const auto& t : list)
         if (t.code == codes[s]) ids[s] = t.id;
+    if (!ids[s]) {
+      // The provider spells it differently: the one team whose name fits best.
+      int best = 0, ties = 0;
+      for (const auto& t : list) {
+        const int v = code_name_score(codes[s], t.name.c_str());
+        if (v > best) best = v, ties = 0, ids[s] = t.id;
+        else if (v == best) ++ties;
+      }
+      if (best < 2 || ties > 0) ids[s] = 0;
+      else log_line(std::string("scorebug code ") + codes[s] + " matched by team name");
+    }
   }
+  if (ids[0] && ids[0] == ids[1]) ids[0] = ids[1] = 0;
   if (!ids[0] || !ids[1]) {
     status(std::string("scorebug ") + codes[0] + " v " + codes[1] + ": not in " + league +
            " (add to data/team_codes.json or pick teams)");
     m_.source = MatchSource::Scorebug;  // do not retry every read; manual still wins
-    return;
+    return true;
   }
   identify(ids[0], ids[1], MatchSource::Scorebug);
+  return true;
 }
 
 void Services::handle(const ServiceCmd& c) {
@@ -521,7 +534,7 @@ void Services::run() {
   status(ocr.ready() ? "scorebug OCR ready" : "no OCR engine for the user's languages");
   load_teams();
   publish();
-  std::string text;
+  std::string text, first;
   while (!stop_.load()) {
     std::vector<ServiceCmd> cmds;
     {
@@ -537,7 +550,18 @@ void Services::run() {
         std::memcpy(m_.roi, crop.roi, sizeof(m_.roi));
         dirty_ = true;
       }
-      if (ocr.read(crop.px.get(), crop.w, crop.h, crop.w * 4, text)) on_read(text.c_str());
+      // Colour first; failing that, grey with the contrast stretched.
+      bool parsed = false;
+      first.clear();
+      for (int mode = 0; mode < 2 && !parsed; ++mode) {
+        if (!ocr.read(crop.px.get(), crop.w, crop.h, crop.w * 4, text, mode)) break;
+        parsed = on_read(text.c_str());
+        if (mode == 0) first = text;
+      }
+      if (!parsed && !first.empty() && last_unparsed_ != first) {
+        last_unparsed_ = first;
+        status("scorebug text not understood: " + first);
+      }
       crop.busy.store(false, std::memory_order_release);
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));

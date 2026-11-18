@@ -1,6 +1,7 @@
 #include "touchfc/mini_replay.hpp"
 #include "touchfc/panel_flip.hpp"
 #include "touchfc/arena.hpp"
+#include "touchfc/ball_pick.hpp"
 #include "touchfc/blocking_spsc.hpp"
 #include "touchfc/config_json.hpp"
 #include "touchfc/cpu.hpp"
@@ -1988,3 +1989,183 @@ TEST_CASE("scorer names from OCR text, lineup layout and provider scoring plays"
   REQUIRE(espn::parse_summary(roster, r));
   REQUIRE(r.team[0].squad[0].place == 1);
 }
+
+TEST_CASE("scorebug: stacked layout, lone letters as digits, known codes as hints") {
+  ScorebugRead r;
+  REQUIRE(parse_scorebug("ARS 1 CHE 0 45:00", r));  // two rows, read top to bottom
+  REQUIRE(std::string(r.home) == "ARS");
+  REQUIRE(std::string(r.away) == "CHE");
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 0);
+  REQUIRE(r.clock_ms == 45 * 60000);
+  REQUIRE(parse_scorebug("ARS O - I EVE", r));  // OCR's 0 and 1
+  REQUIRE(r.home_score == 0);
+  REQUIRE(r.away_score == 1);
+  // One letter off a known code is that code.
+  REQUIRE(parse_scorebug("ARS 2 1 EUE", r, "ARS", "EVE"));
+  REQUIRE(std::string(r.away) == "EVE");
+  REQUIRE(r.home_score == 2);
+  // Other text that looks like a score loses to the read naming both teams.
+  REQUIRE(parse_scorebug("LIVE 1 2 UHD ARS 0 0 EVE", r));
+  REQUIRE(std::string(r.home) == "LIVE");
+  REQUIRE(parse_scorebug("LIVE 1 2 UHD ARS 0 0 EVE", r, "ARS", "EVE"));
+  REQUIRE(std::string(r.home) == "ARS");
+  REQUIRE(r.home_score == 0);
+  // Unknown codes still parse with hints given.
+  REQUIRE(parse_scorebug("LIV 3 1 TOT", r, "ARS", "EVE"));
+  REQUIRE(std::string(r.home) == "LIV");
+
+  REQUIRE(code_name_score("MCI", "Manchester City") > code_name_score("MCI", "Manchester United"));
+  REQUIRE(code_name_score("ARS", "Arsenal") >= 2);
+  REQUIRE(code_name_score("NFO", "Nottingham Forest") >= 2);
+  REQUIRE(code_name_score("XYZ", "Arsenal") == -1);
+  REQUIRE(code_name_score("RSE", "Arsenal") == -1);  // must start the name
+}
+
+TEST_CASE("score vote: a changed score needs agreeing reads") {
+  ScoreVote v;
+  REQUIRE_FALSE(v.add(0, 0, 1, 0));
+  REQUIRE(v.pending());
+  REQUIRE(v.add(0, 0, 1, 0));  // one more goal: two reads
+  REQUIRE_FALSE(v.add(1, 0, 1, 0));
+  REQUIRE_FALSE(v.pending());
+  // A misread digit: gone on the next read.
+  REQUIRE_FALSE(v.add(1, 0, 1, 8));
+  REQUIRE_FALSE(v.add(1, 0, 1, 0));
+  REQUIRE_FALSE(v.pending());
+  // A score going down, or up by two, needs three reads.
+  REQUIRE_FALSE(v.add(1, 0, 0, 0));
+  REQUIRE_FALSE(v.add(1, 0, 0, 0));
+  REQUIRE(v.add(1, 0, 0, 0));
+  // The first score read after start: two reads.
+  ScoreVote w;
+  REQUIRE_FALSE(w.add(-1, -1, 2, 1));
+  REQUIRE(w.add(-1, -1, 2, 1));
+}
+
+namespace {
+BallCand cand(float px, float py, float score, float x, float y, float near_m) {
+  BallCand b;
+  b.px = px;
+  b.py = py;
+  b.score = score;
+  b.pitch_ok = true;
+  b.x = x;
+  b.y = y;
+  b.near_m = near_m;
+  return b;
+}
+}  // namespace
+
+TEST_CASE("ball picker: one ball, no teleports, spare balls and graphics left out") {
+  BallPickParams p;
+  SECTION("the ball at a player's feet is confirmed, a brighter spare ball by the line never is") {
+    BallPicker k;
+    int picked_spare = 0, picked_real = 0;
+    for (int f = 0; f < 200; ++f) {
+      const float t = 0.04f * f;
+      // Real ball dribbled along; unseen from frame 80 to 140.
+      BallCand c[2] = {cand(1700.f, 300.f, 0.9f, 20.f, 34.5f, 30.f),
+                       cand(400.f + 3.f * f, 600.f, 0.5f, -20.f + 0.15f * f, 0.f, 1.f)};
+      const int n = f >= 80 && f < 140 ? 1 : 2;
+      const int i = k.pick(c, n, t, 0.f, 0.f, p);
+      picked_spare += i == 0;
+      picked_real += i == 1;
+      if (f == 1) REQUIRE(i == -1);  // not yet confirmed
+      if (f == 10 || f == 150) REQUIRE(i == 1);
+    }
+    REQUIRE(picked_spare == 0);
+    REQUIRE(picked_real > 120);
+  }
+  SECTION("a one-frame hit far away does not move the ball") {
+    BallPicker k;
+    for (int f = 0; f < 40; ++f) {
+      BallCand c[2] = {cand(600.f + 2.f * f, 500.f, 0.5f, 0.1f * f, 0.f, 1.f),
+                       cand(1500.f, 200.f, 0.95f, 35.f, -20.f, 1.f)};
+      const int n = f == 20 ? 2 : 1;
+      const int i = k.pick(c, n, 0.04f * f, 0.f, 0.f, p);
+      if (f >= 3) REQUIRE(i == 0);
+    }
+  }
+  SECTION("a new ball far away takes over once the old one is gone, after `confirm` frames") {
+    BallPicker k;
+    for (int f = 0; f < 10; ++f) {
+      BallCand c = cand(600.f, 500.f, 0.6f, 0.f, 0.f, 1.f);
+      k.pick(&c, 1, 0.04f * f, 0.f, 0.f, p);
+    }
+    REQUIRE(k.tracking());
+    // A long pass, unseen in flight, received 40 m away.
+    BallCand c = cand(1500.f, 400.f, 0.6f, 40.f, 5.f, 1.f);
+    REQUIRE(k.pick(&c, 1, 0.9f, 0.f, 0.f, p) == -1);
+    REQUIRE(k.pick(&c, 1, 0.94f, 0.f, 0.f, p) == -1);
+    REQUIRE(k.pick(&c, 1, 0.98f, 0.f, 0.f, p) == 0);
+  }
+  SECTION("a loose ball with nobody near counts when it moves") {
+    BallPicker k;
+    int first = -1;
+    for (int f = 0; f < 20 && first < 0; ++f) {
+      BallCand c = cand(600.f + 12.f * f, 500.f, 0.6f, 0.6f * f, 0.f, 20.f);
+      if (k.pick(&c, 1, 0.04f * f, 0.f, 0.f, p) == 0) first = f;
+    }
+    REQUIRE(first >= 3);
+    REQUIRE(first <= 6);
+  }
+  SECTION("a ball outside the lines is not a new ball") {
+    BallPicker k;
+    for (int f = 0; f < 30; ++f) {
+      BallCand c = cand(600.f, 100.f, 0.9f, 10.f, -36.5f, 1.f);
+      REQUIRE(k.pick(&c, 1, 0.04f * f, 0.f, 0.f, p) == -1);
+    }
+  }
+  SECTION("a graphic fixed on the screen while the camera pans") {
+    BallPicker k;
+    int picked = 0;
+    for (int f = 0; f < 120; ++f) {
+      // Its pitch position slides with the pan, past players.
+      BallCand c = cand(1800.f, 950.f, 0.9f, -30.f + 0.5f * f, 20.f, 1.f);
+      picked += k.pick(&c, 1, 0.04f * f, -6.f, 0.f, p) == 0;
+    }
+    REQUIRE(picked == 0);
+  }
+  SECTION("the tracked ball follows the camera shift") {
+    BallPicker k;
+    for (int f = 0; f < 30; ++f) {
+      // Ball still on the pitch; the picture pans 30 px a frame.
+      BallCand c = cand(1000.f - 30.f * f, 500.f, 0.6f, 5.f, 5.f, 1.f);
+      const int i = k.pick(&c, 1, 0.04f * f, -30.f, 0.f, p);
+      if (f >= 3) REQUIRE(i == 0);
+    }
+  }
+}
+
+TEST_CASE("events: a goal with no shot seen adds one where the team last had the ball") {
+  Sim s;
+  for (int k = 0; k < 10; ++k) s.frame(40.f, 5.f, 9, 1);  // team A on the ball in the area
+  REQUIRE(s.d.team_stats().shots[0] == 0);
+  Event e;
+  REQUIRE(s.d.goal_shot(s.t + 20.f, 1, &e, s.p) == 1);
+  REQUIRE(e.type == EventType::Shot);
+  REQUIRE(e.result == EventResult::Goal);
+  REQUIRE(e.sx == 40.f);
+  REQUIRE(e.ex == 52.5f);
+  REQUIRE(s.d.team_stats().shots[0] == 1);
+  REQUIRE(std::fabs(s.d.team_stats().xg[0] - shot_xg(40.f, 5.f, 52.5f)) < 1e-5f);
+  REQUIRE(s.d.track(9)->shots == 1);
+  REQUIRE(s.d.track(9)->rating > 1.f);
+  // Team B never had it near A's goal: from the penalty spot, under some pressure.
+  REQUIRE(s.d.goal_shot(s.t + 30.f, 2, &e, s.p) == 1);
+  REQUIRE(e.sx == -41.5f);
+  REQUIRE(e.ex == -52.5f);
+  REQUIRE(std::fabs(s.d.last_shot_xg() - shot_xg(-41.5f, 0.f, -52.5f, 1.f)) < 1e-5f);
+  REQUIRE(s.d.team_stats().shots[1] == 1);
+}
+
+TEST_CASE("events: a ball that jumps is not a struck ball") {
+  Sim s;
+  for (int k = 0; k < 10; ++k) s.frame(25.f, 0.f, 7, 1);
+  // False hits near the goal for a few frames, nobody near them, then back.
+  for (int k = 0; k < 2; ++k) s.frame(50.f, 0.f, 0, 0, 20.f);
+  for (int k = 0; k < 10; ++k) s.frame(25.f, 0.f, 7, 1);
+  REQUIRE(s.d.team_stats().shots[0] == 0);
+}
+

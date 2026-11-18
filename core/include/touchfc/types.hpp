@@ -184,6 +184,9 @@ struct Config {
   float dead_panel_s = 3.f;          // dead this long: a lineup / line / momentum panel shows
   float goal_banner_s = 90.f;        // scorer banner stays this long
   float popup_s = 3.f;               // shot / key pass / turnover pop-ups
+  // Ball filter
+  float ball_max_speed = 1.5f;       // the ball crosses at most this many picture widths a second
+  float ball_park_s = 2.f;           // a ball alone and still this long is a spare one
   std::uint32_t layers = 0xffffffffu;  // Layer bits
   std::uint16_t half_gap_s = 300;    // a break in play this long after 40' is half time (0: never swap ends)
   std::uint16_t h_holdover = 50;     // frames a fit lives on camera motion alone
@@ -210,7 +213,8 @@ struct Config {
   std::uint8_t team_auto = 1;   // find the two kits from the players, no click
   std::uint8_t dir_auto = 1;    // attack direction from where each team stands
   std::uint8_t replay_log_n = 8;  // key moments kept for the replay log (0 off)
-  std::uint8_t pad[7]{};        // explicit, so profiles round-trip byte for byte
+  std::uint8_t ball_confirm = 3;  // sightings in a row before a new ball counts (0: filter off)
+  std::uint8_t pad[6]{};        // explicit, so profiles round-trip byte for byte
 };
 
 // Config.layers: overlay pieces the user can switch off.

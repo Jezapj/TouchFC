@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace touchfc {
@@ -17,13 +18,33 @@ struct ScorebugRead {
 
 namespace detail {
 inline bool upper(char c) noexcept { return c >= 'A' && c <= 'Z'; }
+inline bool is_lower(char c) noexcept { return c >= 'a' && c <= 'z'; }
 inline bool digit(char c) noexcept { return c >= '0' && c <= '9'; }
+inline bool alnum(char c) noexcept { return upper(c) || is_lower(c) || digit(c); }
+// A letter standing alone where a score belongs is OCR's 0 or 1.
+inline int lone_digit(char c) noexcept {
+  return c == 'O' || c == 'o' || c == 'Q' || c == 'D' ? 0 : c == 'I' || c == 'l' || c == 'i' ? 1 : -1;
+}
+// The same length as the hint, at most one letter different (3+ letters).
+inline bool code_near(const char* code, const char* hint) noexcept {
+  if (!hint || !hint[0]) return false;
+  const std::size_t n = std::strlen(code);
+  if (n != std::strlen(hint)) return false;
+  int diff = 0;
+  for (std::size_t i = 0; i < n; ++i) diff += code[i] != hint[i];
+  return diff == 0 || (diff == 1 && n >= 3);
+}
 }  // namespace detail
 
-// Pattern CODE n [sep] n CODE, codes 2 to 4 capitals, separators anything that
-// is not a letter or digit (spaces, '-', ':', '|', an en dash's UTF-8 bytes).
-// A mm:ss anywhere is the clock. False when no score pattern is found.
-inline bool parse_scorebug(const char* text, ScorebugRead& out) noexcept {
+// Codes are 2 to 4 capitals, separators anything that is not a letter or
+// digit (spaces, '-', ':', '|', an en dash's UTF-8 bytes). Two layouts, text
+// in reading order: CODE n [sep] n CODE (side by side) and CODE n CODE n
+// (stacked, the top row is home). A mm:ss anywhere is the clock. With the
+// teams known, their codes are passed as hints: a read one letter off is
+// taken as that code, and a match on both codes wins over any other. False
+// when no score pattern is found.
+inline bool parse_scorebug(const char* text, ScorebugRead& out, const char* hint_home = nullptr,
+                           const char* hint_away = nullptr) noexcept {
   out = {};
   struct Tok {
     int kind;  // 0 code, 1 number
@@ -35,7 +56,11 @@ inline bool parse_scorebug(const char* text, ScorebugRead& out) noexcept {
   const int len = static_cast<int>(std::strlen(text));
   for (int i = 0; i < len && n < 48;) {
     const char c = text[i];
-    if (detail::digit(c)) {
+    const bool alone = (i == 0 || !detail::alnum(text[i - 1])) && (i + 1 >= len || !detail::alnum(text[i + 1]));
+    if (alone && detail::lone_digit(c) >= 0) {
+      t[n++] = {1, i, i + 1, detail::lone_digit(c)};
+      ++i;
+    } else if (detail::digit(c)) {
       int j = i, v = 0;
       while (j < len && detail::digit(text[j]) && j - i < 4) v = v * 10 + (text[j++] - '0');
       // mm:ss clock
@@ -71,18 +96,97 @@ inline bool parse_scorebug(const char* text, ScorebugRead& out) noexcept {
       ++i;
     }
   }
-  for (int k = 0; k + 3 < n; ++k) {
-    if (t[k].kind != 0 || t[k + 1].kind != 1 || t[k + 2].kind != 1 || t[k + 3].kind != 0) continue;
-    if (t[k + 1].value > 30 || t[k + 2].value > 30) continue;
-    const int wh = t[k].b - t[k].a, wa = t[k + 3].b - t[k + 3].a;
-    std::memcpy(out.home, text + t[k].a, static_cast<std::size_t>(wh));
-    std::memcpy(out.away, text + t[k + 3].a, static_cast<std::size_t>(wa));
-    out.home_score = t[k + 1].value;
-    out.away_score = t[k + 2].value;
-    return true;
+  const bool hinted = hint_home && hint_away && hint_home[0] && hint_away[0];
+  // Copies the code; true when it is (nearly) one of the known teams'.
+  auto name = [&](const Tok& tk, char* dst) {
+    std::memset(dst, 0, 6);
+    std::memcpy(dst, text + tk.a, static_cast<std::size_t>(tk.b - tk.a));
+    if (!hinted) return false;
+    const char* h = detail::code_near(dst, hint_home)   ? hint_home
+                    : detail::code_near(dst, hint_away) ? hint_away
+                                                        : nullptr;
+    if (h) std::snprintf(dst, 6, "%s", h);
+    return h != nullptr;
+  };
+  // First the reads that name both known teams, then any.
+  for (int pass = hinted ? 0 : 1; pass < 2; ++pass) {
+    for (int k = 0; k + 3 < n; ++k) {
+      if (t[k].kind != 0 || t[k + 1].kind != 1) continue;
+      int ia, is;  // away code, away score
+      if (t[k + 2].kind == 1 && t[k + 3].kind == 0) ia = k + 3, is = k + 2;
+      else if (t[k + 2].kind == 0 && t[k + 3].kind == 1) ia = k + 2, is = k + 3;
+      else continue;
+      if (t[k + 1].value > 30 || t[is].value > 30) continue;
+      ScorebugRead r;
+      r.clock_ms = out.clock_ms;
+      const bool kh = name(t[k], r.home), ka = name(t[ia], r.away);
+      if (pass == 0 && (!kh || !ka || std::strcmp(r.home, r.away) == 0)) continue;
+      r.home_score = t[k + 1].value;
+      r.away_score = t[is].value;
+      out = r;
+      return true;
+    }
   }
   return false;
 }
+
+// How well a bug's code fits a team name, for codes the provider spells
+// differently: the code's letters must appear in order, starting with the
+// name's first letter. One point per letter that starts a word or continues
+// the name's opening letters ("MCI": Manchester City 2, Manchester United 1).
+// -1: no fit. Case-insensitive.
+inline int code_name_score(const char* code, const char* name) noexcept {
+  auto up = [](char c) { return detail::is_lower(c) ? static_cast<char>(c - 32) : c; };
+  const int nc = static_cast<int>(std::strlen(code));
+  const int full = static_cast<int>(std::strlen(name));
+  const int nn = full < 63 ? full : 63;
+  if (nc < 2 || nc > 4 || nn < nc || up(code[0]) != up(name[0])) return -1;
+  // best[i][j]: code[0..i] matched with code[i] on name[j].
+  int best[4][64];
+  for (int i = 0; i < nc; ++i)
+    for (int j = 0; j < nn; ++j) {
+      best[i][j] = -1;
+      if (up(code[i]) != up(name[j])) continue;
+      if (i == 0) {
+        if (j == 0) best[i][j] = 1;
+        continue;
+      }
+      const bool word = !detail::alnum(name[j - 1]);
+      for (int q = i - 1; q < j; ++q) {
+        if (best[i - 1][q] < 0) continue;
+        const int v = best[i - 1][q] + (word || (j == i && q == i - 1) ? 1 : 0);
+        if (v > best[i][j]) best[i][j] = v;
+      }
+    }
+  int top = -1;
+  for (int j = 0; j < nn; ++j) top = best[nc - 1][j] > top ? best[nc - 1][j] : top;
+  return top;
+}
+
+// A changed score counts once it is read the same twice in a row; anything
+// but one more goal for one side needs a third read. One misread digit would
+// otherwise put up a goal and take it back.
+class ScoreVote {
+ public:
+  // cur: the score on show (-1 unknown). True when h, a should replace it.
+  bool add(int cur_h, int cur_a, int h, int a) noexcept {
+    if (h == cur_h && a == cur_a) {
+      run_ = 0;
+      return false;
+    }
+    if (h == h_ && a == a_ && run_ > 0) ++run_;
+    else h_ = h, a_ = a, run_ = 1;
+    const bool known = cur_h >= 0 && cur_a >= 0;
+    const bool one_goal = known && h >= cur_h && a >= cur_a && (h - cur_h) + (a - cur_a) == 1;
+    if (run_ < (known && !one_goal ? 3 : 2)) return false;
+    run_ = 0;
+    return true;
+  }
+  bool pending() const noexcept { return run_ > 0; }
+
+ private:
+  int h_ = -1, a_ = -1, run_ = 0;
+};
 
 // Confident when the same codes are read N times in a row.
 class ScorebugVote {
@@ -110,7 +214,8 @@ class ScorebugVote {
 // Finds the scorebug: over wide frames, cells in the top 20% of the picture
 // that are both high-contrast and barely change between frames. Screen-fixed
 // graphics pass; the crowd, boards and pitch move with the camera. The largest
-// wide cluster wins (a channel logo is smaller and squarer). Fixed arrays, no
+// cluster a quarter wider than tall wins (a stacked bug is about that shape; a
+// channel logo is smaller and squarer). Fixed arrays, no
 // allocation, so it can run on T3 until it locks.
 class ScorebugRoiFinder {
  public:
@@ -208,7 +313,7 @@ class ScorebugRoiFinder {
             stack[sp++][1] = static_cast<std::int16_t>(q[1]);
           }
         }
-        if (count > best && x1 - x0 + 1 >= 2 * (y1 - y0 + 1) && count >= 4) {
+        if (count > best && 4 * (x1 - x0 + 1) >= 5 * (y1 - y0 + 1) && count >= 4) {
           best = count;
           // One cell of margin so the edge glyphs are inside.
           const int ax = x0 > 0 ? x0 - 1 : 0, ay = y0 > 0 ? y0 - 1 : 0;

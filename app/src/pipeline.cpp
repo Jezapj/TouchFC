@@ -939,6 +939,68 @@ void Pipeline::update_pitch(FrameSlot& slot, const Config& cfg) {
   }
 }
 
+// One ball a frame. BallPicker chooses it; the other ball boxes are dropped
+// here, so possession, events, play state and the overlay see at most one.
+void Pipeline::pick_ball(FrameSlot& slot, const Config& cfg) {
+  const float W = static_cast<float>(slot.meta.width);
+  const std::int32_t* roi = manual_roi_[2] > 0 ? manual_roi_ : roi_finder_.done() ? roi_finder_.roi() : nullptr;
+  int idx[BallPicker::kMaxCand];
+  BallCand c[BallPicker::kMaxCand];
+  int n = 0, top = -1;
+  for (std::uint32_t i = 0; i < slot.det_count && n < BallPicker::kMaxCand; ++i) {
+    const Detection& d = slot.dets[i];
+    if (d.class_id != 3) continue;
+    BallCand b;
+    b.px = d.x + 0.5f * d.w;
+    b.py = d.y + 0.5f * d.h;
+    // On the scorebug: a graphic.
+    if (roi && b.px >= static_cast<float>(roi[0]) && b.px <= static_cast<float>(roi[0] + roi[2]) &&
+        b.py >= static_cast<float>(roi[1]) && b.py <= static_cast<float>(roi[1] + roi[3]))
+      continue;
+    b.score = d.score;
+    b.pitch_ok = slot.pitch_ok[i] != 0;
+    b.x = slot.pitch_x[i];
+    b.y = slot.pitch_y[i];
+    if (b.pitch_ok)
+      for (std::uint32_t j = 0; j < slot.det_count; ++j)
+        if (slot.dets[j].class_id <= 1 && slot.pitch_ok[j])
+          b.near_m = std::fmin(b.near_m, std::hypot(slot.pitch_x[j] - b.x, slot.pitch_y[j] - b.y));
+    if (top < 0 || b.score > c[top].score) top = n;
+    idx[n] = static_cast<int>(i);
+    c[n++] = b;
+  }
+  int keep = -1;
+  if (!cfg.ball_confirm || !slot.pitch_valid) {
+    // No pitch (a close-up, a replay): nothing is counted, the best box is shown.
+    if (top >= 0) keep = idx[top];
+  } else {
+    const std::int64_t tg = live_ ? last_track_t_ns_ : slot.meta.pts_ns;
+    if (ball_t0_ < 0) ball_t0_ = tg;
+    BallPickParams bp;
+    bp.max_px_s = cfg.ball_max_speed * W;
+    bp.slack_px = 0.02f * W;
+    bp.ui_px = std::fmax(4.f, W / 400.f);
+    bp.park_s = cfg.ball_park_s;
+    bp.confirm = cfg.ball_confirm;
+    const bool cam = last_gmc_.confidence >= 0.5f;
+    const int k = ball_pick_.pick(c, n, static_cast<float>(tg - ball_t0_) * 1e-9f, cam ? last_gmc_.dx : 0.f,
+                                  cam ? last_gmc_.dy : 0.f, bp);
+    if (k >= 0) keep = idx[k];
+  }
+  std::uint32_t out = 0;
+  for (std::uint32_t i = 0; i < slot.det_count; ++i) {
+    if (slot.dets[i].class_id == 3 && static_cast<int>(i) != keep) continue;
+    if (out != i) {
+      slot.dets[out] = slot.dets[i];
+      slot.pitch_ok[out] = slot.pitch_ok[i];
+      slot.pitch_x[out] = slot.pitch_x[i];
+      slot.pitch_y[out] = slot.pitch_y[i];
+    }
+    ++out;
+  }
+  slot.det_count = out;
+}
+
 void Pipeline::log_event(const Event& e) noexcept {
   if (poss_n_ >= kMaxEvents) return;
   poss_events_[poss_n_] = e;
@@ -1109,20 +1171,36 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
         e.status = EventStatus::Confirmed;
         e.team = static_cast<std::uint8_t>(s + 1);
         e.match_ms_start = e.match_ms_end = static_cast<std::int32_t>(play_t_s_ * 1000.f);
-        // The scoring team's last shot within 15 s becomes a goal in the log.
-        for (int k = poss_n_ - 1; k >= 0; --k) {
+        // The scoring team's last shot within 45 s becomes a goal in the log
+        // (the bug changes well after the ball goes in). Other event kinds
+        // run on another clock, so only passes and shots end the search.
+        bool shot = false;
+        for (int k = poss_n_ - 1; k >= 0 && !shot; --k) {
           Event& sh = poss_events_[k];
-          if (e.match_ms_end - sh.match_ms_end > 15000) break;
+          if (sh.type != EventType::Shot && sh.type != EventType::Pass) continue;
+          if (e.match_ms_end - sh.match_ms_end > 45000) break;
           if (sh.type == EventType::Shot && sh.team == e.team) {
             sh.result = EventResult::Goal;
-            break;
+            shot = true;
           }
         }
-        log_event(e);
         EventParams ep;
         ep.rating_goal = cfg.rating_goal;
-        events_.goal(play_t_s_, ep);
+        ep.rating_shot = cfg.rating_shot;
+        ep.shot_zone_m = cfg.shot_zone_m;
+        ep.key_pass_window_s = cfg.key_pass_window_s;
+        ep.attack_dir = attack_dir.load(std::memory_order_relaxed);
         flow_.set_bin(flow_bin());
+        Event added{};
+        if (shot) {
+          events_.goal(play_t_s_, ep);
+        } else if (events_.goal_shot(play_t_s_, e.team, &added, ep)) {
+          // No shot was seen: one is added where the team last had the ball.
+          log_event(added);
+          flow_.shot(e.team, events_.last_shot_xg());
+          log_line("goal with no shot seen: shot added, xG " + std::to_string(events_.last_shot_xg()));
+        }
+        log_event(e);
         flow_.goal(e.team);
         flow_dirty_ = true;
         push_feed(FeedKind::Goal, e.team);
@@ -1152,7 +1230,11 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
   const TimeNs now = last_track_t_ns_;
   // 5 s once the teams are known; 2 s after a shot or a goal, when the
   // broadcaster's scorer caption is up for a few seconds.
-  const TimeNs every = !match_.teams_ok ? 1000000000LL : now < ocr_fast_until_ ? 2000000000LL : 5000000000LL;
+  const bool again = ocr_again_.load(std::memory_order_relaxed);
+  const TimeNs every = again                 ? 400000000LL
+                       : !match_.teams_ok    ? 1000000000LL
+                       : now < ocr_fast_until_ ? 2000000000LL
+                                               : 5000000000LL;
   if (now - last_ocr_ns_ < every) return;
   for (std::uint32_t i = 0; i < 2; ++i) {
     OcrCrop& c = crops_[i];
@@ -1168,6 +1250,7 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
                   static_cast<std::size_t>(c.w) * 4);
     c.busy.store(true, std::memory_order_release);
     if (!ocr_req_.try_push(i)) c.busy.store(false, std::memory_order_release);
+    else if (again) ocr_again_.store(false, std::memory_order_relaxed);
     last_ocr_ns_ = now;
     break;
   }
@@ -1261,6 +1344,7 @@ void Pipeline::run_t3() {
       ++gmc_n_;
     }
     update_pitch(slot, cfg);
+    pick_ball(slot, cfg);
     update_play(slot, cfg);
     update_match(slot, cfg);
     assign_teams(slot, cfg);

@@ -15,6 +15,7 @@
 #include "touchfc/match_flow.hpp"
 #include "touchfc/match_info.hpp"
 #include "touchfc/mini_replay.hpp"
+#include "touchfc/ball_pick.hpp"
 #include "touchfc/scorebug.hpp"
 #include "touchfc/pitch_control.hpp"
 #include "touchfc/possession.hpp"
@@ -73,6 +74,8 @@ class Pipeline {
   BlockingSpsc<UiCommand, 64>& commands() noexcept { return commands_; }
   BlockingSpsc<std::uint32_t, 4>& ocr_requests() noexcept { return ocr_req_; }
   OcrCrop& ocr_crop(std::uint32_t i) noexcept { return crops_[i & 1]; }
+  // T7: the last read needs a second look (a changed score); read again at once.
+  void ocr_again() noexcept { ocr_again_.store(true, std::memory_order_relaxed); }
   TripleBuffer<MatchInfo>& match_t3() noexcept { return match_t3_; }
   TripleBuffer<MatchInfo>& match_ui() noexcept { return match_ui_; }
   // M15: T3 writes the ring and posts requests; T7 fills clips; present plays.
@@ -163,6 +166,10 @@ class Pipeline {
   std::uint16_t gmc_id_[64]{};
   std::uint32_t gmc_n_ = 0;
   void update_pitch(FrameSlot& slot, const Config& cfg);
+  void pick_ball(FrameSlot& slot, const Config& cfg);
+  BallPicker ball_pick_{};
+  std::int64_t ball_t0_ = -1;
+  std::atomic<bool> ocr_again_{false};
   void update_play(FrameSlot& slot, const Config& cfg);
   void update_match(FrameSlot& slot, const Config& cfg);
   void seed_kits(const Config& cfg);

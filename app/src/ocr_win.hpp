@@ -13,8 +13,10 @@ class Ocr {
   Ocr();
   ~Ocr();
   bool ready() const noexcept;
-  // Lines joined by spaces. False when the engine is missing or the read fails.
-  bool read(const std::uint8_t* bgra, int w, int h, int stride, std::string& text);
+  // Words in reading order (rows top to bottom, each left to right), joined
+  // by spaces. mode 0: colour; 1: grey with the contrast stretched. False when
+  // the engine is missing or the read fails.
+  bool read(const std::uint8_t* bgra, int w, int h, int stride, std::string& text, int mode = 0);
 
  private:
   struct Impl;

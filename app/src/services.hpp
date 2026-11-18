@@ -89,7 +89,7 @@ class Services {
   void load_teams();
   void identify(std::uint32_t home, std::uint32_t away, MatchSource src);
   void fetch_summary(bool fresh);
-  void on_read(const char* text);
+  bool on_read(const char* text);
   void publish();
   void serve_clips();
   void status(const std::string& s);
@@ -107,6 +107,7 @@ class Services {
   std::int64_t last_poll_s_ = 0;
   nlohmann::json overrides_;
   ScorebugVote vote_;
+  ScoreVote score_vote_;
   std::string last_unparsed_;
   ClipReq clip_wait_[4]{};  // requests waiting for t + 1.5 s to reach the ring
   int clip_wait_n_ = 0;
