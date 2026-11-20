@@ -2368,6 +2368,7 @@ void App::load_last_profile() {
 void App::draw_tuning(Config& cfg) {
   ImGui::SetNextItemWidth(160.f);
   ImGui::InputText("##profile", profile_name_, sizeof(profile_name_));
+  ImGui::SetItemTooltip("Profile name: letters, digits, _ and - only.");
   ImGui::SameLine();
   if (ImGui::Button("save profile")) {
     if (!profile_name_ok(profile_name_)) {
@@ -2380,11 +2381,13 @@ void App::draw_tuning(Config& cfg) {
       profile_msg_ = std::string("saved ") + profile_name_;
     }
   }
+  ImGui::SetItemTooltip("Save every threshold below to profiles/<name>.json.");
   ImGui::SameLine();
   if (ImGui::Button("load profile")) {
     profile_msg_ = load_profile(profile_name_) ? std::string("loaded ") + profile_name_ : "no such profile";
     cfg = pipe_->config().load();
   }
+  ImGui::SetItemTooltip("Load the thresholds saved under this name.");
   if (!profile_msg_.empty()) ImGui::TextDisabled("%s", profile_msg_.c_str());
 
   bool changed = false;
@@ -2395,6 +2398,7 @@ void App::draw_tuning(Config& cfg) {
       cfg_reset_group(cfg, static_cast<CfgGroup>(g));
       changed = true;
     }
+    ImGui::SetItemTooltip("Put every slider in this group back to its default.");
     for (const CfgField& f : kConfigFields) {
       if (static_cast<int>(f.group) != g) continue;
       const double v = cfg_get(cfg, f);
@@ -2412,6 +2416,7 @@ void App::draw_tuning(Config& cfg) {
           changed = true;
         }
       }
+      if (f.hint && f.hint[0]) ImGui::SetItemTooltip("%s", f.hint);
       char live[48];
       if (live_value(f.key, live, sizeof(live))) {
         ImGui::SameLine();
@@ -3047,6 +3052,7 @@ void App::draw_live_card() {
                                                                 : "not calibrated",
                       last_reproj_m_);
           if (ImGui::Button(calib_mode_ ? "Done clicking" : "Calibrate by clicking the video")) calib_mode_ = !calib_mode_;
+          ImGui::SetItemTooltip("Fit the pitch by hand: click the chosen landmark on the video, then the next.");
           ImGui::SameLine();
           if (ImGui::Button("Clear")) {
             UiCommand c;
@@ -3054,13 +3060,17 @@ void App::draw_live_card() {
             push_cmd(c);
             for (bool& a : sent_anchor_) a = false;
           }
+          ImGui::SetItemTooltip("Drop the clicked landmarks and go back to the automatic pitch fit.");
           ImGui::SetNextItemWidth(-1);
           ImGui::Combo("##landmark", &calib_pick_, kPitchLandmarkName, kPitchLandmarks);
+          ImGui::SetItemTooltip("The pitch landmark your next click marks.");
           ImGui::TextDisabled("Pause the stream first. Click 4 or more landmarks; right-click skips one.");
           ImGui::Checkbox("Show the fitted lines", &debug_reproj_);
+          ImGui::SetItemTooltip("Draw the pitch lines where the current fit puts them, to check it.");
         }
         if (ImGui::CollapsingHeader("Diagnostics")) {
           ImGui::Checkbox("Performance overlay", &show_diag_);
+          ImGui::SetItemTooltip("Show the HUD over the video: latency, fps, replay cost and why play is dead.");
           ImGui::Text("detector: %s", detector_ ? detector_->label() : "-");
           ImGui::Text("capture to screen p50 %.1f ms, p99 %.1f ms",
                       static_cast<double>(pipe_->present_p50_ns.load()) / 1.0e6,
@@ -3070,6 +3080,7 @@ void App::draw_live_card() {
             c.type = CmdType::TestReplay;
             push_cmd(c);
           }
+          ImGui::SetItemTooltip("Play a mini replay of the last few seconds now.");
           if (pending_cmd_) ImGui::TextDisabled("command queue full; will retry");
         }
         if (ImGui::CollapsingHeader("Thresholds and profiles")) draw_tuning(cfg);

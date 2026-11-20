@@ -130,6 +130,208 @@ inline bool parse_scorebug(const char* text, ScorebugRead& out, const char* hint
   return false;
 }
 
+// One OCR word and its box (any pixel scale, y down).
+struct BugWord {
+  float x = 0, y = 0, w = 0, h = 0;
+  char s[24]{};
+};
+
+// The same read from word boxes, so each score is tied to the code it sits
+// beside: a team's score is on the code's row, directly left or right of it
+// (no other number between), whatever row the other team is on. With the
+// teams known (hints), out.home/away are the hints in that order, a side not
+// seen is -1, and one team with its score is enough: the other's is the
+// number just past it on the same row ("TOT 1 - 1"), or the one under or over
+// it on the next row (stacked), when no code sits beside that number.
+// Without hints both codes and scores are needed; home is the left (or top)
+// code. False when no score is found.
+inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out, const char* hint_home = nullptr,
+                                 const char* hint_away = nullptr) noexcept {
+  out = {};
+  struct Tok {
+    bool code;
+    float x0, x1, cy, h;
+    int value;
+    char s[6];
+  };
+  Tok t[64];
+  int n = 0;
+  const bool hinted = hint_home && hint_away && hint_home[0] && hint_away[0];
+  auto up = [](char c) { return detail::is_lower(c) ? static_cast<char>(c - 32) : c; };
+  for (int wi = 0; wi < nw; ++wi) {
+    const BugWord& w = words[wi];
+    const char* s = w.s;
+    const int len = static_cast<int>(std::strlen(s));
+    if (len == 0 || w.h <= 0) continue;
+    const float cw = w.w / static_cast<float>(len);
+    auto push = [&](bool code, int a, int b, int v) {
+      if (n >= 64) return;
+      Tok& k = t[n++];
+      k.code = code;
+      k.x0 = w.x + cw * static_cast<float>(a);
+      k.x1 = w.x + cw * static_cast<float>(b);
+      k.cy = w.y + 0.5f * w.h;
+      k.h = w.h;
+      k.value = v;
+      std::memset(k.s, 0, sizeof(k.s));
+      if (code)
+        for (int q = a; q < b && q - a < 5; ++q) k.s[q - a] = up(s[q]);
+    };
+    for (int i = 0; i < len;) {
+      const char c = s[i];
+      const bool alone = (i == 0 || !detail::alnum(s[i - 1])) && (i + 1 >= len || !detail::alnum(s[i + 1]));
+      if (alone && detail::lone_digit(c) >= 0) {
+        push(false, i, i + 1, detail::lone_digit(c));
+        ++i;
+      } else if (detail::digit(c)) {
+        int j = i, v = 0;
+        while (j < len && detail::digit(s[j])) v = v * 10 + (s[j++] - '0');
+        if (j < len - 2 && s[j] == ':' && detail::digit(s[j + 1]) && detail::digit(s[j + 2]) &&
+            (j + 3 >= len || !detail::digit(s[j + 3]))) {
+          const int ss = (s[j + 1] - '0') * 10 + (s[j + 2] - '0');
+          if (j - i <= 3 && v <= 130 && ss < 60) out.clock_ms = (v * 60 + ss) * 1000;
+          i = j + 3;
+          continue;
+        }
+        // Added time ("+3") and long numbers are never a score.
+        const bool added = i > 0 && s[i - 1] == '+';
+        if (!added && j - i <= 2 && v <= 30) push(false, i, j, v);
+        i = j;
+      } else if (detail::upper(c) || detail::is_lower(c)) {
+        int j = i;
+        while (j < len && (detail::upper(s[j]) || detail::is_lower(s[j]))) ++j;
+        bool caps = true;
+        for (int k = i; k < j; ++k) caps = caps && detail::upper(s[k]);
+        if (j - i >= 2 && j - i <= 4) {
+          char cu[6]{};
+          for (int k = i; k < j; ++k) cu[k - i] = up(s[k]);
+          // Lower case only for a known code ("Ars"); words are not codes.
+          if (caps || (hinted && (detail::code_near(cu, hint_home) || detail::code_near(cu, hint_away))))
+            push(true, i, j, 0);
+        }
+        i = j;
+      } else {
+        ++i;
+      }
+    }
+  }
+  auto row = [](const Tok& a, const Tok& b) {
+    return std::fabs(a.cy - b.cy) <= 0.5f * (a.h > b.h ? a.h : b.h);
+  };
+  // Something of kind `code` strictly between a and b on their row.
+  auto between = [&](int a, int b, int skip_kind) {
+    const float l = t[a].x1 < t[b].x1 ? t[a].x1 : t[b].x1, r = t[a].x0 > t[b].x0 ? t[a].x0 : t[b].x0;
+    for (int k = 0; k < n; ++k)
+      if (k != a && k != b && static_cast<int>(t[k].code) != skip_kind && row(t[k], t[a]) && t[k].x0 >= l - 1.f &&
+          t[k].x1 <= r + 1.f)
+        return true;
+    return false;
+  };
+  // Gap from a code to a number directly beside it on its row; -1: not beside.
+  auto beside = [&](int c, int m) -> float {
+    if (!t[c].code || t[m].code || !row(t[c], t[m]) || between(c, m, 2)) return -1.f;
+    const float g = t[m].x0 >= t[c].x1 - 1.f ? t[m].x0 - t[c].x1 : t[c].x0 - t[m].x1;
+    return g >= -t[c].h && g <= 6.f * t[c].h ? (g > 0.f ? g : 0.f) : -1.f;
+  };
+  // Side of each code: 0, 1 (a known team), 2 (other, unhinted only), -1.
+  int side[64];
+  static constexpr const char* kStop[] = {"HT", "FT", "ET", "AET", "PEN", "LIVE", "UHD", "HD", "VAR", "MIN", "TV"};
+  for (int k = 0; k < n; ++k) {
+    side[k] = -1;
+    if (!t[k].code) continue;
+    if (hinted) {
+      side[k] = detail::code_near(t[k].s, hint_home) ? 0 : detail::code_near(t[k].s, hint_away) ? 1 : -1;
+      if (side[k] >= 0 && std::strcmp(hint_home, hint_away) == 0) side[k] = -1;
+    } else {
+      bool stop = false;
+      for (const char* w : kStop) stop = stop || std::strcmp(t[k].s, w) == 0;
+      side[k] = stop ? -1 : 2;
+    }
+  }
+  // Pair codes and numbers, nearest first, each used once.
+  int score_of[64], code_of[64];
+  for (int k = 0; k < n; ++k) score_of[k] = code_of[k] = -1;
+  for (;;) {
+    int bc = -1, bm = -1;
+    float bg = 1e9f;
+    for (int c = 0; c < n; ++c) {
+      if (side[c] < 0 || score_of[c] >= 0) continue;
+      if (hinted) {  // one code per known team
+        bool taken = false;
+        for (int q = 0; q < n; ++q) taken = taken || (q != c && side[q] == side[c] && score_of[q] >= 0);
+        if (taken) continue;
+      }
+      for (int m = 0; m < n; ++m) {
+        if (t[m].code || code_of[m] >= 0) continue;
+        const float g = beside(c, m);
+        if (g >= 0.f && g < bg) bg = g, bc = c, bm = m;
+      }
+    }
+    if (bc < 0) break;
+    score_of[bc] = bm;
+    code_of[bm] = bc;
+  }
+  if (hinted) {
+    int sc[2] = {-1, -1}, at[2] = {-1, -1};
+    for (int c = 0; c < n; ++c)
+      if (side[c] >= 0 && score_of[c] >= 0 && at[side[c]] < 0) at[side[c]] = c, sc[side[c]] = t[score_of[c]].value;
+    if (sc[0] < 0 && sc[1] < 0) return false;
+    if (sc[0] < 0 || sc[1] < 0) {
+      const int known = sc[0] >= 0 ? 0 : 1, c = at[known], m = score_of[c];
+      // A number no code sits beside: past the score on its row, or on the next row in line with it.
+      int best = -1;
+      float bd = 1e9f;
+      for (int u = 0; u < n; ++u) {
+        if (t[u].code || u == m) continue;
+        bool owned = false;
+        for (int q = 0; q < n; ++q) owned = owned || beside(q, u) >= 0.f;
+        if (owned) continue;
+        float d = -1.f;
+        if (row(t[u], t[m])) {
+          const bool right = t[m].x0 >= t[c].x1 - 1.f;
+          const float g = right ? t[u].x0 - t[m].x1 : t[m].x0 - t[u].x1;
+          if (g >= -1.f && g <= 3.f * t[m].h && !between(m, u, 2)) d = g;
+        } else {
+          const float dx = std::fabs(0.5f * (t[u].x0 + t[u].x1) - 0.5f * (t[m].x0 + t[m].x1));
+          const float dy = std::fabs(t[u].cy - t[m].cy);
+          if (dx <= t[m].h && dy <= 2.5f * t[m].h) d = dy;
+        }
+        if (d >= 0.f && d < bd) bd = d, best = u;
+      }
+      if (best >= 0) sc[1 - known] = t[best].value;
+    }
+    std::snprintf(out.home, sizeof(out.home), "%s", hint_home);
+    std::snprintf(out.away, sizeof(out.away), "%s", hint_away);
+    out.home_score = sc[0];
+    out.away_score = sc[1];
+    return true;
+  }
+  // Unknown teams: two scored codes on one row with the scores between them,
+  // or on adjacent rows, left aligned. Reading order: the first pair wins.
+  for (int a = 0; a < n; ++a) {
+    if (side[a] < 0 || score_of[a] < 0) continue;
+    for (int b = 0; b < n; ++b) {
+      if (b == a || side[b] < 0 || score_of[b] < 0 || std::strcmp(t[a].s, t[b].s) == 0) continue;
+      const Tok &A = t[a], &B = t[b], &SA = t[score_of[a]], &SB = t[score_of[b]];
+      bool ok = false;
+      if (row(A, B)) {
+        ok = A.x1 <= SA.x0 + 1.f && SA.x1 <= SB.x0 + 1.f && SB.x1 <= B.x0 + 1.f;  // A sa - sb B
+      } else {
+        const float dy = B.cy - A.cy;
+        ok = dy > 0.f && dy <= 3.f * A.h && std::fabs(A.x0 - B.x0) <= 1.5f * A.h &&
+             std::fabs(0.5f * (SA.x0 + SA.x1) - 0.5f * (SB.x0 + SB.x1)) <= 1.5f * A.h;
+      }
+      if (!ok) continue;
+      std::snprintf(out.home, sizeof(out.home), "%s", A.s);
+      std::snprintf(out.away, sizeof(out.away), "%s", B.s);
+      out.home_score = SA.value;
+      out.away_score = SB.value;
+      return true;
+    }
+  }
+  return false;
+}
+
 // How well a bug's code fits a team name, for codes the provider spells
 // differently: the code's letters must appear in order, starting with the
 // name's first letter. One point per letter that starts a word or continues

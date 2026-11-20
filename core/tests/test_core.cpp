@@ -1276,6 +1276,8 @@ TEST_CASE("config profile round-trips byte for byte") {
     INFO(f.key);
     REQUIRE(v >= f.lo);
     REQUIRE(v <= f.hi);
+    REQUIRE(f.hint);
+    REQUIRE(std::strlen(f.hint) > 10);  // every slider explains itself on hover
   }
 }
 
@@ -2020,6 +2022,99 @@ TEST_CASE("scorebug: stacked layout, lone letters as digits, known codes as hint
   REQUIRE(code_name_score("NFO", "Nottingham Forest") >= 2);
   REQUIRE(code_name_score("XYZ", "Arsenal") == -1);
   REQUIRE(code_name_score("RSE", "Arsenal") == -1);  // must start the name
+}
+
+namespace {
+// Words on a row at y, 20 px tall, laid out from x with 10 px per letter and a 10 px gap.
+void bug_row(std::vector<BugWord>& out, float x, float y, std::initializer_list<const char*> ws) {
+  for (const char* w : ws) {
+    BugWord b;
+    b.x = x;
+    b.y = y;
+    b.h = 20.f;
+    b.w = 10.f * static_cast<float>(std::strlen(w));
+    std::snprintf(b.s, sizeof(b.s), "%s", w);
+    out.push_back(b);
+    x += b.w + 10.f;
+  }
+}
+}  // namespace
+
+TEST_CASE("scorebug words: scores sit beside their code, one team is enough") {
+  ScorebugRead r;
+  std::vector<BugWord> w;
+  bug_row(w, 0, 0, {"TOT", "1", "-", "2", "ARS", "23:41"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r));
+  REQUIRE(std::string(r.home) == "TOT");
+  REQUIRE(std::string(r.away) == "ARS");
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 2);
+  REQUIRE(r.clock_ms == (23 * 60 + 41) * 1000);
+  // Hints given in the other order: out is in hint order.
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "TOT"));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+
+  // ARS not read: the number past TOT's score is ARS's.
+  w.clear();
+  bug_row(w, 0, 0, {"TOT", "1", "-", "3"});
+  REQUIRE_FALSE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r));
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "TOT", "ARS"));
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 3);
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "TOT"));
+  REQUIRE(r.home_score == 3);
+  REQUIRE(r.away_score == 1);
+  // Reversed side: "1 - 3 ARS" with TOT missing.
+  w.clear();
+  bug_row(w, 0, 0, {"1", "-", "3", "ARS"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "TOT", "ARS"));
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 3);
+
+  // Stacked rows, codes on different y; the score is on its code's row.
+  w.clear();
+  bug_row(w, 0, 0, {"CHE", "0"});
+  bug_row(w, 0, 30, {"LIV", "2"});
+  bug_row(w, 120, 15, {"67:12"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r));
+  REQUIRE(std::string(r.home) == "CHE");
+  REQUIRE(r.home_score == 0);
+  REQUIRE(r.away_score == 2);
+  // Bottom code misread: the number under CHE's score is LIV's.
+  w.clear();
+  bug_row(w, 0, 0, {"CHE", "0"});
+  bug_row(w, 0, 30, {"~~~", "2"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "CHE", "LIV"));
+  REQUIRE(r.home_score == 0);
+  REQUIRE(r.away_score == 2);
+  // Only one row read: that side only.
+  w.clear();
+  bug_row(w, 0, 30, {"LIV", "2"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "CHE", "LIV"));
+  REQUIRE(r.home_score == -1);
+  REQUIRE(r.away_score == 2);
+
+  // A channel name with a number does not score for a known team, and a
+  // number beside another code is never taken as the missing team's.
+  w.clear();
+  bug_row(w, 0, 0, {"TNT", "1"});
+  bug_row(w, 0, 40, {"ARS", "0", "LIV", "4"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "EVE"));
+  REQUIRE(r.home_score == 0);
+  REQUIRE(r.away_score == -1);
+  // One letter off and lower case still match a known code; added time is no score.
+  w.clear();
+  bug_row(w, 0, 0, {"Ars", "2", "-", "1", "EUE", "90:00", "+4"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "EVE"));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+  // "ARS1" glued and "O" as zero.
+  w.clear();
+  bug_row(w, 0, 0, {"ARS1", "O", "EVE"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "EVE"));
+  REQUIRE(r.home_score == 1);
+  REQUIRE(r.away_score == 0);
 }
 
 TEST_CASE("score vote: a changed score needs agreeing reads") {

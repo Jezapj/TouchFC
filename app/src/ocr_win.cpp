@@ -9,6 +9,7 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -34,12 +35,23 @@ Ocr::~Ocr() = default;
 
 bool Ocr::ready() const noexcept { return impl_->engine != nullptr; }
 
-bool Ocr::read(const std::uint8_t* bgra, int w, int h, int stride, std::string& text, int mode) {
+bool Ocr::read(const std::uint8_t* bgra, int w, int h, int stride, std::string& text, int mode,
+               std::vector<BugWord>* out_words) {
   text.clear();
+  if (out_words) out_words->clear();
   if (!ready() || w <= 0 || h <= 0) return false;
   // Scorebug glyphs are small (a stacked bug's rows more so); the engine reads
   // them better at 2x or more, smoothed.
-  const int k = h <= 160 ? 3 : 2;
+  // The engine refuses images past MaxImageDimension (2600 px).
+  int k = h <= 160 ? 3 : 2;
+  const int big = w > h ? w : h;
+  int max_dim = 2600;
+  try {
+    max_dim = static_cast<int>(ocr::OcrEngine::MaxImageDimension());
+  } catch (...) {
+  }
+  while (k > 1 && big * k > max_dim) --k;
+  if (big * k > max_dim) return false;
   const int ow = w * k, oh = h * k;
   try {
     // Grey range of the crop, for the stretch.
@@ -101,6 +113,15 @@ bool Ocr::read(const std::uint8_t* bgra, int w, int h, int stride, std::string& 
       for (const auto& word : line.Words()) {
         const auto r = word.BoundingRect();
         words.push_back({r.X, r.Y + 0.5f * r.Height, r.Height, winrt::to_string(word.Text())});
+        if (out_words) {
+          BugWord b;
+          b.x = r.X;
+          b.y = r.Y;
+          b.w = r.Width;
+          b.h = r.Height;
+          std::snprintf(b.s, sizeof(b.s), "%s", words.back().s.c_str());
+          out_words->push_back(b);
+        }
       }
     std::sort(words.begin(), words.end(), [](const Word& a, const Word& b) { return a.cy < b.cy; });
     for (std::size_t i = 0; i < words.size();) {

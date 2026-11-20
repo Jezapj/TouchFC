@@ -269,6 +269,17 @@ Pending: a real fine-tuned D-FINE-N or RF-DETR-Nano compared with yolov8n on the
 | Replay log | `Services::save_clip`, `play_log`, [`jpeg_win.cpp`](../app/src/jpeg_win.cpp), Replays tab | Every clip T7 copies is also kept as JPEG (WIC), newest `replay_log_n` (8). **Play** decodes into a third clip buffer (allocated on first use) and plays over the stream. "Auto-play key moments" off: logged, not shown. A shot followed by a goal within 45 s is marked. The codec is round-tripped at start. |
 | Checked | `--selftest --demo-flow`, tests | Banner, pop-ups, flames and the three panels drawn from made-up data (window captures). JPEG round trip logged at start (max error 7 of 255). Tests 869 / 70, selftest 0. Not checked on a broadcast: scorer names from a real caption, the provider fallback live, half time on a live clock, line heights against a tracking provider, a real replay-log clip (needs detected shots). |
 
+## Scorebug reading by position (after M18)
+
+| What | Where | Notes |
+|---|---|---|
+| Word boxes | `Ocr::read` in [`ocr_win.cpp`](../app/src/ocr_win.cpp) | Returns each word with its box as `BugWord`, as well as the flat text. Upscale capped at `OcrEngine::MaxImageDimension` (2600): a 960 px crop at 3x used to fail the read. |
+| Parser | `parse_scorebug_words` in [`scorebug.hpp`](../core/include/touchfc/scorebug.hpp) | A score is the number on its code's row directly left or right of it (no token between, within 6 code heights); rows may differ between teams. Teams known: out is in team order, a side not seen is -1, and one team is enough: the other's score is the next number past it on the row, or the one in line with it on the adjacent row, if no code sits beside that number. Teams unknown: two scored codes, scores between them on one row or left-aligned on adjacent rows. Skips added time (`+4`), numbers over 30, and words like HT, LIVE, UHD. Lower case only for a known code. |
+| Services | `Services::on_read` | Word parser first; the text parser as a fallback, which with teams known must name both (a stray "LIV 3 1 TOT" no longer scores for the home team). A one-sided read keeps the other side's score. Team identification only from reads with both scores. |
+| Read area | `Pipeline` OCR crop, `bug_area`, `bug_area_w_pct`, `bug_area_h_pct` | On by default: OCR reads the top-left 40% x 20%, not the found box. A box drawn by hand wins. The found box still masks the ball detector and the panels. |
+| Hints | `CfgField::hint`, `App::draw_tuning`, Advanced tab | Every Tuning slider and Advanced control has hover text. A test requires a hint on every visible field. |
+| Checked | tests, selftest | Tests 1265 / 76 (38 new: side by side, stacked, one team inferred both ways and on the next row, channel logo ignored, lower case, one letter off, glued `ARS1`). Selftest 0, OCR ready. Not checked on a broadcast: a live score change, a bug outside the top left, the wider crop's OCR time. |
+
 ## Licence and weights
 
 The repo licence is AGPL-3.0-only (`LICENSE`). FFmpeg is the BtbN LGPL shared build, not the GPL one. `scripts/fetch_models.ps1` refuses to download weights. `docs/models.md` lists the detector licences: D-FINE, DEIM, RT-DETR (lyuwenyu) and RF-DETR are Apache 2.0; Ultralytics models (yolov8n, the roboflow/sports pitch model) are AGPL-3.0. No broadcast footage is in the tree.

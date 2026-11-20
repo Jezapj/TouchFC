@@ -1225,6 +1225,10 @@ void Pipeline::update_match(FrameSlot& slot, const Config& cfg) {
     }
   }
   for (int k = 0; k < 4; ++k) slot.bug_roi[k] = static_cast<std::int16_t>(roi ? roi[k] : 0);
+  // Scorebugs sit top left: read that whole area, so a wrong or late box
+  // never hides the score. The found box still masks the ball detector.
+  std::int32_t area[4] = {0, 0, W * cfg.bug_area_w_pct / 100, H * cfg.bug_area_h_pct / 100};
+  if (manual_roi_[2] <= 0 && cfg.bug_area && area[2] > 0 && area[3] > 0) roi = area;
   if (!roi || roi[2] <= 0 || roi[3] <= 0) return;
 
   const TimeNs now = last_track_t_ns_;

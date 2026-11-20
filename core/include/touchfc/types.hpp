@@ -214,7 +214,10 @@ struct Config {
   std::uint8_t dir_auto = 1;    // attack direction from where each team stands
   std::uint8_t replay_log_n = 8;  // key moments kept for the replay log (0 off)
   std::uint8_t ball_confirm = 3;  // sightings in a row before a new ball counts (0: filter off)
-  std::uint8_t pad[6]{};        // explicit, so profiles round-trip byte for byte
+  std::uint8_t bug_area = 1;      // OCR reads the top-left area, not the found box (a manual box still wins)
+  std::uint8_t bug_area_w_pct = 40;  // ... this share of the width
+  std::uint8_t bug_area_h_pct = 20;  // ... and of the height
+  std::uint8_t pad[3]{};        // explicit, so profiles round-trip byte for byte
 };
 
 // Config.layers: overlay pieces the user can switch off.

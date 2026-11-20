@@ -277,7 +277,7 @@ void Services::resolve_goals() {
 }
 
 // False when the text holds no score pattern.
-bool Services::on_read(const char* text) {
+bool Services::on_read(const char* text, const std::vector<BugWord>& words) {
   {
     int side = 0, idx = 0;
     if (find_player(text, m_, side, idx)) {
@@ -286,16 +286,32 @@ bool Services::on_read(const char* text) {
       seen_s_ = now_s();
     }
   }
+  const char* hh = m_.teams_ok ? m_.team[0].code : nullptr;
+  const char* ha = m_.teams_ok ? m_.team[1].code : nullptr;
+  // Word boxes first (each score tied to the code beside it); the flat text
+  // read as a fallback, which with the teams known must name both.
   ScorebugRead r;
-  if (!parse_scorebug(text, r, m_.teams_ok ? m_.team[0].code : nullptr, m_.teams_ok ? m_.team[1].code : nullptr))
-    return false;
+  if (!parse_scorebug_words(words.data(), static_cast<int>(words.size()), r, hh, ha)) {
+    if (!parse_scorebug(text, r, hh, ha)) return false;
+    if (m_.teams_ok) {
+      const bool same = std::strcmp(r.home, hh) == 0 && std::strcmp(r.away, ha) == 0;
+      const bool swapped = std::strcmp(r.home, ha) == 0 && std::strcmp(r.away, hh) == 0;
+      if (!same && !swapped) return false;
+      if (swapped) {
+        std::swap(r.home, r.away);
+        std::swap(r.home_score, r.away_score);
+      }
+    }
+  }
   if (r.clock_ms >= 0 && r.clock_ms != m_.clock_ms) {
     m_.clock_ms = r.clock_ms;
     dirty_ = true;
   }
-  // Left is home; map by code when both are known, so a swapped bug still scores right.
-  int hs = 0, as = 1;
-  if (m_.teams_ok && std::strcmp(r.home, m_.team[1].code) == 0) std::swap(hs, as);
+  // r is in team order now. A side not read keeps its score.
+  const int hs = 0, as = 1;
+  const bool both = r.home_score >= 0 && r.away_score >= 0;
+  if (r.home_score < 0) r.home_score = m_.team[hs].score;
+  if (r.away_score < 0) r.away_score = m_.team[as].score;
   // A changed score is read again at once and counts when the reads agree.
   const bool changed = score_vote_.add(m_.team[hs].score, m_.team[as].score, r.home_score, r.away_score);
   if (score_vote_.pending()) pipe_.ocr_again();
@@ -304,12 +320,13 @@ bool Services::on_read(const char* text) {
     const int sides[2] = {hs, as};
     for (int k = 0; k < 2; ++k) {
       if (was[k] >= 0 && is[k] == was[k] + 1) add_goal(sides[k]);
-      else if (was[k] >= 0 && is[k] < was[k]) drop_goal(sides[k]);
+      else if (was[k] >= 0 && is[k] >= 0 && is[k] < was[k]) drop_goal(sides[k]);
     }
     m_.team[hs].score = static_cast<std::int16_t>(r.home_score);
     m_.team[as].score = static_cast<std::int16_t>(r.away_score);
     dirty_ = true;
   }
+  if (!both) return true;
   if (!vote_.add(r) || m_.source == MatchSource::Manual || m_.source == MatchSource::Scorebug) return true;
   // Codes to provider ids: data/team_codes.json overrides, then abbreviations.
   const std::string league = this->league();
@@ -535,6 +552,7 @@ void Services::run() {
   load_teams();
   publish();
   std::string text, first;
+  std::vector<BugWord> words;
   while (!stop_.load()) {
     std::vector<ServiceCmd> cmds;
     {
@@ -554,8 +572,8 @@ void Services::run() {
       bool parsed = false;
       first.clear();
       for (int mode = 0; mode < 2 && !parsed; ++mode) {
-        if (!ocr.read(crop.px.get(), crop.w, crop.h, crop.w * 4, text, mode)) break;
-        parsed = on_read(text.c_str());
+        if (!ocr.read(crop.px.get(), crop.w, crop.h, crop.w * 4, text, mode, &words)) break;
+        parsed = on_read(text.c_str(), words);
         if (mode == 0) first = text;
       }
       if (!parsed && !first.empty() && last_unparsed_ != first) {

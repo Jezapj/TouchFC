@@ -89,7 +89,7 @@ class Services {
   void load_teams();
   void identify(std::uint32_t home, std::uint32_t away, MatchSource src);
   void fetch_summary(bool fresh);
-  bool on_read(const char* text);
+  bool on_read(const char* text, const std::vector<BugWord>& words);
   void publish();
   void serve_clips();
   void status(const std::string& s);
