@@ -2128,14 +2128,123 @@ TEST_CASE("score vote: a changed score needs agreeing reads") {
   REQUIRE_FALSE(v.add(1, 0, 1, 8));
   REQUIRE_FALSE(v.add(1, 0, 1, 0));
   REQUIRE_FALSE(v.pending());
-  // A score going down, or up by two, needs three reads.
+  // A goal ruled out needs three reads.
   REQUIRE_FALSE(v.add(1, 0, 0, 0));
   REQUIRE_FALSE(v.add(1, 0, 0, 0));
   REQUIRE(v.add(1, 0, 0, 0));
-  // The first score read after start: two reads.
+  // Goals in quick succession each count after two reads.
+  REQUIRE_FALSE(v.add(0, 0, 1, 0));
+  REQUIRE(v.add(0, 0, 1, 0));
+  REQUIRE_FALSE(v.add(1, 0, 1, 1));
+  REQUIRE(v.add(1, 0, 1, 1));
+  // A jump (a logo read as a digit: 1-1 to 16-1) needs `jump` reads, at the slow cadence.
+  for (int k = 0; k < 5; ++k) {
+    REQUIRE_FALSE(v.add(1, 1, 16, 1, 6));
+    REQUIRE_FALSE(v.pending());
+  }
+  REQUIRE(v.add(1, 1, 16, 1, 6));
+  // ... and a read of the score on show starts it again.
+  for (int k = 0; k < 5; ++k) REQUIRE_FALSE(v.add(1, 1, 3, 1, 6));
+  REQUIRE_FALSE(v.add(1, 1, 1, 1, 6));
+  REQUIRE_FALSE(v.add(1, 1, 3, 1, 6));
+  // Both sides at once is a jump too.
+  REQUIRE_FALSE(v.add(1, 1, 2, 2, 3));
+  REQUIRE_FALSE(v.add(1, 1, 2, 2, 3));
+  REQUIRE(v.add(1, 1, 2, 2, 3));
+  // The first score read after start: two reads, unless past 9.
   ScoreVote w;
   REQUIRE_FALSE(w.add(-1, -1, 2, 1));
   REQUIRE(w.add(-1, -1, 2, 1));
+  ScoreVote x;
+  REQUIRE_FALSE(x.add(-1, -1, 26, 1, 4));
+  REQUIRE_FALSE(x.add(-1, -1, 26, 1, 4));
+  REQUIRE_FALSE(x.add(-1, -1, 26, 1, 4));
+  REQUIRE(x.add(-1, -1, 26, 1, 4));
+}
+
+TEST_CASE("scorebug: a logo between the scores read as a digit") {
+  ScorebugRead r;
+  // Flat text: "261k" is 2, the lion as 6, 1, and the panel pattern as k.
+  REQUIRE(parse_scorebug("ARS 261k CHE 66:08", r, "ARS", "CHE"));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+  REQUIRE(r.clock_ms == (66 * 60 + 8) * 1000);
+  REQUIRE(parse_scorebug("ARS 26 1 CHE", r, "ARS", "CHE"));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+  REQUIRE(parse_scorebug("ARS 2 61 KCHE", r, "ARS", "CHE"));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+  REQUIRE(parse_scorebug("ARS 261 CHE", r));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+
+  std::vector<BugWord> w;
+  for (auto ws : {std::initializer_list<const char*>{"ARS", "261k", "CHE", "66:08"},
+                  std::initializer_list<const char*>{"ARS", "26", "1", "CHE"},
+                  std::initializer_list<const char*>{"ARS", "2", "61", "kCHE"},
+                  std::initializer_list<const char*>{"ARS", "2", "6", "1", "CHEk"}}) {
+    w.clear();
+    bug_row(w, 0, 0, ws);
+    REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "CHE"));
+    REQUIRE(r.home_score == 2);
+    REQUIRE(r.away_score == 1);
+  }
+  // Unhinted words too.
+  w.clear();
+  bug_row(w, 0, 0, {"ARS", "26", "1", "CHE"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r));
+  REQUIRE(r.home_score == 2);
+  REQUIRE(r.away_score == 1);
+}
+
+TEST_CASE("scorebug: crests read as digits give way to the score on show") {
+  ScorebugRead r;
+  std::vector<BugWord> w;
+  auto words = [&](std::initializer_list<const char*> ws, int ch, int ca) {
+    w.clear();
+    bug_row(w, 0, 0, ws);
+    return parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "CHE", ch, ca);
+  };
+  // A crest beside each code read as 6: no change, then one goal, both seen.
+  REQUIRE(words({"ARS", "6", "2", "-", "1", "6", "CHE"}, 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  REQUIRE(words({"ARS", "6", "3", "-", "1", "6", "CHE"}, 2, 1));
+  REQUIRE((r.home_score == 3 && r.away_score == 1));
+  REQUIRE(words({"ARS", "6", "2", "-", "2", "6", "CHE"}, 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 2));
+  // Crest on one side only, or a divider read as 1.
+  REQUIRE(words({"ARS", "8", "2", "1", "CHE"}, 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  REQUIRE(words({"ARS", "2", "1", "1", "CHE"}, 2, 0));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  // Home on the right: the order of the numbers follows the codes.
+  REQUIRE(words({"CHE", "6", "1", "-", "2", "6", "ARS"}, 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  // A real jump with nothing extra is still read as it is (the vote holds it).
+  REQUIRE(words({"ARS", "2", "-", "1", "CHE"}, 0, 0));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  // Stacked, a crest on each row.
+  w.clear();
+  bug_row(w, 0, 0, {"6", "ARS", "2"});
+  bug_row(w, 0, 30, {"6", "CHE", "1"});
+  REQUIRE(parse_scorebug_words(w.data(), static_cast<int>(w.size()), r, "ARS", "CHE", 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+
+  // Flat text: the same, side by side and stacked.
+  REQUIRE(parse_scorebug("ARS 6 2 1 6 CHE 66:08", r, "ARS", "CHE", 2, 1));
+  REQUIRE((std::string(r.home) == "ARS" && r.home_score == 2 && r.away_score == 1));
+  REQUIRE(parse_scorebug("ARS 6 3 1 6 CHE", r, "ARS", "CHE", 2, 1));
+  REQUIRE((r.home_score == 3 && r.away_score == 1));
+  REQUIRE(parse_scorebug("ARS 6 2 CHE 6 1", r, "ARS", "CHE", 2, 1));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  REQUIRE(parse_scorebug("CHE 6 1 2 6 ARS", r, "ARS", "CHE", 2, 1));
+  REQUIRE((std::string(r.home) == "CHE" && r.home_score == 1 && r.away_score == 2));
+  // A plain pattern a jump off, with nothing better, stands.
+  REQUIRE(parse_scorebug("ARS 2 1 CHE", r, "ARS", "CHE", 0, 0));
+  REQUIRE((r.home_score == 2 && r.away_score == 1));
+  // No score on show: crests are not passed over.
+  REQUIRE_FALSE(parse_scorebug("ARS 6 2 1 6 CHE", r, "ARS", "CHE"));
 }
 
 namespace {

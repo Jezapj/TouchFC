@@ -290,9 +290,11 @@ bool Services::on_read(const char* text, const std::vector<BugWord>& words) {
   const char* ha = m_.teams_ok ? m_.team[1].code : nullptr;
   // Word boxes first (each score tied to the code beside it); the flat text
   // read as a fallback, which with the teams known must name both.
+  // The score on show steers past a crest or logo read as a digit.
+  const int ch = m_.teams_ok ? m_.team[0].score : -1, ca = m_.teams_ok ? m_.team[1].score : -1;
   ScorebugRead r;
-  if (!parse_scorebug_words(words.data(), static_cast<int>(words.size()), r, hh, ha)) {
-    if (!parse_scorebug(text, r, hh, ha)) return false;
+  if (!parse_scorebug_words(words.data(), static_cast<int>(words.size()), r, hh, ha, ch, ca)) {
+    if (!parse_scorebug(text, r, hh, ha, ch, ca)) return false;
     if (m_.teams_ok) {
       const bool same = std::strcmp(r.home, hh) == 0 && std::strcmp(r.away, ha) == 0;
       const bool swapped = std::strcmp(r.home, ha) == 0 && std::strcmp(r.away, hh) == 0;
@@ -313,7 +315,8 @@ bool Services::on_read(const char* text, const std::vector<BugWord>& words) {
   if (r.home_score < 0) r.home_score = m_.team[hs].score;
   if (r.away_score < 0) r.away_score = m_.team[as].score;
   // A changed score is read again at once and counts when the reads agree.
-  const bool changed = score_vote_.add(m_.team[hs].score, m_.team[as].score, r.home_score, r.away_score);
+  const bool changed = score_vote_.add(m_.team[hs].score, m_.team[as].score, r.home_score, r.away_score,
+                                       pipe_.config().load().bug_jump_reads);
   if (score_vote_.pending()) pipe_.ocr_again();
   if (changed) {
     const int was[2] = {m_.team[hs].score, m_.team[as].score}, is[2] = {r.home_score, r.away_score};

@@ -114,6 +114,7 @@ inline constexpr CfgField kConfigFields[] = {
     TOUCHFC_CFG(bug_area, Match, "scorebug: read top-left area", 0, 1, "On: OCR reads the whole top-left area set below, where scorebugs sit. Off: only the found box. A box set by hand wins either way."),
     TOUCHFC_CFG(bug_area_w_pct, Match, "scorebug area width %", 10, 60, "Width of the top-left scorebug area, as a % of the picture."),
     TOUCHFC_CFG(bug_area_h_pct, Match, "scorebug area height %", 5, 40, "Height of the top-left scorebug area, as a % of the picture."),
+    TOUCHFC_CFG(bug_jump_reads, Match, "scorebug: reads for a score jump", 3, 30, "One more goal for one side counts after 2 agreeing reads. Any other change (two goals at once, a jump like 2 to 16) needs this many, read at the normal pace (about 5 s apart)."),
 
     TOUCHFC_CFG(show_boxes, Overlay, "show boxes", 0, 1, "Draw detection boxes on the video."),
     TOUCHFC_CFG(delay_margin_ms, Overlay, "present margin ms", 0.f, 80.f, "Extra delay on the overlay so it lines up with the video."),

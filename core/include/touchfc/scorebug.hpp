@@ -34,17 +34,39 @@ inline bool code_near(const char* code, const char* hint) noexcept {
   for (std::size_t i = 0; i < n; ++i) diff += code[i] != hint[i];
   return diff == 0 || (diff == 1 && n >= 3);
 }
+// code_near, or the hint with one stray letter before or after it ("KCHE":
+// a patterned panel beside the code read as a letter).
+inline bool code_fits(const char* code, const char* hint) noexcept {
+  if (code_near(code, hint)) return true;
+  if (!hint || !hint[0]) return false;
+  const std::size_t n = std::strlen(code), m = std::strlen(hint);
+  return m >= 3 && n == m + 1 && (std::strcmp(code + 1, hint) == 0 || std::strncmp(code, hint, m) == 0);
+}
 }  // namespace detail
+
+// How far h, a is from the score on show: 0 the same, 1 one more goal for
+// one side, 2 one fewer for one side, 3 anything else (or cur unknown). A
+// side of -1 (not read) counts as unchanged.
+inline int score_step(int cur_h, int cur_a, int h, int a) noexcept {
+  if (cur_h < 0 || cur_a < 0) return 3;
+  const int dh = h < 0 ? 0 : h - cur_h, da = a < 0 ? 0 : a - cur_a;
+  if (dh == 0 && da == 0) return 0;
+  if ((dh == 0 && da == 1) || (da == 0 && dh == 1)) return 1;
+  if ((dh == 0 && da == -1) || (da == 0 && dh == -1)) return 2;
+  return 3;
+}
 
 // Codes are 2 to 4 capitals, separators anything that is not a letter or
 // digit (spaces, '-', ':', '|', an en dash's UTF-8 bytes). Two layouts, text
 // in reading order: CODE n [sep] n CODE (side by side) and CODE n CODE n
 // (stacked, the top row is home). A mm:ss anywhere is the clock. With the
 // teams known, their codes are passed as hints: a read one letter off is
-// taken as that code, and a match on both codes wins over any other. False
-// when no score pattern is found.
+// taken as that code, and a match on both codes wins over any other. With the
+// score on show also known (cur_h, cur_a in hint order), extra numbers by the
+// codes (a crest or logo read as a digit) are passed over for the numbers
+// within one goal of it. False when no score pattern is found.
 inline bool parse_scorebug(const char* text, ScorebugRead& out, const char* hint_home = nullptr,
-                           const char* hint_away = nullptr) noexcept {
+                           const char* hint_away = nullptr, int cur_h = -1, int cur_a = -1) noexcept {
   out = {};
   struct Tok {
     int kind;  // 0 code, 1 number
@@ -69,6 +91,13 @@ inline bool parse_scorebug(const char* text, ScorebugRead& out, const char* hint
         const int ss = (text[j + 1] - '0') * 10 + (text[j + 2] - '0');
         if (v <= 130 && ss < 60) out.clock_ms = (v * 60 + ss) * 1000;
         i = j + 3;
+        continue;
+      }
+      if (j - i == 3 && n < 47) {
+        // "261": two scores with the logo between them read as a digit.
+        t[n++] = {1, i, i + 1, text[i] - '0'};
+        t[n++] = {1, j - 1, j, text[j - 1] - '0'};
+        i = j;
         continue;
       }
       t[n++] = {1, i, j, v};
@@ -102,30 +131,94 @@ inline bool parse_scorebug(const char* text, ScorebugRead& out, const char* hint
     std::memset(dst, 0, 6);
     std::memcpy(dst, text + tk.a, static_cast<std::size_t>(tk.b - tk.a));
     if (!hinted) return false;
-    const char* h = detail::code_near(dst, hint_home)   ? hint_home
-                    : detail::code_near(dst, hint_away) ? hint_away
+    const char* h = detail::code_fits(dst, hint_home)   ? hint_home
+                    : detail::code_fits(dst, hint_away) ? hint_away
                                                         : nullptr;
     if (h) std::snprintf(dst, 6, "%s", h);
     return h != nullptr;
   };
-  // First the reads that name both known teams, then any.
-  for (int pass = hinted ? 0 : 1; pass < 2; ++pass) {
+  // The first CODE n [n] CODE [n] pattern; pass 0 must name both known teams.
+  auto pattern = [&](int pass, ScorebugRead& r) {
     for (int k = 0; k + 3 < n; ++k) {
       if (t[k].kind != 0 || t[k + 1].kind != 1) continue;
       int ia, is;  // away code, away score
       if (t[k + 2].kind == 1 && t[k + 3].kind == 0) ia = k + 3, is = k + 2;
       else if (t[k + 2].kind == 0 && t[k + 3].kind == 1) ia = k + 2, is = k + 3;
       else continue;
-      if (t[k + 1].value > 30 || t[is].value > 30) continue;
-      ScorebugRead r;
+      int vh = t[k + 1].value, va = t[is].value;
+      // "26 1" or "2 61" side by side: three digits between the codes, the
+      // middle one the logo.
+      if (is == k + 2) {
+        const int dh = t[k + 1].b - t[k + 1].a, da = t[is].b - t[is].a;
+        if (dh == 2 && da == 1) vh /= 10;
+        else if (dh == 1 && da == 2) va %= 10;
+      }
+      if (vh > 30 || va > 30) continue;
+      r = {};
       r.clock_ms = out.clock_ms;
       const bool kh = name(t[k], r.home), ka = name(t[ia], r.away);
       if (pass == 0 && (!kh || !ka || std::strcmp(r.home, r.away) == 0)) continue;
-      r.home_score = t[k + 1].value;
-      r.away_score = t[is].value;
-      out = r;
+      r.home_score = vh;
+      r.away_score = va;
       return true;
     }
+    return false;
+  };
+  // Extra numbers by the codes (a crest or logo read as a digit) break the
+  // pattern. With the score on show known (cur, in hint order): the numbers
+  // between the two codes (side by side) or after each (stacked) within one
+  // goal of it, no change first, then fewest numbers skipped. False when
+  // none is.
+  auto nearest = [&](ScorebugRead& r) {
+    if (!hinted || cur_h < 0 || cur_a < 0) return false;
+    int side[48];
+    for (int k = 0; k < n; ++k) {
+      char s[6];
+      side[k] = -1;
+      if (t[k].kind == 0 && name(t[k], s)) side[k] = std::strcmp(s, hint_home) == 0 ? 0 : 1;
+    }
+    int best_step = 3, best_skip = 1 << 20, bp = -1, bi = -1, bj = -1;
+    for (int p = 0; p < n; ++p) {
+      if (side[p] < 0) continue;
+      int q = p + 1;
+      while (q < n && t[q].kind == 1) ++q;
+      if (q >= n || side[q] < 0 || side[q] == side[p]) continue;
+      int e = q + 1;  // numbers after q, up to the next code
+      while (e < n && t[e].kind == 1) ++e;
+      for (int i = p + 1; i < q; ++i)
+        for (int j = i + 1; j < e; ++j) {  // j before q: side by side; after: stacked
+          if (j == q || t[i].value > 30 || t[j].value > 30) continue;
+          const int skip = (i - p - 1) + (j < q ? q - j - 1 : j - q - 1);
+          const int vh = side[p] == 0 ? t[i].value : t[j].value, va = side[p] == 0 ? t[j].value : t[i].value;
+          const int st = score_step(cur_h, cur_a, vh, va);
+          if (st < best_step || (st == best_step && skip < best_skip))
+            best_step = st, best_skip = skip, bp = p, bi = i, bj = j;
+        }
+    }
+    if (bp < 0 || best_step > 2) return false;
+    r = {};
+    r.clock_ms = out.clock_ms;
+    std::snprintf(r.home, sizeof(r.home), "%s", side[bp] == 0 ? hint_home : hint_away);
+    std::snprintf(r.away, sizeof(r.away), "%s", side[bp] == 0 ? hint_away : hint_home);
+    r.home_score = t[bi].value;
+    r.away_score = t[bj].value;
+    return true;
+  };
+  // r's change from cur, its scores put in hint order.
+  auto step_of = [&](const ScorebugRead& r) {
+    const bool swapped = std::strcmp(r.home, hint_away) == 0;
+    return score_step(cur_h, cur_a, swapped ? r.away_score : r.home_score, swapped ? r.home_score : r.away_score);
+  };
+  ScorebugRead r;
+  if (hinted && pattern(0, r)) {
+    // A read more than one goal off: the extra numbers may hold the real one.
+    ScorebugRead alt;
+    out = step_of(r) == 3 && nearest(alt) ? alt : r;
+    return true;
+  }
+  if (nearest(r) || pattern(1, r)) {
+    out = r;
+    return true;
   }
   return false;
 }
@@ -144,14 +237,18 @@ struct BugWord {
 // number just past it on the same row ("TOT 1 - 1"), or the one under or over
 // it on the next row (stacked), when no code sits beside that number.
 // Without hints both codes and scores are needed; home is the left (or top)
-// code. False when no score is found.
+// code. With the score on show also known (cur_h, cur_a in hint order), a
+// read more than one goal off it gives way to other numbers on the codes'
+// rows (a crest or logo read as a digit) that are within one goal of it.
+// False when no score is found.
 inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out, const char* hint_home = nullptr,
-                                 const char* hint_away = nullptr) noexcept {
+                                 const char* hint_away = nullptr, int cur_h = -1, int cur_a = -1) noexcept {
   out = {};
   struct Tok {
     bool code;
     float x0, x1, cy, h;
     int value;
+    int nd;  // digits read
     char s[6];
   };
   Tok t[64];
@@ -173,6 +270,7 @@ inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out
       k.cy = w.y + 0.5f * w.h;
       k.h = w.h;
       k.value = v;
+      k.nd = b - a;
       std::memset(k.s, 0, sizeof(k.s));
       if (code)
         for (int q = a; q < b && q - a < 5; ++q) k.s[q - a] = up(s[q]);
@@ -195,19 +293,34 @@ inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out
         }
         // Added time ("+3") and long numbers are never a score.
         const bool added = i > 0 && s[i - 1] == '+';
-        if (!added && j - i <= 2 && v <= 30) push(false, i, j, v);
+        if (!added && j - i == 3) {
+          // "261": two scores with the logo between them read as a digit.
+          push(false, i, i + 1, s[i] - '0');
+          push(false, j - 1, j, s[j - 1] - '0');
+        } else if (!added && j - i <= 2) {
+          push(false, i, j, v);  // past 30 dropped after the logo trim below
+        }
         i = j;
       } else if (detail::upper(c) || detail::is_lower(c)) {
         int j = i;
         while (j < len && (detail::upper(s[j]) || detail::is_lower(s[j]))) ++j;
         bool caps = true;
         for (int k = i; k < j; ++k) caps = caps && detail::upper(s[k]);
-        if (j - i >= 2 && j - i <= 4) {
-          char cu[6]{};
+        char cu[6]{};
+        if (j - i >= 2 && j - i <= 4)
           for (int k = i; k < j; ++k) cu[k - i] = up(s[k]);
-          // Lower case only for a known code ("Ars"); words are not codes.
-          if (caps || (hinted && (detail::code_near(cu, hint_home) || detail::code_near(cu, hint_away))))
-            push(true, i, j, 0);
+        // Lower case only for a known code ("Ars"); words are not codes.
+        if (cu[0] && (caps || (hinted && (detail::code_near(cu, hint_home) || detail::code_near(cu, hint_away))))) {
+          push(true, i, j, 0);
+        } else if (!caps) {
+          // Capitals with stray lower case at the ends ("kCHE", "CHEk"): a
+          // patterned panel beside the code read as letters.
+          int a = i, b = j;
+          while (a < b && detail::is_lower(s[a])) ++a;
+          while (b > a && detail::is_lower(s[b - 1])) --b;
+          bool inner = b - a >= 2 && b - a <= 4 && (a > i || b < j);
+          for (int k = a; inner && k < b; ++k) inner = detail::upper(s[k]);
+          if (inner) push(true, a, b, 0);
         }
         i = j;
       } else {
@@ -218,6 +331,31 @@ inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out
   auto row = [](const Tok& a, const Tok& b) {
     return std::fabs(a.cy - b.cy) <= 0.5f * (a.h > b.h ? a.h : b.h);
   };
+  // "26 1" or "2 61": three digits close together on a row are two scores
+  // with the logo between them read as a digit; the two-digit word loses it.
+  for (int p = 0; p < n; ++p) {
+    if (t[p].code) continue;
+    for (int q = 0; q < n; ++q) {
+      if (q == p || t[q].code || t[p].nd + t[q].nd != 3 || !row(t[p], t[q])) continue;
+      const float g = t[q].x0 - t[p].x1;  // q right of p
+      if (g < -1.f || g > 1.5f * t[p].h) continue;
+      bool mid = false;
+      for (int k = 0; k < n; ++k)
+        mid = mid || (k != p && k != q && row(t[k], t[p]) && t[k].x0 >= t[p].x1 - 1.f && t[k].x1 <= t[q].x0 + 1.f);
+      if (mid) continue;
+      Tok& two = t[p].nd == 2 ? t[p] : t[q];
+      const float half = 0.5f * (two.x0 + two.x1);
+      if (&two == &t[p]) two.value /= 10, two.x1 = half;  // keep the left digit
+      else two.value %= 10, two.x0 = half;               // keep the right one
+      two.nd = 1;
+    }
+  }
+  {  // Numbers past 30 are never a score.
+    int m = 0;
+    for (int k = 0; k < n; ++k)
+      if (t[k].code || t[k].value <= 30) t[m++] = t[k];
+    n = m;
+  }
   // Something of kind `code` strictly between a and b on their row.
   auto between = [&](int a, int b, int skip_kind) {
     const float l = t[a].x1 < t[b].x1 ? t[a].x1 : t[b].x1, r = t[a].x0 > t[b].x0 ? t[a].x0 : t[b].x0;
@@ -240,7 +378,7 @@ inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out
     side[k] = -1;
     if (!t[k].code) continue;
     if (hinted) {
-      side[k] = detail::code_near(t[k].s, hint_home) ? 0 : detail::code_near(t[k].s, hint_away) ? 1 : -1;
+      side[k] = detail::code_fits(t[k].s, hint_home) ? 0 : detail::code_fits(t[k].s, hint_away) ? 1 : -1;
       if (side[k] >= 0 && std::strcmp(hint_home, hint_away) == 0) side[k] = -1;
     } else {
       bool stop = false;
@@ -299,6 +437,44 @@ inline bool parse_scorebug_words(const BugWord* words, int nw, ScorebugRead& out
         if (d >= 0.f && d < bd) bd = d, best = u;
       }
       if (best >= 0) sc[1 - known] = t[best].value;
+    }
+    // More than one goal off the score on show: a crest or logo by a code
+    // may have been read as a digit and paired. Each code's candidates are
+    // the numbers on its row with no code between; the pair within one goal
+    // of the score on show wins, no change first, then fewest skipped. Side
+    // by side, the home number stays on the home code's side of the away one.
+    if (cur_h >= 0 && cur_a >= 0 && score_step(cur_h, cur_a, sc[0], sc[1]) == 3) {
+      int ci[2] = {at[0], at[1]};
+      for (int k = 0; k < n; ++k)
+        if (side[k] >= 0 && ci[side[k]] < 0) ci[side[k]] = k;
+      if (ci[0] >= 0 && ci[1] >= 0) {
+        auto reach = [&](int c, int u) {
+          if (t[u].code || !row(t[c], t[u]) || between(c, u, 0)) return -1;
+          const float g = t[u].x0 >= t[c].x1 - 1.f ? t[u].x0 - t[c].x1 : t[c].x0 - t[u].x1;
+          if (g > 8.f * t[c].h) return -1;
+          int skip = 0;  // numbers between the code and u
+          const float l = t[c].x1 < t[u].x1 ? t[c].x1 : t[u].x1, r = t[c].x0 > t[u].x0 ? t[c].x0 : t[u].x0;
+          for (int k = 0; k < n; ++k)
+            skip += k != u && !t[k].code && row(t[k], t[c]) && t[k].x0 >= l - 1.f && t[k].x1 <= r + 1.f;
+          return skip;
+        };
+        const bool one_row = row(t[ci[0]], t[ci[1]]);
+        const bool home_left = t[ci[0]].x0 < t[ci[1]].x0;
+        int best_step = 3, best_skip = 1 << 20, b0 = -1, b1 = -1;
+        for (int u0 = 0; u0 < n; ++u0) {
+          const int s0 = reach(ci[0], u0);
+          if (s0 < 0) continue;
+          for (int u1 = 0; u1 < n; ++u1) {
+            const int s1 = u1 == u0 ? -1 : reach(ci[1], u1);
+            if (s1 < 0) continue;
+            if (one_row && (t[u0].x0 < t[u1].x0) != home_left) continue;
+            const int st = score_step(cur_h, cur_a, t[u0].value, t[u1].value);
+            if (st < best_step || (st == best_step && s0 + s1 < best_skip))
+              best_step = st, best_skip = s0 + s1, b0 = u0, b1 = u1;
+          }
+        }
+        if (b0 >= 0 && best_step <= 2) sc[0] = t[b0].value, sc[1] = t[b1].value;
+      }
     }
     std::snprintf(out.home, sizeof(out.home), "%s", hint_home);
     std::snprintf(out.away, sizeof(out.away), "%s", hint_away);
@@ -365,29 +541,36 @@ inline int code_name_score(const char* code, const char* name) noexcept {
   return top;
 }
 
-// A changed score counts once it is read the same twice in a row; anything
-// but one more goal for one side needs a third read. One misread digit would
-// otherwise put up a goal and take it back.
+// A changed score counts once it is read the same several times in a row.
+// Goals come one at a time: one more for one side takes 2 reads (so goals in
+// quick succession each count), one fewer (ruled out) 3. Any other change (a
+// jump like 2-1 to 16-1, a logo read as a digit; both sides at once) takes
+// `jump` reads at the normal cadence, with no quick re-read. The first score
+// read takes 2, or `jump` past 9 goals. A read of the score on show in
+// between starts the count again.
 class ScoreVote {
  public:
   // cur: the score on show (-1 unknown). True when h, a should replace it.
-  bool add(int cur_h, int cur_a, int h, int a) noexcept {
+  bool add(int cur_h, int cur_a, int h, int a, int jump = 6) noexcept {
     if (h == cur_h && a == cur_a) {
       run_ = 0;
       return false;
     }
     if (h == h_ && a == a_ && run_ > 0) ++run_;
     else h_ = h, a_ = a, run_ = 1;
-    const bool known = cur_h >= 0 && cur_a >= 0;
-    const bool one_goal = known && h >= cur_h && a >= cur_a && (h - cur_h) + (a - cur_a) == 1;
-    if (run_ < (known && !one_goal ? 3 : 2)) return false;
+    if (jump < 3) jump = 3;
+    const int st = score_step(cur_h, cur_a, h, a);
+    if (cur_h < 0 || cur_a < 0) need_ = h > 9 || a > 9 ? jump : 2;
+    else need_ = st == 1 ? 2 : st == 2 ? 3 : jump;
+    if (run_ < need_) return false;
     run_ = 0;
     return true;
   }
-  bool pending() const noexcept { return run_ > 0; }
+  // A small change waiting on a quick re-read.
+  bool pending() const noexcept { return run_ > 0 && need_ <= 3; }
 
  private:
-  int h_ = -1, a_ = -1, run_ = 0;
+  int h_ = -1, a_ = -1, run_ = 0, need_ = 2;
 };
 
 // Confident when the same codes are read N times in a row.

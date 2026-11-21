@@ -217,7 +217,8 @@ struct Config {
   std::uint8_t bug_area = 1;      // OCR reads the top-left area, not the found box (a manual box still wins)
   std::uint8_t bug_area_w_pct = 40;  // ... this share of the width
   std::uint8_t bug_area_h_pct = 20;  // ... and of the height
-  std::uint8_t pad[3]{};        // explicit, so profiles round-trip byte for byte
+  std::uint8_t bug_jump_reads = 6;   // agreeing reads before a score change other than one goal counts
+  std::uint8_t pad[2]{};        // explicit, so profiles round-trip byte for byte
 };
 
 // Config.layers: overlay pieces the user can switch off.
